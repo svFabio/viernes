@@ -17,7 +17,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Viernes: Modular Voice Assistant")
     parser.add_argument("prompt", nargs="*", help="Direct text prompt to speak or ask")
     parser.add_argument("--test-tts", action="store_true", help="Test TTS synthesis directly")
+    parser.add_argument("--list-audio-devices", action="store_true", help="List available microphones and speakers")
     args = parser.parse_args()
+
+    if args.list_audio_devices:
+        from viernes.audio.devices import print_audio_devices
+
+        print_audio_devices()
+        return
 
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     player = AudioPlayer()
