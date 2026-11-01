@@ -27,7 +27,7 @@ def test_qa_unicode_and_emojis_in_piper(tmp_path):
         result = provider.synthesize(unicode_text, output_path=out_file)
 
         assert result == out_file.resolve()
-        mock_proc.communicate.assert_called_once_with(input=unicode_text)
+        mock_proc.communicate.assert_called_once_with(input=unicode_text, timeout=15.0)
 
 
 def test_qa_multi_paragraph_text_in_elevenlabs(tmp_path):

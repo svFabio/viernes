@@ -60,7 +60,8 @@ def load_settings() -> Settings:
             "ELEVENLABS_API_KEY is not configured. Viernes will operate using local Piper fallback as primary TTS."
         )
     try:
-        app_settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        app_settings.temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(app_settings.temp_dir, 0o700)
     except Exception as exc:
         logger.warning("Could not pre-create temp_dir %s: %s", app_settings.temp_dir, exc)
     return app_settings

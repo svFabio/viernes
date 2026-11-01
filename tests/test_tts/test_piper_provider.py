@@ -45,7 +45,7 @@ def test_piper_synthesize_success(tmp_path):
             stderr=subprocess.PIPE,
             text=True,
         )
-        mock_proc.communicate.assert_called_once_with(input="Probando síntesis con Piper")
+        mock_proc.communicate.assert_called_once_with(input="Probando síntesis con Piper", timeout=15.0)
 
 
 def test_piper_synthesize_without_model(tmp_path):

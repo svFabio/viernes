@@ -10,15 +10,19 @@ from viernes.tts.base import TTSProvider
 class PiperProvider(TTSProvider):
     """Local Piper neural TTS provider."""
 
+    DEFAULT_TIMEOUT_SECONDS = 15.0
+
     def __init__(
         self,
         model_path: str | Path | None = None,
         piper_bin: str | None = None,
         temp_dir: Path | str | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         model = model_path if model_path is not None else os.getenv("PIPER_MODEL_PATH", "")
         self.model_path = str(model) if model else ""
         self.piper_bin = piper_bin or os.getenv("PIPER_BIN", "piper")
+        self.timeout = timeout
         resolved = temp_dir if temp_dir is not None else os.getenv("VIERNES_TEMP_DIR")
         self.temp_dir = Path(resolved or "/tmp/viernes")
 
@@ -53,7 +57,14 @@ class PiperProvider(TTSProvider):
             stderr=subprocess.PIPE,
             text=True,
         )
-        _stdout, stderr = process.communicate(input=text.strip())
+
+        try:
+            _stdout, stderr = process.communicate(input=text.strip(), timeout=self.timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            raise TimeoutError(f"Piper execution timed out after {self.timeout}s") from exc
+
         if process.returncode != 0:
             raise RuntimeError(f"Piper execution failed: {stderr.strip()}")
 
