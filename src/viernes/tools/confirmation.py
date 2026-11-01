@@ -128,6 +128,11 @@ class ConfirmationManager:
         self.timeout_seconds = timeout_seconds
         self.pending_action: PendingAction | None = None
 
+    def abort_action(self) -> str:
+        """Immediately aborts any pending action, clearing state."""
+        self.pending_action = None
+        return "Acción cancelada."
+
     def evaluate_response(self, text: str) -> ConfirmationDecision:
         """Evaluates whether spoken text contains an accepted affirmative or negative term."""
         cleaned = text.strip().lower()
