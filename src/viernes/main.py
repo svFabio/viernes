@@ -76,7 +76,22 @@ def main() -> None:
     parser.add_argument("--mock-brain", action="store_true", help="Use MockAgent for offline execution")
     parser.add_argument("--echo-brain", action="store_true", help="Use EchoAgent for simple roundtrip tests")
     parser.add_argument("--list-tools", action="store_true", help="List security-allowed MCP tools")
+    parser.add_argument("--list-audio-devices", action="store_true", help="List detected microphones and speakers")
+    parser.add_argument("--ptt", choices=["press", "release", "cancel"], help="Send Push-to-Talk IPC command")
     args = parser.parse_args()
+
+    if args.list_audio_devices:
+        from viernes.audio.devices import print_audio_devices
+        print_audio_devices()
+        return
+
+    if args.ptt:
+        from viernes.input.ipc import send_ptt_ipc_command
+        success = send_ptt_ipc_command(args.ptt)
+        if not success:
+            logger.error("Failed to deliver Push-to-Talk IPC command '%s'", args.ptt)
+            sys.exit(1)
+        return
 
     if args.list_tools:
         print("Allowed MCP Tools in Viernes Security Allowlist:")
