@@ -89,7 +89,7 @@ class ViernesControlCenter(ctk.CTk):
         # ElevenLabs API Key
         key_label = ctk.CTkLabel(
             container,
-            text="ElevenLabs API Key:",
+            text="ElevenLabs API Key(s) [Pool Multicuenta]:",
             font=ctk.CTkFont(size=13, weight="bold"),
         )
         key_label.pack(anchor="w", pady=(8, 4))
@@ -99,7 +99,7 @@ class ViernesControlCenter(ctk.CTk):
 
         self.api_key_entry = ctk.CTkEntry(
             key_frame,
-            placeholder_text="sk_...",
+            placeholder_text="sk_..., sk_... (separadas por coma para rotación automática)",
             show="*",
             height=36,
         )
@@ -346,10 +346,12 @@ class ViernesControlCenter(ctk.CTk):
         """Populates widgets with values loaded from the configuration file."""
         cfg = self.current_config
 
-        # 1. ElevenLabs API Key
-        key = cfg.get("ELEVENLABS_API_KEY", "")
+        # 1. ElevenLabs API Key(s)
+        pool = cfg.get("ELEVENLABS_API_KEYS", "")
+        single = cfg.get("ELEVENLABS_API_KEY", "")
+        key_val = pool if pool else single
         self.api_key_entry.delete(0, "end")
-        self.api_key_entry.insert(0, key)
+        self.api_key_entry.insert(0, key_val)
 
         # 2. Voice ID & Preset
         voice_id = cfg.get("ELEVENLABS_VOICE_ID", PRESET_VOICES["Jessica (Oficial)"])
@@ -429,9 +431,18 @@ class ViernesControlCenter(ctk.CTk):
         """Collects GUI values and persists them to the .env file."""
         updates: dict[str, str] = {}
 
-        # API Key
-        key = self.api_key_entry.get().strip()
-        updates["ELEVENLABS_API_KEY"] = key
+        # API Keys (Pool or single key)
+        raw_keys = self.api_key_entry.get().strip()
+        parsed_keys = [k.strip() for k in raw_keys.replace("\n", ",").split(",") if k.strip()]
+        if len(parsed_keys) > 1:
+            updates["ELEVENLABS_API_KEYS"] = ",".join(parsed_keys)
+            updates["ELEVENLABS_API_KEY"] = parsed_keys[0]
+        elif len(parsed_keys) == 1:
+            updates["ELEVENLABS_API_KEYS"] = parsed_keys[0]
+            updates["ELEVENLABS_API_KEY"] = parsed_keys[0]
+        else:
+            updates["ELEVENLABS_API_KEYS"] = ""
+            updates["ELEVENLABS_API_KEY"] = ""
 
         # Voice ID
         vid = self.voice_id_entry.get().strip()

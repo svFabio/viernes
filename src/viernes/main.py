@@ -13,6 +13,7 @@ from viernes.pipeline.barge_in import BargeInController
 from viernes.pipeline.playback_queue import SequentialPlaybackQueue
 from viernes.pipeline.streaming_pipeline import StreamingPipeline
 from viernes.tools.registry import DEFAULT_ALLOWLIST
+from viernes.tts.base import TTSProvider
 from viernes.tts.elevenlabs_provider import ElevenLabsProvider
 from viernes.tts.piper_provider import PiperProvider
 from viernes.tts.resilient import ResilientTTS
@@ -22,8 +23,19 @@ logger = logging.getLogger("viernes")
 
 
 def build_tts_engine(temp_dir: Path) -> ResilientTTS:
-    primary = None
-    if settings.elevenlabs_api_key:
+    primary: TTSProvider | None = None
+    if settings.elevenlabs_api_keys:
+        try:
+            from viernes.tts.key_pool import KeyPoolElevenLabsProvider
+
+            primary = KeyPoolElevenLabsProvider(
+                api_keys=settings.elevenlabs_api_keys,
+                voice_id=settings.elevenlabs_voice_id,
+                temp_dir=temp_dir,
+            )
+        except (ValueError, RuntimeError) as exc:
+            logger.warning("Could not initialize ElevenLabs Key Pool: %s", exc)
+    elif settings.elevenlabs_api_key:
         try:
             primary = ElevenLabsProvider(
                 api_key=settings.elevenlabs_api_key,

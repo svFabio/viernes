@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -18,10 +18,21 @@ def mask_secret(value: str) -> str:
     return f"{value[:3]}***{value[-4:]}"
 
 
+def parse_elevenlabs_keys() -> list[str]:
+    """Extracts all configured ElevenLabs API keys from environment."""
+    raw_pool = os.getenv("ELEVENLABS_API_KEYS", "")
+    keys = [k.strip() for k in raw_pool.split(",") if k.strip()]
+    single = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if single and single not in keys:
+        keys.insert(0, single)
+    return keys
+
+
 class Settings(BaseModel):
     """Strongly typed application configuration."""
 
     elevenlabs_api_key: str = Field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", ""))
+    elevenlabs_api_keys: list[str] = Field(default_factory=parse_elevenlabs_keys)
     elevenlabs_voice_id: str = Field(
         default_factory=lambda: os.getenv("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
     )
@@ -33,18 +44,32 @@ class Settings(BaseModel):
 
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
 
+    @model_validator(mode="after")
+    def _validate_keys(self) -> "Settings":
+        if self.elevenlabs_api_key and self.elevenlabs_api_key not in self.elevenlabs_api_keys:
+            object.__setattr__(
+                self, "elevenlabs_api_keys", [self.elevenlabs_api_key] + self.elevenlabs_api_keys
+            )
+        return self
+
     @property
     def is_elevenlabs_configured(self) -> bool:
-        return bool(self.elevenlabs_api_key.strip())
+        return bool(self.elevenlabs_api_keys or self.elevenlabs_api_key.strip())
 
     @property
     def masked_elevenlabs_api_key(self) -> str:
         return mask_secret(self.elevenlabs_api_key)
 
+    @property
+    def masked_elevenlabs_api_keys(self) -> list[str]:
+        return [mask_secret(k) for k in self.elevenlabs_api_keys]
+
     def __repr__(self) -> str:
+        keys_preview = ", ".join(self.masked_elevenlabs_api_keys) or "<none>"
         return (
             f"Settings("
             f"elevenlabs_api_key='{self.masked_elevenlabs_api_key}', "
+            f"elevenlabs_api_keys=[{keys_preview}], "
             f"elevenlabs_voice_id='{self.elevenlabs_voice_id}', "
             f"piper_bin='{self.piper_bin}', "
             f"piper_model_path='{self.piper_model_path}', "

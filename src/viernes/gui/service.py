@@ -89,9 +89,10 @@ class ConfigService:
         """Generates a live voice audition file and plays it."""
         from viernes.audio.player import AudioPlayer
         from viernes.tts.elevenlabs_provider import ElevenLabsProvider
+        from viernes.tts.key_pool import KeyPoolElevenLabsProvider
 
-        key = api_key.strip()
-        if not key:
+        keys = [k.strip() for k in api_key.replace("\n", ",").split(",") if k.strip()]
+        if not keys:
             raise ValueError("La API key de ElevenLabs no puede estar vacía.")
 
         vid = voice_id.strip() or PRESET_VOICES["Jessica (Oficial)"]
@@ -99,7 +100,11 @@ class ConfigService:
         work_dir.mkdir(parents=True, exist_ok=True)
         out_path = work_dir / "audition_test.mp3"
 
-        provider = ElevenLabsProvider(api_key=key, voice_id=vid, temp_dir=work_dir)
+        provider = (
+            KeyPoolElevenLabsProvider(api_keys=keys, voice_id=vid, temp_dir=work_dir)
+            if len(keys) > 1
+            else ElevenLabsProvider(api_key=keys[0], voice_id=vid, temp_dir=work_dir)
+        )
         synthesized = provider.synthesize(phrase, out_path)
 
         player = AudioPlayer()
