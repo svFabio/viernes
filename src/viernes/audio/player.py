@@ -1,6 +1,8 @@
 import logging
 import shutil
+import signal
 import subprocess
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -73,3 +75,19 @@ class AudioPlayer:
                 except Exception as exc:
                     logger.warning("Error stopping audio player process %s: %s", getattr(proc, "pid", "unknown"), exc)
         self._active_processes.clear()
+
+
+def register_signal_handlers(player: AudioPlayer | None = None) -> None:
+    """Registers clean signal handlers for SIGINT and SIGTERM to stop active audio."""
+
+    def _handler(signum, _frame):
+        logger.info("Received termination signal %s. Cleaning up audio processes...", signum)
+        if player:
+            player.stop_all()
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, AttributeError) as exc:
+        logger.debug("Signal handlers could not be registered: %s", exc)
