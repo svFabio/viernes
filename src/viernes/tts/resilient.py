@@ -37,6 +37,9 @@ class ResilientTTS(TTSProvider):
         self.quota_exhausted: bool = False
 
     def synthesize(self, text: str, output_path: Path | None = None) -> Path:
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
         if not self.quota_exhausted:
             try:
                 logger.info("Attempting synthesis with primary TTS provider.")
