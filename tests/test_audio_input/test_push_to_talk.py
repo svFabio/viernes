@@ -1,9 +1,12 @@
 from unittest.mock import MagicMock, patch
 
 from viernes.input.push_to_talk import (
+    DEFAULT_NOTIFICATION_REPLACE_ID,
     PushToTalkController,
     PushToTalkState,
+    get_active_notification_id,
     send_desktop_notification,
+    set_active_notification_id,
 )
 
 
@@ -136,3 +139,77 @@ def test_send_desktop_notification_replaces_card(monkeypatch):
         assert "string:x-canonical-private-synchronous:viernes" in args
         assert "-t" in args
         assert "2000" in args
+        assert "-r" in args
+        assert str(DEFAULT_NOTIFICATION_REPLACE_ID) in args
+
+
+def test_send_desktop_notification_consecutive_replaces_same_id(monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with (
+        patch("shutil.which", return_value="/usr/bin/notify-send"),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        # Fire multiple notifications in sequence
+        for msg in ["Escuchando...", "Procesando...", "Respondiendo..."]:
+            send_desktop_notification("Viernes", msg)
+
+        assert mock_popen.call_count == 3
+        for call_item in mock_popen.call_args_list:
+            args = call_item[0][0]
+            assert "-r" in args
+            r_idx = args.index("-r")
+            assert args[r_idx + 1] == str(DEFAULT_NOTIFICATION_REPLACE_ID)
+
+
+def test_send_desktop_notification_custom_replace_id(monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with (
+        patch("shutil.which", return_value="/usr/bin/notify-send"),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        target = send_desktop_notification("Viernes", "Test", replace_id=7777)
+        assert target == 7777
+        args = mock_popen.call_args[0][0]
+        assert "-r" in args
+        r_idx = args.index("-r")
+        assert args[r_idx + 1] == "7777"
+
+
+def test_active_notification_id_getter_and_setter():
+    orig = get_active_notification_id()
+    try:
+        set_active_notification_id(8888)
+        assert get_active_notification_id() == 8888
+    finally:
+        set_active_notification_id(orig)
+
+
+def test_push_to_talk_concurrency_rapid_events():
+    import threading
+
+    controller = PushToTalkController()
+    errors = []
+
+    def run_rapid_cycle():
+        try:
+            for _ in range(50):
+                controller.handle_key_down()
+                controller.handle_key_up()
+                controller.handle_key_down()
+                controller.handle_escape()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run_rapid_cycle) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Encountered concurrency errors: {errors}"
+    assert controller.state in (
+        PushToTalkState.IDLE,
+        PushToTalkState.LISTENING,
+        PushToTalkState.PROCESSING,
+        PushToTalkState.CANCELLED,
+    )

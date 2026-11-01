@@ -17,33 +17,66 @@ class PushToTalkState(str, Enum):
     CANCELLED = "CANCELLED"
 
 
-def send_desktop_notification(title: str, message: str) -> None:
-    """Sends a desktop notification using notify-send if available."""
+DEFAULT_NOTIFICATION_REPLACE_ID: int = 4242
+_active_notification_id: int = DEFAULT_NOTIFICATION_REPLACE_ID
+_notification_lock = threading.Lock()
+
+
+def get_active_notification_id() -> int:
+    """Returns the currently active desktop notification ID."""
+    with _notification_lock:
+        return _active_notification_id
+
+
+def set_active_notification_id(notification_id: int) -> None:
+    """Sets the active notification ID for desktop notifications."""
+    global _active_notification_id
+    with _notification_lock:
+        _active_notification_id = int(notification_id)
+
+
+def send_desktop_notification(
+    title: str,
+    message: str,
+    replace_id: int | None = None,
+) -> int:
+    """Sends a desktop notification using notify-send with ID replacement to prevent stacking."""
     if "PYTEST_CURRENT_TEST" in os.environ:
-        return
+        with _notification_lock:
+            return replace_id if replace_id is not None else _active_notification_id
 
     notify_send_bin = shutil.which("notify-send")
-    if notify_send_bin:
+    if not notify_send_bin:
+        with _notification_lock:
+            return replace_id if replace_id is not None else _active_notification_id
+
+    with _notification_lock:
+        target_id = replace_id if replace_id is not None else _active_notification_id
+        cmd = [
+            notify_send_bin,
+            "-a",
+            "Viernes",
+            "-i",
+            "audio-input-microphone",
+            "-t",
+            "2000",
+            "-r",
+            str(target_id),
+            "-h",
+            "string:x-canonical-private-synchronous:viernes",
+            title,
+            message,
+        ]
         try:
             subprocess.Popen(
-                [
-                    notify_send_bin,
-                    "-a",
-                    "Viernes",
-                    "-i",
-                    "audio-input-microphone",
-                    "-t",
-                    "2000",
-                    "-h",
-                    "string:x-canonical-private-synchronous:viernes",
-                    title,
-                    message,
-                ],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
         except OSError as exc:
             logger.debug("Failed to spawn notify-send: %s", exc)
+
+        return target_id
 
 
 class PushToTalkController:
@@ -56,7 +89,8 @@ class PushToTalkController:
         on_finish: Callable[[], Any] | None = None,
         on_cancel: Callable[[], Any] | None = None,
         on_interrupt: Callable[[], Any] | None = None,
-        notify_fn: Callable[[str, str], None] | None = None,
+        notify_fn: Callable[..., Any] | None = None,
+        notification_id: int | None = None,
     ) -> None:
         self.shortcut = (
             shortcut
@@ -69,6 +103,7 @@ class PushToTalkController:
         self.on_cancel = on_cancel
         self.on_interrupt = on_interrupt
         self.notify_fn = notify_fn or send_desktop_notification
+        self.notification_id = notification_id or DEFAULT_NOTIFICATION_REPLACE_ID
 
         self.state: PushToTalkState = PushToTalkState.IDLE
         self._lock = threading.Lock()
