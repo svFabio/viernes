@@ -92,3 +92,41 @@ def test_service_status_and_control() -> None:
     success, msg = service.control_service("invalid_action")
     assert success is False
     assert "Acción inválida" in msg
+
+
+def test_format_audition_error() -> None:
+    # 401 Credential error
+    err_401 = Exception("status_code: 401, text: invalid api key")
+    msg_401 = ConfigService.format_audition_error(err_401)
+    assert "Credenciales inválidas (401)" in msg_401
+
+    class CustomHttpError(Exception):
+        def __init__(self, code: int):
+            self.status_code = code
+
+    assert "Credenciales inválidas (401)" in ConfigService.format_audition_error(CustomHttpError(401))
+
+    # 402/429 Quota exhausted
+    err_402 = Exception("Payment Required: quota_exceeded")
+    msg_402 = ConfigService.format_audition_error(err_402)
+    assert "Cuota agotada o límite alcanzado (402/429)" in msg_402
+    assert "Cuota agotada o límite alcanzado (402/429)" in ConfigService.format_audition_error(CustomHttpError(429))
+
+    # Timeout error
+    err_timeout = TimeoutError("Connection timed out after 5.0s")
+    assert "Tiempo de espera agotado" in ConfigService.format_audition_error(err_timeout)
+
+    # Network connection error
+    err_network = ConnectionResetError("Connection refused by peer")
+    assert "Error de conexión de red" in ConfigService.format_audition_error(err_network)
+
+
+def test_stop_test_voice() -> None:
+    service = ConfigService()
+    mock_player = MagicMock()
+    service._current_player = mock_player
+
+    service.stop_test_voice()
+
+    mock_player.stop_all.assert_called_once()
+    assert service._current_player is None
