@@ -26,6 +26,14 @@ class TickTickCreateParams(BaseModel):
     project_id: str | None = Field(default=None, max_length=50)
 
 
+class TickTickDeleteParams(BaseModel):
+    task_id: str = Field(..., min_length=1, max_length=50)
+
+
+class SystemDeleteFileParams(BaseModel):
+    target_path: str = Field(..., min_length=1, max_length=200)
+
+
 @dataclass
 class ToolDefinition:
     """Represents a validated, securable MCP tool."""
@@ -35,6 +43,7 @@ class ToolDefinition:
     param_schema: type[BaseModel]
     handler: Callable[[BaseModel], Any]
     requires_confirmation: bool = False
+    impact_formatter: Callable[[BaseModel], str] | None = None
 
 
 class ToolRegistry:
@@ -72,6 +81,13 @@ class ToolRegistry:
     def get_tool(self, tool_name: str) -> ToolDefinition | None:
         """Alias for get() to retrieve a tool by name."""
         return self._tools.get(tool_name)
+
+    def format_impact(self, name: str, params: BaseModel) -> str:
+        """Formats a human-readable impact description for critical/destructive actions."""
+        tool = self.get_tool(name)
+        if tool and tool.impact_formatter:
+            return tool.impact_formatter(params)
+        return f"ejecutar la acción '{name}'"
 
     def execute(self, tool_name: str, raw_params: dict[str, Any] | None = None) -> Any:
         """Validates tool against allowlist, parses Pydantic parameters, and executes."""
