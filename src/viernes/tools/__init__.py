@@ -1,4 +1,11 @@
 from viernes.tools.audit import AuditLogger, AuditRecord, sanitize_params
+from viernes.tools.confirmation import (
+    DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+    ConfirmationQuestionBuilder,
+    PendingAction,
+    formulate_confirmation_question,
+    formulate_impact_description,
+)
 from viernes.tools.registry import DEFAULT_CRITICAL_TOOLS, ToolDefinition, ToolRegistry
 from viernes.tools.schemas import (
     FileDeleteParams,
@@ -25,13 +32,16 @@ from viernes.tools.security import (
 
 __all__ = [
     "DEFAULT_ALLOWLIST",
+    "DEFAULT_CONFIRMATION_TIMEOUT_SECONDS",
     "DEFAULT_CRITICAL_TOOLS",
     "FORBIDDEN_TOOLS",
     "AuditLogEntry",
     "AuditLogger",
     "AuditRecord",
+    "ConfirmationQuestionBuilder",
     "FileDeleteParams",
     "OpenAppParams",
+    "PendingAction",
     "SecurityGate",
     "SecurityPolicy",
     "SecurityViolationError",
@@ -45,6 +55,8 @@ __all__ = [
     "ToolRegistry",
     "VolumeControlParams",
     "WeatherParams",
+    "formulate_confirmation_question",
+    "formulate_impact_description",
     "inspect_for_shell_injection",
     "sanitize_params",
     "validate_tool_params",
