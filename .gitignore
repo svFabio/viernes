@@ -18,3 +18,5 @@ wt-*
 
 # Temporary files
 /tmp/
+# Local AI runtime state
+.atl/
