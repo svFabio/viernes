@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 import fnmatch
 import logging
+import re
 import time
 from typing import Any
 
@@ -83,6 +84,50 @@ def sanitize_params(data: Any) -> Any:
     if isinstance(data, list):
         return [sanitize_params(item) for item in data]
     return data
+
+
+FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "eval",
+        "exec",
+        "rm",
+        "sudo",
+        "su",
+        "chmod",
+        "chown",
+        "dd",
+        "mkfs",
+    }
+)
+
+SHELL_INJECTION_PATTERN: re.Pattern[str] = re.compile(r"[;&|`$<>\n\r]")
+
+
+def inspect_for_shell_injection(value: Any) -> None:
+    """Recursively inspects parameter values to block shell metacharacters and forbidden binaries."""
+    if isinstance(value, str):
+        if SHELL_INJECTION_PATTERN.search(value):
+            raise SecurityViolationError(
+                f"Dangerous shell characters detected in input argument: '{value}'"
+            )
+        tokens = value.lower().split()
+        for token in tokens:
+            if token in FORBIDDEN_COMMANDS:
+                raise SecurityViolationError(
+                    f"Forbidden shell command '{token}' detected in argument."
+                )
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            inspect_for_shell_injection(k)
+            inspect_for_shell_injection(v)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            inspect_for_shell_injection(item)
 
 
 class AuditLogEntry(BaseModel):
@@ -206,6 +251,8 @@ class SecurityGate:
 
         try:
             self.policy.validate_tool(tool_name)
+            if params:
+                inspect_for_shell_injection(sanitized)
         except SecurityViolationError as err:
             duration = (time.perf_counter() - start) * 1000
             entry = AuditLogEntry(
@@ -246,10 +293,13 @@ class SecurityGate:
 
 __all__ = [
     "DEFAULT_ALLOWLIST",
+    "FORBIDDEN_COMMANDS",
     "FORBIDDEN_TOOLS",
+    "SHELL_INJECTION_PATTERN",
     "AuditLogEntry",
     "SecurityGate",
     "SecurityPolicy",
     "SecurityViolationError",
+    "inspect_for_shell_injection",
     "sanitize_params",
 ]
