@@ -37,6 +37,9 @@ class ResilientTTS(TTSProvider):
         self.quota_exhausted: bool = False
 
     def synthesize(self, text: str, output_path: Path | None = None) -> Path:
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
         if not self.quota_exhausted:
             try:
                 logger.info("Attempting synthesis with primary TTS provider.")
@@ -52,7 +55,10 @@ class ResilientTTS(TTSProvider):
                     )
                     self.quota_exhausted = True
                     if self.on_fallback_activated:
-                        self.on_fallback_activated(exc)
+                        try:
+                            self.on_fallback_activated(exc)
+                        except Exception as cb_exc:
+                            logger.error("Error in on_fallback_activated callback: %s", cb_exc)
                 else:
                     logger.error(
                         "Primary TTS failed with transient error: %s. Routing this call to fallback.",

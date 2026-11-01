@@ -9,28 +9,67 @@ logger = logging.getLogger(__name__)
 class AudioPlayer:
     """Dispatches audio playback to system audio daemons (mpv, pw-play, paplay, aplay)."""
 
-    def __init__(self):
-        self.player_bin = self._resolve_player()
+    SUPPORTED_BACKENDS = ("mpv", "pw-play", "paplay", "aplay")
+
+    def __init__(self, backend: str | None = None):
+        self.player_bin = backend or self._resolve_player()
+        self._active_processes: list[subprocess.Popen] = []
 
     def _resolve_player(self) -> str:
-        for candidate in ("mpv", "pw-play", "paplay", "aplay"):
+        for candidate in self.SUPPORTED_BACKENDS:
             if shutil.which(candidate):
                 return candidate
-        raise RuntimeError("No supported audio player found (install mpv, pipewire, or pulseaudio).")
+        raise RuntimeError(
+            "No supported audio player found in PATH (install mpv, pipewire, or pulseaudio, "
+            "e.g. 'sudo pacman -S mpv' or 'sudo apt install mpv')."
+        )
 
-    def play(self, audio_path: Path, blocking: bool = True) -> subprocess.Popen:
-        """Plays the specified audio file."""
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
+    def _cleanup_finished_processes(self) -> None:
+        """Prunes finished processes from active tracker to prevent zombie accumulation."""
+        still_running = []
+        for proc in self._active_processes:
+            if proc.poll() is None:
+                still_running.append(proc)
+        self._active_processes = still_running
+
+    def play(self, audio_path: Path | str, blocking: bool = True) -> subprocess.Popen:
+        """Plays the specified audio file.
+
+        When blocking=False, immediately returns the spawned Popen process.
+        """
+        path = Path(audio_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file does not exist: {path}")
+
+        self._cleanup_finished_processes()
 
         cmd = [self.player_bin]
         if self.player_bin == "mpv":
             cmd.extend(["--no-terminal", "--no-video"])
 
-        cmd.append(str(audio_path))
+        cmd.append(str(path))
         logger.debug("Playing audio with command: %s", " ".join(cmd))
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._active_processes.append(proc)
+
         if blocking:
             proc.wait()
+            self._cleanup_finished_processes()
+
         return proc
+
+    def stop_all(self) -> None:
+        """Terminates all currently running playback processes."""
+        for proc in self._active_processes:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception as exc:
+                    logger.warning("Error stopping audio player process %s: %s", getattr(proc, "pid", "unknown"), exc)
+        self._active_processes.clear()
