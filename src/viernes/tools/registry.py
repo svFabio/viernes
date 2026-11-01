@@ -4,9 +4,26 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from viernes.tools.security import SecurityGate, SecurityPolicy, SecurityViolationError
+
+
+class OpenAppParams(BaseModel):
+    app_name: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_\-\.]+$")
+
+
+class VolumeControlParams(BaseModel):
+    level_percent: int = Field(..., ge=0, le=100)
+
+
+class TickTickListParams(BaseModel):
+    project_id: str | None = Field(default=None, max_length=50)
+
+
+class TickTickCreateParams(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    project_id: str | None = Field(default=None, max_length=50)
 
 
 @dataclass
