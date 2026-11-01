@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from viernes.tools.schemas import validate_tool_params
 from viernes.tools.security import SecurityGate, SecurityPolicy, SecurityViolationError
 
 
@@ -58,7 +59,7 @@ class ToolRegistry:
                     f"Tool '{tool_name}' is permitted by allowlist but has not been registered."
                 )
 
-            validated_params = tool.param_schema.model_validate(params_dict)
+            validated_params = validate_tool_params(tool.param_schema, params_dict)
             return tool.handler(validated_params)
 
     def list_allowed_tools(self) -> list[str]:
