@@ -61,7 +61,7 @@ def load_settings() -> Settings:
         )
     try:
         app_settings.temp_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Could not pre-create temp_dir %s: %s", app_settings.temp_dir, exc)
     return app_settings
 
