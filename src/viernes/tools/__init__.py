@@ -1,6 +1,10 @@
 from viernes.tools.audit import AuditLogger, AuditRecord, sanitize_params
 from viernes.tools.confirmation import (
+    AFFIRMATIVE_TERMS,
     DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+    NEGATIVE_TERMS,
+    ConfirmationDecision,
+    ConfirmationManager,
     ConfirmationQuestionBuilder,
     PendingAction,
     formulate_confirmation_question,
@@ -31,6 +35,7 @@ from viernes.tools.security import (
 )
 
 __all__ = [
+    "AFFIRMATIVE_TERMS",
     "DEFAULT_ALLOWLIST",
     "DEFAULT_CONFIRMATION_TIMEOUT_SECONDS",
     "DEFAULT_CRITICAL_TOOLS",
@@ -38,8 +43,11 @@ __all__ = [
     "AuditLogEntry",
     "AuditLogger",
     "AuditRecord",
+    "ConfirmationDecision",
+    "ConfirmationManager",
     "ConfirmationQuestionBuilder",
     "FileDeleteParams",
+    "NEGATIVE_TERMS",
     "OpenAppParams",
     "PendingAction",
     "SecurityGate",

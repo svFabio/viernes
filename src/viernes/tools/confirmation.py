@@ -1,11 +1,53 @@
-"""Voice confirmation formulation and impact descriptions for critical MCP actions."""
+"""Voice confirmation formulation, 8s listening window, and decision evaluation for critical MCP actions."""
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import Enum
+import logging
 from typing import Any
 
 from pydantic import BaseModel
 
-DEFAULT_CONFIRMATION_TIMEOUT_SECONDS = 8.0
+logger = logging.getLogger("viernes.tools.confirmation")
+
+DEFAULT_CONFIRMATION_TIMEOUT_SECONDS: float = 8.0
+
+AFFIRMATIVE_TERMS: frozenset[str] = frozenset(
+    {
+        "sí",
+        "si",
+        "confirmo",
+        "adelante",
+        "procede",
+        "dale",
+        "de acuerdo",
+        "claro",
+        "seguro",
+    }
+)
+
+NEGATIVE_TERMS: frozenset[str] = frozenset(
+    {
+        "no",
+        "cancela",
+        "cancelar",
+        "espera",
+        "pará",
+        "para",
+        "detén",
+        "detener",
+        "abortar",
+    }
+)
+
+
+class ConfirmationDecision(str, Enum):
+    """Possible outcomes of a voice confirmation query."""
+
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    TIMEOUT = "TIMEOUT"
 
 
 @dataclass
@@ -79,8 +121,77 @@ class ConfirmationQuestionBuilder:
         )
 
 
+class ConfirmationManager:
+    """Manages explicit voice confirmation for destructive actions within an 8-second window."""
+
+    def __init__(self, timeout_seconds: float = DEFAULT_CONFIRMATION_TIMEOUT_SECONDS) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.pending_action: PendingAction | None = None
+
+    def evaluate_response(self, text: str) -> ConfirmationDecision:
+        """Evaluates whether spoken text contains an accepted affirmative or negative term."""
+        cleaned = text.strip().lower()
+        words = set(cleaned.split())
+
+        if any(term in words or term in cleaned for term in AFFIRMATIVE_TERMS):
+            return ConfirmationDecision.APPROVED
+        if any(term in words or term in cleaned for term in NEGATIVE_TERMS):
+            return ConfirmationDecision.REJECTED
+
+        return ConfirmationDecision.REJECTED
+
+    def is_affirmative(self, text: str) -> bool:
+        """Returns True if the text evaluates to approved."""
+        return self.evaluate_response(text) == ConfirmationDecision.APPROVED
+
+    def is_negative(self, text: str) -> bool:
+        """Returns True if the text evaluates to rejected."""
+        return self.evaluate_response(text) == ConfirmationDecision.REJECTED
+
+    async def wait_for_voice_confirmation(
+        self,
+        action: PendingAction,
+        voice_listener: Callable[[], Awaitable[str]],
+    ) -> tuple[ConfirmationDecision, str]:
+        """Listens for user confirmation within the strict time window (default 8s)."""
+        self.pending_action = action
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                user_spoken = await voice_listener()
+
+            decision = self.evaluate_response(user_spoken)
+            if decision == ConfirmationDecision.APPROVED:
+                logger.info("Voice action '%s' confirmed by user.", action.tool_name)
+                return decision, "Confirmación recibida. Procediendo con la acción."
+            else:
+                logger.info(
+                    "Voice action '%s' cancelled by user response: '%s'",
+                    action.tool_name,
+                    user_spoken,
+                )
+                return ConfirmationDecision.REJECTED, "Acción cancelada."
+
+        except TimeoutError:
+            logger.warning(
+                "Confirmation window (%.1fs) expired for '%s'. Discarding action.",
+                self.timeout_seconds,
+                action.tool_name,
+            )
+            return (
+                ConfirmationDecision.TIMEOUT,
+                "Tiempo de espera agotado. Acción cancelada por seguridad.",
+            )
+        finally:
+            # Guarantee no cumulative lingering state
+            self.pending_action = None
+
+
 __all__ = [
+    "AFFIRMATIVE_TERMS",
     "DEFAULT_CONFIRMATION_TIMEOUT_SECONDS",
+    "NEGATIVE_TERMS",
+    "ConfirmationDecision",
+    "ConfirmationManager",
     "ConfirmationQuestionBuilder",
     "PendingAction",
     "formulate_confirmation_question",
