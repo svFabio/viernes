@@ -6,7 +6,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from viernes.tools.security import SecurityGate, SecurityPolicy, SecurityViolationError
+from viernes.tools.security import (
+    DEFAULT_ALLOWLIST,
+    SecurityGate,
+    SecurityPolicy,
+    SecurityViolationError,
+)
 
 
 class OpenAppParams(BaseModel):
@@ -112,4 +117,14 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
 
-__all__ = ["ToolDefinition", "ToolRegistry"]
+__all__ = [
+    "DEFAULT_ALLOWLIST",
+    "OpenAppParams",
+    "SystemDeleteFileParams",
+    "TickTickCreateParams",
+    "TickTickDeleteParams",
+    "TickTickListParams",
+    "ToolDefinition",
+    "ToolRegistry",
+    "VolumeControlParams",
+]
