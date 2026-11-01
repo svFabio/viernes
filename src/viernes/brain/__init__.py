@@ -1,3 +1,3 @@
-from viernes.brain.agent import Agent, EchoAgent
+from viernes.brain.agent import Agent, EchoAgent, MockAgent
 
-__all__ = ["Agent", "EchoAgent"]
+__all__ = ["Agent", "EchoAgent", "MockAgent"]
