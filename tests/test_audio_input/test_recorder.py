@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from viernes.audio.recorder import AudioRecorder, RecorderState
+from viernes.audio.recorder import AudioRecorder, RecorderState, resample_audio
 
 
 @pytest.fixture
@@ -170,3 +170,31 @@ def test_recorder_keyboard_interrupt_handling(temp_audio_dir: Path):
 
         mock_start.assert_called_once()
         mock_stop.assert_called_once()
+
+
+def test_resample_audio_linear():
+    t_48k = np.linspace(0, 0.03, 1440, endpoint=False)  # 30ms at 48kHz
+    signal_48k = (0.4 * np.sin(2 * np.pi * 400 * t_48k) * 32767).astype(np.int16)
+
+    resampled_16k = resample_audio(signal_48k, orig_sr=48000, target_sr=16000)
+    assert len(resampled_16k) == 480  # 30ms at 16kHz
+    assert resampled_16k.dtype == np.int16
+
+    # Test identical rate returns original
+    assert len(resample_audio(signal_48k, 48000, 48000)) == 1440
+
+
+def test_recorder_resamples_48khz_input(temp_audio_dir: Path):
+    recorder = AudioRecorder(
+        sample_rate=16000,
+        input_sample_rate=48000,
+        temp_dir=temp_audio_dir,
+    )
+    # Feed 30ms frame at 48kHz (1440 samples)
+    t_48k = np.linspace(0, 0.03, 1440, endpoint=False)
+    speech_48k = (0.4 * np.sin(2 * np.pi * 400 * t_48k) * 32767).astype(np.int16)
+
+    recorder.process_frame(speech_48k)
+    assert recorder.state == RecorderState.RECORDING
+    # The recorded frame stored in internal buffer must be resampled to 16kHz (480 samples)
+    assert len(recorder._recorded_frames[-1]) == 480

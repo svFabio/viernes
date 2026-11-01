@@ -24,6 +24,17 @@ class RecorderState(str, Enum):
     PROCESSING = "PROCESSING"
 
 
+def resample_audio(samples: np.ndarray, orig_sr: int, target_sr: int = 16000) -> np.ndarray:
+    """Resamples mono audio array from orig_sr to target_sr using linear interpolation."""
+    if orig_sr == target_sr or len(samples) == 0:
+        return samples
+    duration = len(samples) / orig_sr
+    num_target_samples = round(duration * target_sr)
+    orig_times = np.linspace(0.0, duration, len(samples), endpoint=False)
+    target_times = np.linspace(0.0, duration, num_target_samples, endpoint=False)
+    return np.interp(target_times, orig_times, samples).astype(samples.dtype)
+
+
 class AudioRecorder:
     """Captures 16kHz mono 16-bit PCM audio with Voice Activity Detection (VAD).
 
@@ -41,10 +52,12 @@ class AudioRecorder:
         min_speech_duration_ms: int = 300,
         max_recording_duration_s: float = 30.0,
         device: int | str | None = None,
+        input_sample_rate: int | None = None,
         temp_dir: Path | None = None,
         vad: VoiceActivityDetector | None = None,
     ) -> None:
         self.sample_rate = sample_rate
+        self.input_sample_rate = input_sample_rate or sample_rate
         self.channels = channels
         self.dtype = dtype
         self.frame_duration_ms = frame_duration_ms
@@ -123,6 +136,10 @@ class AudioRecorder:
                 samples = frame.astype(np.int16)
         else:
             raise TypeError(f"Unsupported frame type: {type(frame)}")
+
+        # Resample if incoming audio sample rate differs from target rate (16kHz)
+        if self.input_sample_rate != self.sample_rate:
+            samples = resample_audio(samples, self.input_sample_rate, self.sample_rate)
 
         is_voice = self.vad.is_speech(samples)
 
