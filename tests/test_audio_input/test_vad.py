@@ -71,3 +71,22 @@ def test_vad_int16_bytes_and_numpy():
 
     assert math.isclose(prob_np, prob_bytes, abs_tol=1e-3)
     assert detector.is_speech(speech_bytes)
+
+
+def test_vad_dc_offset_rejection():
+    detector = VoiceActivityDetector(sample_rate=16000, threshold=0.5)
+    # Hardware DC bias (+0.3 constant voltage)
+    dc_bias = np.full(480, 0.3, dtype=np.float32)
+    assert detector.compute_probability(dc_bias) == 0.0
+    assert not detector.is_speech(dc_bias)
+
+
+def test_vad_nan_and_inf_sanitization():
+    detector = VoiceActivityDetector(sample_rate=16000, threshold=0.5)
+    nan_frame = np.zeros(480, dtype=np.float32)
+    nan_frame[5] = np.nan
+    nan_frame[20] = np.inf
+    nan_frame[30] = -np.inf
+
+    assert detector.compute_probability(nan_frame) == 0.0
+    assert not detector.is_speech(nan_frame)
