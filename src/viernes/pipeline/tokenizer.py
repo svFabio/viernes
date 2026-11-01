@@ -58,32 +58,36 @@ class SentenceTokenizer:
         # Split preserving punctuation delimiters
         parts = PUNCTUATION_SPLIT_REGEX.split(self._buffer)
         if len(parts) < 3:
-            # Need at least: [text_before, delimiter, text_after]
             return sentences
 
-        # Iterate pairs of (clause, delimiter)
+        accumulated_clause = ""
         idx = 0
+
         while idx < len(parts) - 1:
             clause = parts[idx]
             delimiter = parts[idx + 1]
-            candidate = (clause + delimiter).strip()
+            candidate = (accumulated_clause + clause + delimiter).strip()
 
-            # Check if delimiter is part of an abbreviation
-            last_word = candidate.split()[-1].lower() if candidate.split() else ""
+            words = candidate.split()
+            last_word = words[-1].lower() if words else ""
+
+            # Check if delimiter belongs to an abbreviation (e.g. Dr.)
             if last_word in COMMON_ABBREVIATIONS:
-                # Keep accumulating, don't split yet
+                accumulated_clause += clause + delimiter
                 idx += 2
                 continue
 
-            # Ensure minimum word length
-            if len(candidate.split()) < self.min_words and idx + 2 < len(parts):
+            # Check minimum word length if more parts follow
+            if len(words) < self.min_words and idx + 2 < len(parts):
+                accumulated_clause += clause + delimiter
                 idx += 2
                 continue
 
             sentences.append(candidate)
+            accumulated_clause = ""
             idx += 2
 
-        # Retain remainder in buffer
-        remainder = "".join(parts[idx:])
+        # Put back remainder plus any un-emitted accumulated clause
+        remainder = accumulated_clause + "".join(parts[idx:])
         self._buffer = remainder
         return sentences
