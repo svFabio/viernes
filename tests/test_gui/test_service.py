@@ -78,7 +78,7 @@ def test_test_voice_success(tmp_path: Path) -> None:
 
 def test_service_status_and_control() -> None:
     service = ConfigService()
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", return_value="/usr/bin/systemctl"), patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout="active\n", stderr="")
         is_active, status = service.get_service_status("viernes.service")
         assert is_active is True
@@ -88,7 +88,113 @@ def test_service_status_and_control() -> None:
         assert success is True
         assert "completado exitosamente" in msg
 
+        # Try-restart and reload-or-restart
+        success_try, _ = service.control_service("try-restart")
+        assert success_try is True
+        success_reload, _ = service.control_service("reload-or-restart")
+        assert success_reload is True
+
     # Invalid action
     success, msg = service.control_service("invalid_action")
     assert success is False
     assert "Acción inválida" in msg
+
+
+def test_validate_api_key_scenarios() -> None:
+    # Empty key is allowed
+    is_valid, clean, warning = ConfigService.validate_api_key("   ")
+    assert is_valid is True
+    assert clean == ""
+    assert warning == ""
+
+    # Short key produces alert
+    is_valid, clean, warning = ConfigService.validate_api_key("sk_short")
+    assert is_valid is True
+    assert clean == "sk_short"
+    assert "inferior a 20 caracteres" in warning
+
+    # Full valid key
+    valid_key = "sk_808ad725799d106b95dd40636aeaeb901a9"
+    is_valid, clean, warning = ConfigService.validate_api_key(f"  {valid_key}  ")
+    assert is_valid is True
+    assert clean == valid_key
+    assert warning == ""
+
+    # Incompatible characters sanitized
+    is_valid, clean, warning = ConfigService.validate_api_key("sk_key@#$%12345678901234567890")
+    assert is_valid is True
+    assert "@" not in clean
+    assert "#" not in clean
+    assert "sanearon caracteres" in warning
+
+
+def test_validate_voice_id_scenarios() -> None:
+    # Empty defaults to Jessica
+    is_valid, clean, warning = ConfigService.validate_voice_id("")
+    assert is_valid is True
+    assert clean == PRESET_VOICES["Jessica (Oficial)"]
+    assert warning == ""
+
+    # Custom voice ID sanitized
+    is_valid, clean, warning = ConfigService.validate_voice_id("  custom_voice_id_123  ")
+    assert is_valid is True
+    assert clean == "custom_voice_id_123"
+
+    # Incompatible characters sanitized
+    is_valid, clean, warning = ConfigService.validate_voice_id("custom!voice?id")
+    assert is_valid is True
+    assert clean == "customvoiceid"
+    assert "sanearon caracteres" in warning
+
+
+def test_atomic_save_config_error_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("ORIGINAL=kept\n# comment\n")
+
+    service = ConfigService(env_path=env_file)
+
+    # Simulate permission error during replace
+    def failing_replace(src: str, dst: str) -> None:
+        raise PermissionError("Access denied")
+
+    monkeypatch.setattr("os.replace", failing_replace)
+
+    with pytest.raises(PermissionError, match="Access denied"):
+        service.save_config({"ORIGINAL": "modified"})
+
+    # Original file remains completely intact
+    assert "ORIGINAL=kept" in env_file.read_text()
+    assert "# comment" in env_file.read_text()
+
+
+def test_service_status_variations() -> None:
+    service = ConfigService()
+
+    # Missing systemctl
+    with patch("shutil.which", return_value=None):
+        is_active, status = service.get_service_status()
+        assert is_active is False
+        assert status == "no disponible"
+
+        success, msg = service.control_service("start")
+        assert success is False
+        assert "no disponible" in msg
+
+    # Inactive and failed statuses
+    with patch("shutil.which", return_value="/bin/systemctl"), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=3, stdout="failed\n", stderr="")
+        is_active, status = service.get_service_status()
+        assert is_active is False
+        assert status == "failed"
+
+    # Timeout handling
+    import subprocess
+    with patch("shutil.which", return_value="/bin/systemctl"), patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="systemctl", timeout=5)):
+        is_active, status = service.get_service_status()
+        assert is_active is False
+        assert status == "timeout"
+
+        success, msg = service.control_service("restart")
+        assert success is False
+        assert "Tiempo de espera agotado" in msg
+

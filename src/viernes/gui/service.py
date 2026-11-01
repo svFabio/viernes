@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ PRESET_VOICES: dict[str, str] = {
 }
 
 DEFAULT_TEST_PHRASE = "A la orden, Señor. Viernes en línea y lista para operar."
+VALID_SERVICE_ACTIONS = ("start", "stop", "restart", "reload", "reload-or-restart", "try-restart")
 
 
 class ConfigService:
@@ -27,6 +29,47 @@ class ConfigService:
 
     def __init__(self, env_path: Path | None = None) -> None:
         self.env_path = env_path or self.resolve_env_path()
+
+    @staticmethod
+    def validate_api_key(api_key: str) -> tuple[bool, str, str]:
+        """Validates and sanitizes ElevenLabs API key.
+
+        Returns:
+            tuple[bool, str, str]: (is_valid, sanitized_key, warning_or_error_msg)
+        """
+        sanitized = api_key.strip()
+        if not sanitized:
+            return True, "", ""
+
+        warning = ""
+        if len(sanitized) < 20:
+            warning = "Aviso: La longitud de la API key es inferior a 20 caracteres."
+
+        clean_chars = [c for c in sanitized if c.isalnum() or c in ("_", "-")]
+        cleaned = "".join(clean_chars)
+        if cleaned != sanitized:
+            warning = "Aviso: Se sanearon caracteres incompatibles de la API key."
+
+        return True, cleaned, warning
+
+    @staticmethod
+    def validate_voice_id(voice_id: str) -> tuple[bool, str, str]:
+        """Validates and sanitizes ElevenLabs Voice ID.
+
+        Returns:
+            tuple[bool, str, str]: (is_valid, sanitized_id, warning_or_error_msg)
+        """
+        sanitized = voice_id.strip()
+        if not sanitized:
+            return True, PRESET_VOICES["Jessica (Oficial)"], ""
+
+        warning = ""
+        clean_chars = [c for c in sanitized if c.isalnum() or c in ("_", "-")]
+        cleaned = "".join(clean_chars)
+        if cleaned != sanitized:
+            warning = "Aviso: Se sanearon caracteres incompatibles del Voice ID."
+
+        return True, cleaned, warning
 
     @staticmethod
     def resolve_env_path() -> Path:
@@ -49,13 +92,29 @@ class ConfigService:
         return dotenv.dotenv_values(str(self.env_path))  # type: ignore[return-value]
 
     def save_config(self, updates: dict[str, str]) -> None:
-        """Updates or appends configuration keys in the .env file cleanly."""
+        """Updates or appends configuration keys in the .env file atomically.
+
+        Preserves comments, formatting, and adjacent environment variables.
+        """
         if not self.env_path.exists():
             self.env_path.parent.mkdir(parents=True, exist_ok=True)
             self.env_path.touch()
 
-        for key, value in updates.items():
-            dotenv.set_key(str(self.env_path), key, str(value).strip(), quote_mode="never")
+        temp_file = self.env_path.with_suffix(f".tmp.{os.getpid()}")
+        try:
+            shutil.copy2(self.env_path, temp_file)
+            for key, value in updates.items():
+                dotenv.set_key(str(temp_file), key, str(value).strip(), quote_mode="never")
+            os.replace(str(temp_file), str(self.env_path))
+        except Exception as exc:
+            logger.error("Failed persisting configuration atomically: %s", exc)
+            raise
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
 
     def get_audio_input_devices(self) -> list[tuple[str, str]]:
         """Returns input devices formatted as (display_name, raw_id)."""
@@ -108,17 +167,25 @@ class ConfigService:
 
     def get_service_status(self, service_name: str = "viernes.service") -> tuple[bool, str]:
         """Checks systemd user service status."""
+        if not shutil.which("systemctl"):
+            return False, "no disponible"
+
         try:
             res = subprocess.run(
                 ["systemctl", "--user", "is-active", service_name],
                 capture_output=True,
                 check=False,
                 text=True,
-                timeout=3,
+                timeout=5,
             )
-            status = res.stdout.strip()
+            status = res.stdout.strip().lower()
             is_active = status == "active"
-            return is_active, status or "inactive"
+            if not status:
+                status = res.stderr.strip().lower() or "inactive"
+            return is_active, status
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout expired checking systemd service status: %s", service_name)
+            return False, "timeout"
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("Failed checking systemd service: %s", exc)
             return False, "no disponible"
@@ -126,9 +193,13 @@ class ConfigService:
     def control_service(
         self, action: str, service_name: str = "viernes.service"
     ) -> tuple[bool, str]:
-        """Controls systemd user service (start, stop, restart)."""
-        if action not in ("start", "stop", "restart", "reload"):
+        """Controls systemd user service (start, stop, restart, reload, try-restart, reload-or-restart)."""
+        if action not in VALID_SERVICE_ACTIONS:
             return False, f"Acción inválida: {action}"
+
+        if not shutil.which("systemctl"):
+            return False, "systemctl no disponible en este sistema"
+
         try:
             res = subprocess.run(
                 ["systemctl", "--user", action, service_name],
@@ -139,6 +210,9 @@ class ConfigService:
             )
             if res.returncode == 0:
                 return True, f"Servicio {action} completado exitosamente"
-            return False, res.stderr.strip() or f"Error al ejecutar {action}"
+            err_msg = res.stderr.strip() or res.stdout.strip() or f"Código de salida {res.returncode}"
+            return False, f"Error al ejecutar {action}: {err_msg}"
+        except subprocess.TimeoutExpired:
+            return False, f"Tiempo de espera agotado al ejecutar {action} en el servicio"
         except (subprocess.SubprocessError, OSError) as exc:
-            return False, str(exc)
+            return False, f"Error al invocar systemctl: {exc}"
