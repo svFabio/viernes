@@ -71,7 +71,12 @@ def sanitize_params(data: Any) -> Any:
         for key, value in data.items():
             key_lower = str(key).lower()
             if any(pattern in key_lower for pattern in SENSITIVE_PATTERNS):
-                sanitized[key] = "[REDACTED]"
+                if isinstance(value, dict):
+                    sanitized[key] = sanitize_params(value)
+                elif isinstance(value, list):
+                    sanitized[key] = [sanitize_params(item) for item in value]
+                else:
+                    sanitized[key] = "[REDACTED]"
             else:
                 sanitized[key] = sanitize_params(value)
         return sanitized
@@ -126,6 +131,8 @@ class SecurityPolicy:
             tool_clean == allowed or fnmatch.fnmatch(tool_clean, allowed)
             for allowed in self.allowlist
         )
+
+    is_tool_allowed = is_allowed
 
     def validate_tool(self, tool_name: str) -> None:
         """Validates tool against allowlist, raising SecurityViolationError if forbidden."""
