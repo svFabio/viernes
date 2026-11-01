@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -14,8 +15,9 @@ class AudioPlayer:
 
     SUPPORTED_BACKENDS = ("mpv", "pw-play", "paplay", "aplay")
 
-    def __init__(self, backend: str | None = None):
+    def __init__(self, backend: str | None = None, device: str | None = None):
         self.player_bin = backend or self._resolve_player()
+        self.device = device if device is not None else os.getenv("AUDIO_OUTPUT_DEVICE")
         self._active_processes: list[subprocess.Popen] = []
         self._lock = threading.Lock()
 
@@ -50,11 +52,13 @@ class AudioPlayer:
         audio_path: Path | str,
         blocking: bool = True,
         volume: int | None = None,
+        device: str | None = None,
     ) -> subprocess.Popen:
         """Plays the specified audio file.
 
         When blocking=False, immediately returns the spawned Popen process.
         Accepts optional volume (0-100) for supported backends (e.g. mpv).
+        Accepts optional output device (or falls back to instance device or AUDIO_OUTPUT_DEVICE).
         """
         path = Path(audio_path)
         if not path.is_file():
@@ -63,12 +67,26 @@ class AudioPlayer:
         if path.stat().st_size == 0:
             raise ValueError(f"Audio file is empty (0 bytes): {path}")
 
+        target_device = device if device is not None else (self.device or os.getenv("AUDIO_OUTPUT_DEVICE"))
+        clean_device = str(target_device).strip() if target_device else None
+
         cmd = [self.player_bin]
         if self.player_bin == "mpv":
             cmd.extend(["--no-terminal", "--no-video"])
             if volume is not None:
                 clamped = max(0, min(100, int(volume)))
                 cmd.append(f"--volume={clamped}")
+            if clean_device:
+                cmd.append(f"--audio-device={clean_device}")
+        elif self.player_bin == "pw-play":
+            if clean_device:
+                cmd.append(f"--target={clean_device}")
+        elif self.player_bin == "paplay":
+            if clean_device:
+                cmd.append(f"--device={clean_device}")
+        elif self.player_bin == "aplay":
+            if clean_device:
+                cmd.extend(["-D", clean_device])
 
         cmd.append(str(path))
         logger.debug("Playing audio with command: %s", " ".join(cmd))

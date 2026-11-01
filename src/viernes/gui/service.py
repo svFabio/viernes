@@ -27,6 +27,7 @@ class ConfigService:
 
     def __init__(self, env_path: Path | None = None) -> None:
         self.env_path = env_path or self.resolve_env_path()
+        self._current_player: Any = None
 
     @staticmethod
     def resolve_env_path() -> Path:
@@ -60,7 +61,13 @@ class ConfigService:
     def get_audio_input_devices(self) -> list[tuple[str, str]]:
         """Returns input devices formatted as (display_name, raw_id)."""
         devices: list[tuple[str, str]] = [("Por defecto del sistema", "")]
-        for dev in list_audio_devices():
+        try:
+            raw_devices = list_audio_devices()
+        except Exception as exc:
+            logger.warning("Could not list audio input devices: %s", exc)
+            return devices
+
+        for dev in raw_devices:
             if dev.get("max_input_channels", 0) > 0:
                 idx = dev.get("index", 0)
                 name = dev.get("name", f"Microphone {idx}")
@@ -71,7 +78,13 @@ class ConfigService:
     def get_audio_output_devices(self) -> list[tuple[str, str]]:
         """Returns output devices formatted as (display_name, raw_id)."""
         devices: list[tuple[str, str]] = [("Por defecto del sistema", "")]
-        for dev in list_audio_devices():
+        try:
+            raw_devices = list_audio_devices()
+        except Exception as exc:
+            logger.warning("Could not list audio output devices: %s", exc)
+            return devices
+
+        for dev in raw_devices:
             if dev.get("max_output_channels", 0) > 0:
                 idx = dev.get("index", 0)
                 name = dev.get("name", f"Speaker {idx}")
@@ -85,6 +98,7 @@ class ConfigService:
         voice_id: str,
         phrase: str = DEFAULT_TEST_PHRASE,
         temp_dir: Path | None = None,
+        device: str | None = None,
     ) -> Path:
         """Generates a live voice audition file and plays it."""
         from viernes.audio.player import AudioPlayer
@@ -96,15 +110,27 @@ class ConfigService:
 
         vid = voice_id.strip() or PRESET_VOICES["Jessica (Oficial)"]
         work_dir = temp_dir or Path(os.getenv("VIERNES_TEMP_DIR", "/tmp/viernes"))
-        work_dir.mkdir(parents=True, exist_ok=True)
+        work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         out_path = work_dir / "audition_test.mp3"
 
         provider = ElevenLabsProvider(api_key=key, voice_id=vid, temp_dir=work_dir)
         synthesized = provider.synthesize(phrase, out_path)
 
-        player = AudioPlayer()
+        target_device = device or self.read_config().get("AUDIO_OUTPUT_DEVICE") or os.getenv("AUDIO_OUTPUT_DEVICE")
+        player = AudioPlayer(device=target_device)
+        self._current_player = player
         player.play(synthesized)
         return synthesized
+
+    def stop_playback(self) -> None:
+        """Stops any currently active audition playback subprocesses."""
+        if self._current_player:
+            try:
+                self._current_player.stop_all()
+            except Exception as exc:
+                logger.debug("Failed stopping active player: %s", exc)
+            finally:
+                self._current_player = None
 
     def get_service_status(self, service_name: str = "viernes.service") -> tuple[bool, str]:
         """Checks systemd user service status."""
