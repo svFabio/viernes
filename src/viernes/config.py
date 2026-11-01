@@ -23,7 +23,7 @@ class Settings(BaseModel):
 
     elevenlabs_api_key: str = Field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", ""))
     elevenlabs_voice_id: str = Field(
-        default_factory=lambda: os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+        default_factory=lambda: os.getenv("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
     )
     piper_bin: str = Field(default_factory=lambda: os.getenv("PIPER_BIN", "piper"))
     piper_model_path: str = Field(default_factory=lambda: os.getenv("PIPER_MODEL_PATH", ""))

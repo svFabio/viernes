@@ -16,7 +16,7 @@ def test_settings_default_values():
     with patch.dict(os.environ, {}, clear=True):
         config = Settings()
         assert config.elevenlabs_api_key == ""
-        assert config.elevenlabs_voice_id == "21m00Tcm4TlvDq8ikWAM"
+        assert config.elevenlabs_voice_id == "cgSgspJ2msm6clMCkdW9"
         assert config.piper_bin == "piper"
         assert config.piper_model_path == ""
         assert config.temp_dir == Path("/tmp/viernes")
