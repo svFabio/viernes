@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import tempfile
 import time
@@ -13,6 +14,7 @@ from typing import Self
 import numpy as np
 import sounddevice as sd
 
+from viernes.audio.devices import resolve_audio_device
 from viernes.audio.vad import VoiceActivityDetector, validate_vad_threshold
 
 logger = logging.getLogger(__name__)
@@ -50,12 +52,28 @@ class AudioRecorder:
         self.frame_duration_ms = frame_duration_ms
         self.frame_size = int(self.sample_rate * (self.frame_duration_ms / 1000.0))
 
-        # Thresholds
+        # Thresholds (read defaults from environment if available)
+        raw_vad_th = os.getenv("VAD_THRESHOLD")
+        if vad_threshold == 0.5 and raw_vad_th is not None:
+            try:
+                vad_threshold = float(raw_vad_th)
+            except ValueError:
+                logger.warning("Could not parse VAD_THRESHOLD '%s' as float.", raw_vad_th)
+
+        raw_silence = os.getenv("SILENCE_TIMEOUT_MS")
+        if silence_timeout_ms == 800 and raw_silence is not None:
+            try:
+                silence_timeout_ms = int(raw_silence)
+            except ValueError:
+                logger.warning("Could not parse SILENCE_TIMEOUT_MS '%s' as int.", raw_silence)
+
         self.vad_threshold = validate_vad_threshold(vad_threshold)
         self.silence_timeout_ms = self._validate_silence_timeout(silence_timeout_ms)
         self.min_speech_duration_ms = min_speech_duration_ms
         self.max_recording_duration_s = max_recording_duration_s
-        self.device = device
+
+        # Resolve device by index, name, or AUDIO_INPUT_DEVICE
+        self.device = resolve_audio_device(device, kind="input")
 
         self.temp_dir = temp_dir or Path(tempfile.gettempdir()) / "viernes"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
