@@ -3,7 +3,7 @@ from viernes.audio.devices import (
     print_audio_devices,
     resolve_audio_device,
 )
-from viernes.audio.player import AudioPlayer
+from viernes.audio.player import AudioPlayer, register_signal_handlers
 from viernes.audio.recorder import AudioRecorder, RecorderState
 from viernes.audio.vad import (
     BaseVAD,
@@ -25,6 +25,7 @@ __all__ = [
     "VoiceActivityDetector",
     "list_audio_devices",
     "print_audio_devices",
+    "register_signal_handlers",
     "resolve_audio_device",
     "validate_vad_threshold",
 ]
