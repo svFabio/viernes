@@ -1,0 +1,19 @@
+[Unit]
+Description=Viernes Voice Assistant User Daemon
+Documentation=https://github.com/svFabio/09-viernes
+After=default.target sound.target pipewire.service
+Wants=sound.target pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/09-viernes
+Environment=PYTHONUNBUFFERED=1
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
+ExecStart=%h/.local/bin/uv run python -m viernes.main
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target
