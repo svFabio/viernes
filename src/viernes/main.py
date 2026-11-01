@@ -78,7 +78,13 @@ def main() -> None:
     parser.add_argument("--list-tools", action="store_true", help="List security-allowed MCP tools")
     parser.add_argument("--list-audio-devices", action="store_true", help="List detected microphones and speakers")
     parser.add_argument("--ptt", choices=["press", "release", "cancel"], help="Send Push-to-Talk IPC command")
+    parser.add_argument("--gui", action="store_true", help="Launch the Viernes Control Center GUI")
     args = parser.parse_args()
+
+    if args.gui:
+        from viernes.gui.app import main as gui_main
+        gui_main()
+        return
 
     if args.list_audio_devices:
         from viernes.audio.devices import print_audio_devices
