@@ -22,6 +22,14 @@ class TickTickCreateParams(BaseModel):
     project_id: str | None = Field(default=None, max_length=50)
 
 
+class TickTickDeleteParams(BaseModel):
+    task_id: str = Field(..., min_length=1, max_length=50)
+
+
+class SystemDeleteFileParams(BaseModel):
+    target_path: str = Field(..., min_length=1, max_length=200)
+
+
 @dataclass
 class ToolDefinition:
     name: str
@@ -29,6 +37,7 @@ class ToolDefinition:
     param_schema: type[BaseModel]
     handler: Callable[[BaseModel], Any]
     requires_confirmation: bool = False
+    impact_formatter: Callable[[BaseModel], str] | None = None
 
 
 # Default strict allowlist of tools permitted in Viernes
@@ -37,6 +46,8 @@ DEFAULT_ALLOWLIST = {
     "system_volume_control",
     "ticktick_list_tasks",
     "ticktick_create_task",
+    "ticktick_delete_task",
+    "system_delete_file",
     "system_get_time",
 }
 
@@ -62,3 +73,9 @@ class ToolRegistry:
 
     def is_allowed(self, name: str) -> bool:
         return name in self.allowlist and name in self._tools
+
+    def format_impact(self, name: str, params: BaseModel) -> str:
+        tool = self.get_tool(name)
+        if tool and tool.impact_formatter:
+            return tool.impact_formatter(params)
+        return f"ejecutar la acción '{name}'"
