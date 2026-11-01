@@ -52,3 +52,23 @@ def test_ipc_server_lifecycle_and_command_dispatch(tmp_path: Path):
 def test_ipc_client_handles_non_existent_socket(tmp_path: Path):
     non_existent = tmp_path / "missing.sock"
     assert send_ptt_ipc_command("press", socket_path=non_existent) is False
+
+
+def test_main_cli_ptt_command(monkeypatch):
+    from unittest.mock import patch
+
+    import pytest
+
+    from viernes.main import main
+
+    with patch("viernes.input.ipc.send_ptt_ipc_command", return_value=True) as mock_send, \
+         patch("sys.argv", ["viernes", "--ptt", "press"]):
+        main()
+        mock_send.assert_called_once_with("press")
+
+    with patch("viernes.input.ipc.send_ptt_ipc_command", return_value=False), \
+         patch("sys.argv", ["viernes", "--ptt", "cancel"]), \
+         pytest.raises(SystemExit) as exc_info:
+        main()
+        assert exc_info.value.code == 1
+

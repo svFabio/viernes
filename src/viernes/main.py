@@ -17,7 +17,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Viernes: Modular Voice Assistant")
     parser.add_argument("prompt", nargs="*", help="Direct text prompt to speak or ask")
     parser.add_argument("--test-tts", action="store_true", help="Test TTS synthesis directly")
+    parser.add_argument(
+        "--ptt",
+        choices=["press", "release", "cancel"],
+        help="Send Push-to-Talk IPC trigger command (press, release, cancel) to the daemon",
+    )
     args = parser.parse_args()
+
+    if args.ptt:
+        from viernes.input.ipc import send_ptt_ipc_command
+
+        success = send_ptt_ipc_command(args.ptt)
+        if success:
+            logger.info("Push-to-Talk IPC command '%s' sent successfully.", args.ptt)
+            return
+        else:
+            logger.error("Could not send Push-to-Talk IPC command '%s'. Is Viernes running?", args.ptt)
+            sys.exit(1)
 
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     player = AudioPlayer()
