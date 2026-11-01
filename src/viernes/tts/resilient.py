@@ -45,7 +45,7 @@ class ResilientTTS(TTSProvider):
             try:
                 logger.info("Attempting synthesis with primary TTS provider.")
                 return self.primary.synthesize(text, output_path)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 err_str = str(exc).lower()
                 is_quota_error = any(kw in err_str for kw in QUOTA_ERROR_KEYWORDS)
 
@@ -58,7 +58,7 @@ class ResilientTTS(TTSProvider):
                     if self.on_fallback_activated:
                         try:
                             self.on_fallback_activated(exc)
-                        except Exception as cb_exc:  # noqa: BLE001
+                        except Exception as cb_exc:
                             logger.error("Error in on_fallback_activated callback: %s", cb_exc)
                 else:
                     logger.warning(
