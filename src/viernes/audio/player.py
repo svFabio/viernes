@@ -24,6 +24,10 @@ class AudioPlayer:
         )
 
     def play(self, audio_path: Path | str, blocking: bool = True) -> subprocess.Popen:
+        """Plays the specified audio file.
+
+        When blocking=False, immediately returns the spawned Popen process.
+        """
         path = Path(audio_path)
         if not path.is_file():
             raise FileNotFoundError(f"Audio file does not exist: {path}")
