@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ class ConfigService:
 
     def __init__(self, env_path: Path | None = None) -> None:
         self.env_path = env_path or self.resolve_env_path()
+        self._current_player: Any = None
+        self._player_lock = threading.Lock()
 
     @staticmethod
     def resolve_env_path() -> Path:
@@ -103,8 +106,68 @@ class ConfigService:
         synthesized = provider.synthesize(phrase, out_path)
 
         player = AudioPlayer()
-        player.play(synthesized)
+        with self._player_lock:
+            self._current_player = player
+
+        try:
+            player.play(synthesized)
+        finally:
+            with self._player_lock:
+                if self._current_player is player:
+                    self._current_player = None
+
         return synthesized
+
+    def stop_test_voice(self) -> None:
+        """Terminates any active audition audio playback."""
+        with self._player_lock:
+            if self._current_player is not None:
+                try:
+                    self._current_player.stop_all()
+                except Exception as exc:
+                    logger.debug("Error stopping audition player: %s", exc)
+                self._current_player = None
+
+    @staticmethod
+    def format_audition_error(exc: Exception) -> str:
+        """Translates exceptions during voice audition into clean, user-friendly messages."""
+        err_str = str(exc)
+        err_lower = err_str.lower()
+
+        # Check status_code attributes if present (e.g. ApiError, HTTPStatusError)
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None and hasattr(exc, "response"):
+            status_code = getattr(exc.response, "status_code", None)
+
+        if (
+            status_code == 401
+            or "401" in err_lower
+            or "unauthorized" in err_lower
+            or "invalid api key" in err_lower
+        ):
+            return "Credenciales inválidas (401): verifica tu API Key de ElevenLabs."
+
+        if status_code in (402, 429) or any(
+            t in err_lower
+            for t in (
+                "402",
+                "429",
+                "quota_exceeded",
+                "quota",
+                "rate limit",
+                "payment required",
+                "exceeded",
+            )
+        ):
+            return "Cuota agotada o límite alcanzado (402/429): revisa tu plan en ElevenLabs."
+
+        if "timeout" in err_lower or isinstance(exc, TimeoutError):
+            return "Tiempo de espera agotado al conectar con ElevenLabs."
+
+        if "connection" in err_lower or "network" in err_lower:
+            return "Error de conexión de red al contactar con ElevenLabs."
+
+        return err_str or "Error desconocido durante la audición."
 
     def get_service_status(self, service_name: str = "viernes.service") -> tuple[bool, str]:
         """Checks systemd user service status."""

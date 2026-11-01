@@ -1,4 +1,5 @@
 import logging
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -28,6 +29,17 @@ class ViernesControlCenter(ctk.CTk):
 
         # Load existing config
         self.current_config = self.config_service.read_config()
+
+        # State flags and lifecycle
+        self._is_closing = False
+        self._gui_queue: queue.Queue[Any] = queue.Queue()
+        self._threads_lock = threading.Lock()
+
+        # Start queue polling loop for thread-safe UI updates
+        self._poll_gui_queue()
+
+        # Handle window close protocol cleanly
+        self.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
         # Build UI layout
         self._build_header()
@@ -463,6 +475,12 @@ class ViernesControlCenter(ctk.CTk):
         try:
             self.config_service.save_config(updates)
             self.current_config = self.config_service.read_config()
+
+            # Signal reload/restart to service if active
+            is_active, _ = self.config_service.get_service_status()
+            if is_active:
+                self.config_service.control_service("restart")
+
             self.footer_status.configure(
                 text="✔ Cambios guardados exitosamente en .env",
                 text_color="#4ade80",
@@ -476,8 +494,71 @@ class ViernesControlCenter(ctk.CTk):
                 text_color="#f87171",
             )
 
+    def _poll_gui_queue(self) -> None:
+        """Processes callbacks posted from background worker threads safely on the main thread."""
+        if self._is_closing:
+            return
+
+        while not self._gui_queue.empty():
+            try:
+                task = self._gui_queue.get_nowait()
+                task()
+            except queue.Empty:
+                break
+            except Exception as exc:
+                logger.debug("Error executing queued GUI task: %s", exc)
+
+        if not self._is_closing:
+            try:
+                self.after(20, self._poll_gui_queue)
+            except Exception as exc:
+                logger.debug("Failed scheduling poll_gui_queue: %s", exc)
+
+    def safe_after(self, ms: int, func: Any, *args: Any) -> str | None:
+        """Dispatches GUI task safely via internal thread-safe queue or self.after."""
+        if self._is_closing:
+            return None
+
+        callback = func if not args else lambda: func(*args)
+
+        # If running from a background thread, route through the thread-safe queue
+        if threading.current_thread() is not threading.main_thread():
+            self._gui_queue.put(callback)
+            return "queued"
+
+        try:
+            return str(self.after(ms, callback))
+        except (tk.TclError, RuntimeError, Exception) as exc:
+            logger.debug("Suppressed after() during window teardown: %s", exc)
+            return None
+
+    def _on_close_window(self) -> None:
+        """Handles WM_DELETE_WINDOW protocol: cancels audition, terminates player processes, and destroys window cleanly."""
+        logger.info("Closing Viernes Control Center window...")
+        self._is_closing = True
+
+        # Drain and clear queue
+        while not self._gui_queue.empty():
+            try:
+                self._gui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            self.config_service.stop_test_voice()
+        except Exception as exc:
+            logger.debug("Error stopping test voice on close: %s", exc)
+
+        try:
+            self.destroy()
+        except Exception as exc:
+            logger.debug("Error destroying window: %s", exc)
+
     def _on_test_voice_clicked(self) -> None:
         """Synthesizes and plays back audition audio asynchronously."""
+        if self._is_closing:
+            return
+
         api_key = self.api_key_entry.get().strip()
         voice_id = self.voice_id_entry.get().strip()
 
@@ -497,24 +578,27 @@ class ViernesControlCenter(ctk.CTk):
         def _worker() -> None:
             try:
                 self.config_service.test_voice(api_key=api_key, voice_id=voice_id)
-                self.after(
-                    0,
-                    lambda: self.voice_test_status.configure(
-                        text="✔ Reproducción completada.",
-                        text_color="#4ade80",
-                    ),
-                )
+                if not self._is_closing:
+                    self.safe_after(
+                        0,
+                        lambda: self.voice_test_status.configure(
+                            text="✔ Reproducción completada.",
+                            text_color="#4ade80",
+                        ),
+                    )
             except Exception as exc:
-                err_msg = str(exc)
-                self.after(
-                    0,
-                    lambda: self.voice_test_status.configure(
-                        text=f"✖ Error: {err_msg}",
-                        text_color="#f87171",
-                    ),
-                )
+                if not self._is_closing:
+                    err_msg = self.config_service.format_audition_error(exc)
+                    self.safe_after(
+                        0,
+                        lambda: self.voice_test_status.configure(
+                            text=f"✖ {err_msg}",
+                            text_color="#f87171",
+                        ),
+                    )
             finally:
-                self.after(0, lambda: self.test_voice_btn.configure(state="normal"))
+                if not self._is_closing:
+                    self.safe_after(0, lambda: self.test_voice_btn.configure(state="normal"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -546,7 +630,8 @@ class ViernesControlCenter(ctk.CTk):
                 self.service_feedback_label.configure(text=msg, text_color=color)
                 self._update_service_status_badge()
 
-            self.after(0, _update_ui)
+            if not self._is_closing:
+                self.safe_after(0, _update_ui)
 
         threading.Thread(target=_worker, daemon=True).start()
 

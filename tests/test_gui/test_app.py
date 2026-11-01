@@ -1,4 +1,5 @@
 import os
+import tkinter as tk
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,100 @@ def test_gui_initialization_and_load(dummy_service: ConfigService) -> None:
         app.destroy()
     except Exception as exc:
         # If no X11/Wayland display server is available in CI
+        if "no display name" in str(exc).lower():
+            pytest.skip("Skipping GUI test because DISPLAY is not set.")
+        raise
+
+
+def test_gui_safe_after_suppresses_tcl_error(dummy_service: ConfigService) -> None:
+    try:
+        app = ViernesControlCenter(config_service=dummy_service)
+        app.withdraw()
+
+        called = []
+        # Normal safe_after
+        app.safe_after(0, lambda: called.append(True))
+        app.update()
+        assert called == [True]
+
+        # Closing state suppresses after()
+        app._is_closing = True
+        res = app.safe_after(0, lambda: called.append(False))
+        assert res is None
+
+        # TclError suppression
+        app._is_closing = False
+        with patch.object(app, "after", side_effect=tk.TclError("invalid command name")):
+            assert app.safe_after(0, lambda: None) is None
+
+        app.destroy()
+    except Exception as exc:
+        if "no display name" in str(exc).lower():
+            pytest.skip("Skipping GUI test because DISPLAY is not set.")
+        raise
+
+
+def test_gui_close_window_stops_player_and_destroys(dummy_service: ConfigService) -> None:
+    try:
+        app = ViernesControlCenter(config_service=dummy_service)
+        app.withdraw()
+
+        with (
+            patch.object(dummy_service, "stop_test_voice") as mock_stop_voice,
+            patch.object(app, "destroy") as mock_destroy,
+        ):
+            app._on_close_window()
+            assert app._is_closing is True
+            mock_stop_voice.assert_called_once()
+            mock_destroy.assert_called_once()
+
+    except Exception as exc:
+        if "no display name" in str(exc).lower():
+            pytest.skip("Skipping GUI test because DISPLAY is not set.")
+        raise
+
+
+def test_gui_test_voice_error_interception(dummy_service: ConfigService) -> None:
+    import time
+
+    try:
+        app = ViernesControlCenter(config_service=dummy_service)
+        app.withdraw()
+
+        # 1. 401 Credential error interception
+        with patch.object(
+            dummy_service,
+            "test_voice",
+            side_effect=Exception("status_code: 401 unauthorized"),
+        ):
+            app._on_test_voice_clicked()
+            for _ in range(50):
+                app.update()
+                time.sleep(0.02)
+                if "Credenciales inválidas (401)" in app.voice_test_status.cget("text"):
+                    break
+
+            status_text = app.voice_test_status.cget("text")
+            assert "Credenciales inválidas (401)" in status_text
+
+        # 2. 402/429 Quota exhausted interception
+        with patch.object(
+            dummy_service,
+            "test_voice",
+            side_effect=Exception("429 rate limit quota_exceeded"),
+        ):
+            app._on_test_voice_clicked()
+            for _ in range(50):
+                app.update()
+                time.sleep(0.02)
+                if "Cuota agotada o límite alcanzado (402/429)" in app.voice_test_status.cget("text"):
+                    break
+
+            status_text = app.voice_test_status.cget("text")
+            assert "Cuota agotada o límite alcanzado (402/429)" in status_text
+
+        app.destroy()
+    except Exception as exc:
         if "no display name" in str(exc).lower():
             pytest.skip("Skipping GUI test because DISPLAY is not set.")
         raise

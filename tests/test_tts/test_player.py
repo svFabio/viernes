@@ -102,3 +102,43 @@ def test_stop_all(tmp_path):
         mock_proc1.terminate.assert_called_once()
         mock_proc2.terminate.assert_not_called()
         assert len(player._active_processes) == 0
+
+
+def test_play_with_audio_output_device_mpv(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIO_OUTPUT_DEVICE", "alsa/default")
+    audio_file = tmp_path / "sample.mp3"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/mpv"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer()
+        player.play(audio_file)
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--audio-device=alsa/default" in args
+
+
+def test_play_with_audio_output_device_pw_play(tmp_path):
+    audio_file = tmp_path / "sample.mp3"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/pw-play"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer(backend="pw-play", output_device="42")
+        player.play(audio_file)
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--target" in args
+        assert "42" in args

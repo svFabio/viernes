@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -14,8 +15,9 @@ class AudioPlayer:
 
     SUPPORTED_BACKENDS = ("mpv", "pw-play", "paplay", "aplay")
 
-    def __init__(self, backend: str | None = None):
+    def __init__(self, backend: str | None = None, output_device: str | None = None):
         self.player_bin = backend or self._resolve_player()
+        self.output_device = output_device or os.getenv("AUDIO_OUTPUT_DEVICE")
         self._active_processes: list[subprocess.Popen] = []
         self._lock = threading.Lock()
 
@@ -64,11 +66,17 @@ class AudioPlayer:
             raise ValueError(f"Audio file is empty (0 bytes): {path}")
 
         cmd = [self.player_bin]
+        target_device = self.output_device or os.getenv("AUDIO_OUTPUT_DEVICE")
         if self.player_bin == "mpv":
             cmd.extend(["--no-terminal", "--no-video"])
             if volume is not None:
                 clamped = max(0, min(100, int(volume)))
                 cmd.append(f"--volume={clamped}")
+            if target_device:
+                cmd.append(f"--audio-device={target_device}")
+        elif self.player_bin == "pw-play":
+            if target_device:
+                cmd.extend(["--target", str(target_device)])
 
         cmd.append(str(path))
         logger.debug("Playing audio with command: %s", " ".join(cmd))
