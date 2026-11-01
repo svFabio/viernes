@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "elevenlabs>=2.75.0",
+    "faster-whisper>=1.2.1",
     "numpy>=2.5.4",
     "pydantic>=2.14.2",
     "pytest>=9.2.0",
@@ -51,7 +52,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = "sounddevice.*"
+module = ["sounddevice.*", "faster_whisper.*"]
 ignore_missing_imports = true
 
 
