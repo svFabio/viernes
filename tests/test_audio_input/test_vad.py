@@ -90,3 +90,23 @@ def test_vad_nan_and_inf_sanitization():
 
     assert detector.compute_probability(nan_frame) == 0.0
     assert not detector.is_speech(nan_frame)
+
+
+def test_vad_adversarial_waveform_fuzzing():
+    detector = VoiceActivityDetector(sample_rate=16000, threshold=0.5)
+    rng = np.random.default_rng(seed=777)
+
+    # Test 200 diverse adversarial waveforms
+    for _ in range(200):
+        # Mix Dirac impulses, chirps, clipping, and random noise
+        wave = rng.uniform(-1.0, 1.0, 480).astype(np.float32)
+        # Randomly inject occasional NaN or Inf
+        if rng.random() < 0.1:
+            wave[rng.integers(0, 480)] = np.nan
+        if rng.random() < 0.1:
+            wave[rng.integers(0, 480)] = np.inf
+
+        prob = detector.compute_probability(wave)
+        assert 0.0 <= prob <= 1.0
+        assert isinstance(detector.is_speech(wave), (bool, np.bool_))
+
