@@ -1,0 +1,23 @@
+[project]
+name = "viernes"
+version = "0.1.0"
+description = "Voice assistant with resilient TTS fallback and agent integration"
+readme = "README.md"
+authors = [
+    { name = "svFabio", email = "svfabio.andres@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "elevenlabs>=2.75.0",
+    "pydantic>=2.14.2",
+    "pytest>=9.2.0",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+viernes = "viernes.main:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
