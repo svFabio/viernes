@@ -45,18 +45,30 @@ class AudioPlayer:
             self._cleanup_finished_processes()
             return len(self._active_processes) > 0
 
-    def play(self, audio_path: Path | str, blocking: bool = True) -> subprocess.Popen:
+    def play(
+        self,
+        audio_path: Path | str,
+        blocking: bool = True,
+        volume: int | None = None,
+    ) -> subprocess.Popen:
         """Plays the specified audio file.
 
         When blocking=False, immediately returns the spawned Popen process.
+        Accepts optional volume (0-100) for supported backends (e.g. mpv).
         """
         path = Path(audio_path)
         if not path.is_file():
             raise FileNotFoundError(f"Audio file does not exist: {path}")
 
+        if path.stat().st_size == 0:
+            raise ValueError(f"Audio file is empty (0 bytes): {path}")
+
         cmd = [self.player_bin]
         if self.player_bin == "mpv":
             cmd.extend(["--no-terminal", "--no-video"])
+            if volume is not None:
+                clamped = max(0, min(100, int(volume)))
+                cmd.append(f"--volume={clamped}")
 
         cmd.append(str(path))
         logger.debug("Playing audio with command: %s", " ".join(cmd))

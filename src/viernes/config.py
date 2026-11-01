@@ -1,5 +1,6 @@
 import logging
 import os
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,6 +41,15 @@ class Settings(BaseModel):
     @property
     def masked_elevenlabs_api_key(self) -> str:
         return mask_secret(self.elevenlabs_api_key)
+
+    def create_temp_path(self, prefix: str = "audio", suffix: str = ".mp3") -> Path:
+        """Generates a secure temporary file path within temp_dir with 0o700 permissions."""
+        try:
+            self.temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.temp_dir, 0o700)
+        except Exception as exc:
+            logger.debug("Could not chmod temp_dir %s: %s", self.temp_dir, exc)
+        return self.temp_dir / f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
 
     def __repr__(self) -> str:
         return (

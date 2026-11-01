@@ -99,3 +99,98 @@ def test_qa_audio_player_process_failure_in_blocking(tmp_path):
         player = AudioPlayer()
         proc = player.play(audio_file, blocking=True)
         assert proc.poll() == 1
+
+
+def test_qa_audio_player_empty_file_raises_value_error(tmp_path):
+    empty_file = tmp_path / "empty.mp3"
+    empty_file.touch()
+
+    with patch("shutil.which", return_value="/usr/bin/mpv"):
+        player = AudioPlayer()
+        with pytest.raises(ValueError, match="Audio file is empty"):
+            player.play(empty_file)
+
+
+def test_qa_audio_player_volume_support(tmp_path):
+    audio_file = tmp_path / "valid.mp3"
+    audio_file.write_bytes(b"audio content")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/mpv"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer()
+        player.play(audio_file, blocking=True, volume=85)
+
+        mock_popen.assert_called_once_with(
+            ["mpv", "--no-terminal", "--no-video", "--volume=85", str(audio_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def test_qa_elevenlabs_output_path_is_dir(tmp_path):
+    mock_client = MagicMock()
+    mock_client.text_to_speech.convert.return_value = [b"chunk-data"]
+
+    provider = ElevenLabsProvider(
+        api_key="sk_valid_key_12345",
+        temp_dir=tmp_path,
+        client=mock_client,
+    )
+    custom_dir = tmp_path / "output_dir"
+    custom_dir.mkdir()
+
+    result = provider.synthesize("Output to directory", output_path=custom_dir)
+    assert result.is_file()
+    assert result.parent == custom_dir
+    assert result.suffix == ".mp3"
+
+
+def test_qa_elevenlabs_on_chunk_callback(tmp_path):
+    mock_client = MagicMock()
+    mock_client.text_to_speech.convert.return_value = [b"part1-", b"part2"]
+
+    provider = ElevenLabsProvider(
+        api_key="sk_valid_key_12345",
+        temp_dir=tmp_path,
+        client=mock_client,
+    )
+    chunks_collected = []
+
+    result = provider.synthesize(
+        "Testing chunk streaming callback",
+        on_chunk=lambda c: chunks_collected.append(c),
+    )
+    assert result.exists()
+    assert chunks_collected == [b"part1-", b"part2"]
+
+
+def test_qa_piper_output_path_is_dir(tmp_path):
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("", "")
+    mock_proc.returncode = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/piper"),
+        patch("subprocess.Popen", return_value=mock_proc),
+    ):
+        provider = PiperProvider(temp_dir=tmp_path)
+        custom_dir = tmp_path / "piper_dir"
+        custom_dir.mkdir()
+
+        result = provider.synthesize("Piper to dir", output_path=custom_dir)
+        assert result.parent == custom_dir
+        assert result.suffix == ".wav"
+
+
+def test_qa_settings_create_temp_path(tmp_path):
+    config = Settings(temp_dir=tmp_path / "custom_temp")
+    temp_file = config.create_temp_path("recording", ".wav")
+    assert temp_file.parent.exists()
+    assert temp_file.name.startswith("recording_")
+    assert temp_file.name.endswith(".wav")
+

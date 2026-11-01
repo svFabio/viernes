@@ -1,5 +1,6 @@
 import os
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -37,17 +38,25 @@ class ElevenLabsProvider(TTSProvider):
         self.temp_dir = Path(resolved or "/tmp/viernes")
         self.client = client or ElevenLabs(api_key=api_key, timeout=timeout)
 
-    def synthesize(self, text: str, output_path: Path | None = None) -> Path:
+    def synthesize(
+        self,
+        text: str,
+        output_path: Path | None = None,
+        on_chunk: Callable[[bytes], None] | None = None,
+    ) -> Path:
         """Synthesize text into MP3 audio via streaming chunks."""
         if not text or not text.strip():
             raise ValueError("Text cannot be empty or whitespace only.")
 
         if output_path is None:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            self.temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             output_path = self.temp_dir / f"elevenlabs_{uuid.uuid4().hex[:8]}.mp3"
         else:
             output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.is_dir():
+                output_path = output_path / f"elevenlabs_{uuid.uuid4().hex[:8]}.mp3"
+            else:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             audio_stream = self.client.text_to_speech.convert(
@@ -59,8 +68,14 @@ class ElevenLabsProvider(TTSProvider):
             with open(output_path, "wb") as f:
                 if isinstance(audio_stream, (bytes, bytearray)):
                     f.write(audio_stream)
+                    if on_chunk:
+                        on_chunk(audio_stream)
                 else:
-                    f.writelines(audio_stream)
+                    for chunk in audio_stream:
+                        if chunk:
+                            f.write(chunk)
+                            if on_chunk:
+                                on_chunk(chunk)
         except (httpx.TimeoutException, TimeoutError) as exc:
             raise TimeoutError(f"ElevenLabs request timed out after {self.timeout}s: {exc}") from exc
 

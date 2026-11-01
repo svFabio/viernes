@@ -32,11 +32,14 @@ class PiperProvider(TTSProvider):
             raise ValueError("Text cannot be empty or whitespace only.")
 
         if output_path is None:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            self.temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             output_path = self.temp_dir / f"piper_{uuid.uuid4().hex[:8]}.wav"
         else:
             output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.is_dir():
+                output_path = output_path / f"piper_{uuid.uuid4().hex[:8]}.wav"
+            else:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
 
         piper_executable = shutil.which(self.piper_bin)
         if not piper_executable:
