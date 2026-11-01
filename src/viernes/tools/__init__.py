@@ -1,3 +1,4 @@
+from viernes.tools.audit import AuditLogger, AuditRecord, sanitize_params
 from viernes.tools.registry import ToolDefinition, ToolRegistry
 from viernes.tools.schemas import (
     FileDeleteParams,
@@ -20,13 +21,14 @@ from viernes.tools.security import (
     SecurityPolicy,
     SecurityViolationError,
     inspect_for_shell_injection,
-    sanitize_params,
 )
 
 __all__ = [
     "DEFAULT_ALLOWLIST",
     "FORBIDDEN_TOOLS",
     "AuditLogEntry",
+    "AuditLogger",
+    "AuditRecord",
     "FileDeleteParams",
     "OpenAppParams",
     "SecurityGate",

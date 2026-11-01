@@ -2,14 +2,16 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import UTC, datetime
 import fnmatch
 import logging
 import re
 import time
 from typing import Any
 
-from pydantic import BaseModel, Field
+from viernes.tools.audit import AuditLogger, AuditRecord, sanitize_params
+
+# Alias for backwards compatibility
+AuditLogEntry = AuditRecord
 
 
 class SecurityViolationError(PermissionError):
@@ -95,48 +97,6 @@ def inspect_for_shell_injection(data: Any) -> None:
         for item in data:
             inspect_for_shell_injection(item)
 
-SENSITIVE_PATTERNS: tuple[str, ...] = (
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "api_key",
-    "apikey",
-    "auth",
-    "authorization",
-    "credential",
-    "credentials",
-    "private_key",
-    "bearer",
-)
-
-
-def sanitize_params(data: Any) -> Any:
-    """Recursively redacts sensitive values such as tokens or passwords."""
-    if isinstance(data, dict):
-        sanitized: dict[str, Any] = {}
-        for key, value in data.items():
-            key_lower = str(key).lower()
-            if any(pattern in key_lower for pattern in SENSITIVE_PATTERNS):
-                sanitized[key] = "[REDACTED]"
-            else:
-                sanitized[key] = sanitize_params(value)
-        return sanitized
-    if isinstance(data, list):
-        return [sanitize_params(item) for item in data]
-    return data
-
-
-class AuditLogEntry(BaseModel):
-    """Auditing record for a tool execution attempt."""
-
-    timestamp: str
-    tool_name: str
-    status: str
-    duration_ms: float | None = None
-    params: dict[str, Any] = Field(default_factory=dict)
-    error: str | None = None
-
 
 class SecurityPolicy:
     """Enforces strict allowlist and forbidden rules for tool execution."""
@@ -192,47 +152,20 @@ class SecurityGate:
     def __init__(
         self,
         policy: SecurityPolicy | None = None,
+        audit_logger: AuditLogger | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.policy = policy or SecurityPolicy()
-        self.logger = logger or logging.getLogger("viernes.tools.security")
-        self._audit_logs: list[AuditLogEntry] = []
+        self.audit_logger = audit_logger or AuditLogger(log=logger)
 
     @property
-    def audit_logs(self) -> list[AuditLogEntry]:
+    def audit_logs(self) -> list[AuditRecord]:
         """Returns in-memory audit logs."""
-        return list(self._audit_logs)
+        return self.audit_logger.get_records()
 
     def clear_audit_logs(self) -> None:
         """Clears in-memory audit logs."""
-        self._audit_logs.clear()
-
-    def _record_audit(self, entry: AuditLogEntry) -> None:
-        self._audit_logs.append(entry)
-        if entry.status == "SUCCESS":
-            self.logger.info(
-                "Tool execution audit: tool=%s status=%s duration=%.2fms params=%s",
-                entry.tool_name,
-                entry.status,
-                entry.duration_ms or 0.0,
-                entry.params,
-            )
-        elif entry.status == "REJECTED":
-            self.logger.warning(
-                "Tool execution blocked: tool=%s status=%s error=%s params=%s",
-                entry.tool_name,
-                entry.status,
-                entry.error,
-                entry.params,
-            )
-        else:
-            self.logger.error(
-                "Tool execution error: tool=%s status=%s error=%s params=%s",
-                entry.tool_name,
-                entry.status,
-                entry.error,
-                entry.params,
-            )
+        self.audit_logger.clear()
 
     @contextmanager
     def audit_execution(
@@ -242,46 +175,39 @@ class SecurityGate:
     ) -> Generator[None]:
         """Context manager to audit and protect tool execution."""
         start = time.perf_counter()
-        sanitized = sanitize_params(params or {})
 
         try:
             self.policy.validate_tool(tool_name)
             inspect_for_shell_injection(params or {})
         except SecurityViolationError as err:
             duration = (time.perf_counter() - start) * 1000
-            entry = AuditLogEntry(
-                timestamp=datetime.now(UTC).isoformat(),
+            self.audit_logger.record(
                 tool_name=tool_name,
                 status="REJECTED",
-                duration_ms=round(duration, 3),
-                params=sanitized,
+                duration_ms=duration,
+                params=params,
                 error=str(err),
             )
-            self._record_audit(entry)
             raise
 
         try:
             yield
             duration = (time.perf_counter() - start) * 1000
-            entry = AuditLogEntry(
-                timestamp=datetime.now(UTC).isoformat(),
+            self.audit_logger.record(
                 tool_name=tool_name,
                 status="SUCCESS",
-                duration_ms=round(duration, 3),
-                params=sanitized,
+                duration_ms=duration,
+                params=params,
             )
-            self._record_audit(entry)
         except Exception as exc:
             duration = (time.perf_counter() - start) * 1000
-            entry = AuditLogEntry(
-                timestamp=datetime.now(UTC).isoformat(),
+            self.audit_logger.record(
                 tool_name=tool_name,
                 status="ERROR",
-                duration_ms=round(duration, 3),
-                params=sanitized,
+                duration_ms=duration,
+                params=params,
                 error=str(exc),
             )
-            self._record_audit(entry)
             raise
 
 
@@ -289,6 +215,7 @@ __all__ = [
     "DEFAULT_ALLOWLIST",
     "FORBIDDEN_TOOLS",
     "AuditLogEntry",
+    "AuditRecord",
     "SecurityGate",
     "SecurityPolicy",
     "SecurityViolationError",
