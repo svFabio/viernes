@@ -50,3 +50,24 @@ def test_gitignore_contains_env():
     assert gitignore_file.exists()
     lines = gitignore_file.read_text().splitlines()
     assert ".env" in lines
+
+
+def test_create_temp_path_handles_chmod_exception(tmp_path, caplog):
+    config = Settings(temp_dir=tmp_path / "protected_temp")
+    with (
+        patch("os.chmod", side_effect=PermissionError("Permission denied")),
+        caplog.at_level(logging.DEBUG),
+    ):
+        p = config.create_temp_path()
+        assert p.parent.exists()
+        assert any("Could not chmod temp_dir" in rec.message for rec in caplog.records)
+
+
+def test_load_settings_handles_mkdir_chmod_exception(caplog):
+    with (
+        patch("os.chmod", side_effect=OSError("Read-only filesystem")),
+        caplog.at_level(logging.WARNING),
+    ):
+        loaded = load_settings()
+        assert loaded is not None
+        assert any("Could not pre-create temp_dir" in rec.message for rec in caplog.records)

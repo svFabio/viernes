@@ -87,9 +87,15 @@ def test_synthesize_bytes_stream(tmp_path):
     )
 
     target_file = tmp_path / "raw.mp3"
-    result = provider.synthesize("Test raw", output_path=target_file)
+    received_chunks = []
+    result = provider.synthesize(
+        "Test raw",
+        output_path=target_file,
+        on_chunk=lambda c: received_chunks.append(c),
+    )
     assert result == target_file.resolve()
     assert target_file.read_bytes() == b"raw-bytes-audio"
+    assert received_chunks == [b"raw-bytes-audio"]
 
 
 def test_synthesize_default_temp_dir(tmp_path):
