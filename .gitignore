@@ -7,4 +7,14 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# Environment secrets
+.env
+
+# Scrum tracking & worktrees
+.scrum/
+wt-*
+
+# Temporary files
+/tmp/
