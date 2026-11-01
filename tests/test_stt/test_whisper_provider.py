@@ -120,3 +120,15 @@ def test_whisper_exception_handled_cleanly(sample_wav: Path):
     result = provider.transcribe(sample_wav)
 
     assert result == ""
+
+
+def test_whisper_corrupt_non_audio_file(tmp_path: Path):
+    corrupt_file = tmp_path / "corrupt.wav"
+    corrupt_file.write_bytes(b"INVALID_HEADER_GARBAGE_BYTES")
+
+    mock_model = MagicMock()
+    mock_model.transcribe.side_effect = RuntimeError("Failed to decode audio")
+
+    provider = WhisperSTTProvider(model=mock_model)
+    # Must safely catch and return empty string without raising
+    assert provider.transcribe(corrupt_file) == ""
