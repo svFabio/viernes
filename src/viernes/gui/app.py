@@ -28,15 +28,34 @@ class ViernesControlCenter(ctk.CTk):
 
         # Load existing config
         self.current_config = self.config_service.read_config()
+        self._is_destroyed = False
 
         # Build UI layout
         self._build_header()
         self._build_tabs()
         self._build_footer()
 
+        # Handle window close protocol safely
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
         # Populate initial values
         self._load_config_values()
         self._update_service_status_badge()
+
+    def safe_after(self, ms: int, func: Any, *args: Any) -> None:
+        """Schedules a callback safely, suppressing execution if window is destroyed."""
+        if getattr(self, "_is_destroyed", False):
+            return
+        try:
+            if self.winfo_exists():
+                self.after(ms, func, *args)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def destroy(self) -> None:
+        """Cleans up resources and marks window as destroyed."""
+        self._is_destroyed = True
+        super().destroy()
 
     def _build_header(self) -> None:
         """Constructs application top header and status indicator."""
@@ -147,6 +166,7 @@ class ViernesControlCenter(ctk.CTk):
             height=36,
         )
         self.voice_id_entry.pack(fill="x", pady=(0, 16))
+        self.voice_id_entry.bind("<KeyRelease>", self._on_voice_id_entry_changed)
 
         # Audition Test Button & Status
         self.test_voice_btn = ctk.CTkButton(
@@ -351,8 +371,8 @@ class ViernesControlCenter(ctk.CTk):
         self.api_key_entry.delete(0, "end")
         self.api_key_entry.insert(0, key)
 
-        # 2. Voice ID & Preset
-        voice_id = cfg.get("ELEVENLABS_VOICE_ID", PRESET_VOICES["Jessica (Oficial)"])
+        # 2. Voice ID & Preset (Defaulting to Jessica)
+        voice_id = cfg.get("ELEVENLABS_VOICE_ID", "").strip() or PRESET_VOICES["Jessica (Oficial)"]
         self.voice_id_entry.delete(0, "end")
         self.voice_id_entry.insert(0, voice_id)
 
@@ -412,10 +432,22 @@ class ViernesControlCenter(ctk.CTk):
 
     def _on_voice_preset_selected(self, choice: str) -> None:
         """Fills Voice ID entry when a preset voice is picked."""
+        self.voice_combo.set(choice)
         if choice in PRESET_VOICES:
             vid = PRESET_VOICES[choice]
             self.voice_id_entry.delete(0, "end")
             self.voice_id_entry.insert(0, vid)
+        elif choice == "Personalizada (Custom ID)":
+            self.voice_id_entry.focus_set()
+
+    def _on_voice_id_entry_changed(self, event: Any = None) -> None:
+        """Dynamically matches entered Voice ID to presets or sets to Custom."""
+        current_id = self.voice_id_entry.get().strip()
+        for preset_name, vid in PRESET_VOICES.items():
+            if vid == current_id:
+                self.voice_combo.set(preset_name)
+                return
+        self.voice_combo.set("Personalizada (Custom ID)")
 
     def _on_vad_slider_changed(self, value: float) -> None:
         """Updates live VAD sensitivity label."""
@@ -426,17 +458,25 @@ class ViernesControlCenter(ctk.CTk):
         self.silence_val_label.configure(text=f"{int(value)} ms")
 
     def _on_save_clicked(self) -> None:
-        """Collects GUI values and persists them to the .env file."""
-        updates: dict[str, str] = {}
+        """Collects GUI values, validates credentials, persists to .env, and triggers service reload if active."""
+        # 1. Validate & sanitize API Key
+        raw_key = self.api_key_entry.get()
+        _, clean_key, key_warning = self.config_service.validate_api_key(raw_key)
 
-        # API Key
-        key = self.api_key_entry.get().strip()
-        updates["ELEVENLABS_API_KEY"] = key
+        # 2. Validate & sanitize Voice ID
+        raw_vid = self.voice_id_entry.get()
+        _, clean_vid, vid_warning = self.config_service.validate_voice_id(raw_vid)
 
-        # Voice ID
-        vid = self.voice_id_entry.get().strip()
-        if vid:
-            updates["ELEVENLABS_VOICE_ID"] = vid
+        # Reflect sanitized values
+        self.api_key_entry.delete(0, "end")
+        self.api_key_entry.insert(0, clean_key)
+        self.voice_id_entry.delete(0, "end")
+        self.voice_id_entry.insert(0, clean_vid)
+
+        updates: dict[str, str] = {
+            "ELEVENLABS_API_KEY": clean_key,
+            "ELEVENLABS_VOICE_ID": clean_vid,
+        }
 
         # Input device
         selected_in = self.input_combo.get()
@@ -463,12 +503,45 @@ class ViernesControlCenter(ctk.CTk):
         try:
             self.config_service.save_config(updates)
             self.current_config = self.config_service.read_config()
-            self.footer_status.configure(
-                text="✔ Cambios guardados exitosamente en .env",
-                text_color="#4ade80",
-            )
-            # Re-read status
-            self._update_service_status_badge()
+
+            warning_note = f" ({key_warning})" if key_warning else ""
+
+            # SUB-20.4: Check if viernes.service is active and trigger reload/restart
+            is_active, _ = self.config_service.get_service_status()
+            if is_active:
+                self.footer_status.configure(
+                    text="✔ Cambios guardados en .env. Recargando servicio...",
+                    text_color="#38bdf8",
+                )
+
+                def _reload_worker() -> None:
+                    reloaded, r_msg = self.config_service.control_service("try-restart")
+                    if not reloaded:
+                        reloaded, r_msg = self.config_service.control_service("reload-or-restart")
+
+                    def _after_reload() -> None:
+                        if reloaded:
+                            self.footer_status.configure(
+                                text=f"✔ Cambios guardados exitosamente en .env (Servicio reiniciado){warning_note}",
+                                text_color="#4ade80",
+                            )
+                        else:
+                            self.footer_status.configure(
+                                text=f"✔ Guardado en .env (Aviso: {r_msg}){warning_note}",
+                                text_color="#fbbf24",
+                            )
+                        self._update_service_status_badge()
+
+                    self.safe_after(0, _after_reload)
+
+                threading.Thread(target=_reload_worker, daemon=True).start()
+            else:
+                self.footer_status.configure(
+                    text=f"✔ Cambios guardados exitosamente en .env{warning_note}",
+                    text_color="#4ade80" if not key_warning else "#fbbf24",
+                )
+                self._update_service_status_badge()
+
         except Exception as exc:
             logger.error("Failed saving configuration: %s", exc)
             self.footer_status.configure(
@@ -497,7 +570,7 @@ class ViernesControlCenter(ctk.CTk):
         def _worker() -> None:
             try:
                 self.config_service.test_voice(api_key=api_key, voice_id=voice_id)
-                self.after(
+                self.safe_after(
                     0,
                     lambda: self.voice_test_status.configure(
                         text="✔ Reproducción completada.",
@@ -506,7 +579,7 @@ class ViernesControlCenter(ctk.CTk):
                 )
             except Exception as exc:
                 err_msg = str(exc)
-                self.after(
+                self.safe_after(
                     0,
                     lambda: self.voice_test_status.configure(
                         text=f"✖ Error: {err_msg}",
@@ -514,26 +587,65 @@ class ViernesControlCenter(ctk.CTk):
                     ),
                 )
             finally:
-                self.after(0, lambda: self.test_voice_btn.configure(state="normal"))
+                self.safe_after(0, lambda: self.test_voice_btn.configure(state="normal"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _update_service_status_badge(self) -> None:
-        """Refreshes systemd service state indicator."""
-        is_active, status_desc = self.config_service.get_service_status()
+    def _apply_service_status(self, is_active: bool, status_desc: str) -> None:
+        """Applies status text and semantic colors to header badge and service tab."""
+        stat_lower = status_desc.lower()
         if is_active:
             self.status_badge.configure(text="● Servicio Activo", text_color="#4ade80")
             self.service_state_desc.configure(
-                text=f"Estado: {status_desc.upper()}", text_color="#4ade80"
+                text=f"Estado: {status_desc.upper()} (En ejecución)", text_color="#4ade80"
+            )
+        elif stat_lower == "failed":
+            self.status_badge.configure(text="● Servicio Fallido", text_color="#f87171")
+            self.service_state_desc.configure(
+                text=f"Estado: {status_desc.upper()} (Fallido)", text_color="#f87171"
+            )
+        elif stat_lower == "no disponible":
+            self.status_badge.configure(text="○ Servicio No Disponible", text_color="gray60")
+            self.service_state_desc.configure(
+                text="Estado: NO DISPONIBLE (systemctl no detectado)", text_color="gray60"
             )
         else:
             self.status_badge.configure(text="○ Servicio Inactivo", text_color="gray60")
             self.service_state_desc.configure(
-                text=f"Estado: {status_desc.upper()}", text_color="gray60"
+                text=f"Estado: {status_desc.upper()} (Detenido)", text_color="gray60"
             )
 
+    def _update_service_status_badge(
+        self,
+        async_call: bool = True,
+        callback: Any | None = None,
+    ) -> None:
+        """Refreshes systemd service state indicator non-blockingly."""
+        if not async_call:
+            is_active, status_desc = self.config_service.get_service_status()
+            self._apply_service_status(is_active, status_desc)
+            if callback:
+                callback(is_active, status_desc)
+            return
+
+        def _worker() -> None:
+            is_active, status_desc = self.config_service.get_service_status()
+
+            def _apply() -> None:
+                self._apply_service_status(is_active, status_desc)
+                if callback:
+                    callback(is_active, status_desc)
+
+            self.safe_after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _trigger_service_action(self, action: str) -> None:
-        """Executes a systemctl service command and updates display."""
+        """Executes a systemctl service command asynchronously and updates display."""
+        self.btn_start.configure(state="disabled")
+        self.btn_restart.configure(state="disabled")
+        self.btn_stop.configure(state="disabled")
+
         self.service_feedback_label.configure(
             text=f"Ejecutando {action}...", text_color="#38bdf8"
         )
@@ -544,9 +656,12 @@ class ViernesControlCenter(ctk.CTk):
 
             def _update_ui() -> None:
                 self.service_feedback_label.configure(text=msg, text_color=color)
+                self.btn_start.configure(state="normal")
+                self.btn_restart.configure(state="normal")
+                self.btn_stop.configure(state="normal")
                 self._update_service_status_badge()
 
-            self.after(0, _update_ui)
+            self.safe_after(0, _update_ui)
 
         threading.Thread(target=_worker, daemon=True).start()
 
