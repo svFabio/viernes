@@ -70,6 +70,6 @@ class AudioPlayer:
                 try:
                     proc.terminate()
                     proc.wait(timeout=1.0)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("Error stopping audio player process %s: %s", getattr(proc, "pid", "unknown"), exc)
         self._active_processes.clear()
