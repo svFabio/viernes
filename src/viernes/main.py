@@ -81,6 +81,88 @@ async def run_pipeline_turn(
     )
 
 
+def run_listener_loop(
+    pipeline: StreamingPipeline,
+    barge_in: BargeInController,
+    temp_dir: Path,
+    continuous: bool = False,
+) -> None:
+    import os
+    import threading
+    import time
+    from viernes.audio.recorder import AudioRecorder
+    from viernes.input.ipc import PushToTalkIPCServer
+    from viernes.input.push_to_talk import PushToTalkController
+    from viernes.stt.whisper_provider import WhisperSTTProvider
+
+    logger.info("Initializing Speech Recognition (Whisper model: base)...")
+    whisper = WhisperSTTProvider(model_size="base", language="es")
+    recorder = AudioRecorder(temp_dir=temp_dir)
+
+    is_turn_active = False
+    turn_lock = threading.Lock()
+
+    def handle_speech_capture() -> None:
+        nonlocal is_turn_active
+        with turn_lock:
+            if is_turn_active:
+                return
+            is_turn_active = True
+
+        try:
+            logger.info("Microphone is active. Speak now...")
+            wav_path = recorder.record_utterance(timeout_s=20.0)
+            if wav_path and wav_path.is_file():
+                logger.info("Transcribing speech with Whisper...")
+                prompt = whisper.transcribe(wav_path)
+                logger.info("Recognized prompt: '%s'", prompt)
+                if prompt and prompt.strip():
+                    asyncio.run(run_pipeline_turn(prompt, pipeline, barge_in))
+        except Exception as exc:
+            logger.error("Error during speech turn: %s", exc)
+        finally:
+            with turn_lock:
+                is_turn_active = False
+
+    if continuous:
+        logger.info("Viernes is listening CONTINUOUSLY on your microphone. Speak whenever you want.")
+        try:
+            while True:
+                handle_speech_capture()
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Stopping continuous listener...")
+        return
+
+    def on_ptt_start() -> None:
+        logger.info("Push-to-Talk triggered: capturing audio.")
+        barge_in.handle_user_speech_detected()
+        threading.Thread(target=handle_speech_capture, daemon=True).start()
+
+    def on_ptt_finish() -> None:
+        logger.debug("Push-to-Talk released.")
+
+    def on_ptt_cancel() -> None:
+        logger.info("Push-to-Talk cancelled.")
+        recorder.close()
+
+    controller = PushToTalkController(
+        on_start=on_ptt_start,
+        on_finish=on_ptt_finish,
+        on_cancel=on_ptt_cancel,
+    )
+
+    socket_path = Path(os.getenv("VIERNES_PTT_SOCKET", "/tmp/viernes_ptt.sock"))
+    logger.info("Starting Viernes Daemon. IPC socket: %s", socket_path)
+
+    with PushToTalkIPCServer(controller=controller, socket_path=socket_path):
+        logger.info("Viernes is ACTIVE and listening for PTT commands ('viernes --ptt press' or global hotkey).")
+        try:
+            while True:
+                time.sleep(1)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Stopping Viernes daemon gracefully...")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Viernes: Modular Voice Assistant")
     parser.add_argument("prompt", nargs="*", help="Direct text prompt to speak or ask")
@@ -91,6 +173,7 @@ def main() -> None:
     parser.add_argument("--list-audio-devices", action="store_true", help="List detected microphones and speakers")
     parser.add_argument("--ptt", choices=["press", "release", "cancel"], help="Send Push-to-Talk IPC command")
     parser.add_argument("--gui", action="store_true", help="Launch the Viernes Control Center GUI")
+    parser.add_argument("--continuous", action="store_true", help="Continuously listen on microphone with VAD")
     args = parser.parse_args()
 
     if args.gui:
@@ -137,23 +220,28 @@ def main() -> None:
             sys.exit(1)
         return
 
-    if text_to_speak:
-        # Build streaming pipeline with sequential playback and barge-in controller
-        playback_queue = SequentialPlaybackQueue(lambda p: player.play(p, blocking=True))
-        pipeline = StreamingPipeline(
-            agent=brain,
-            tts_synthesizer=lambda text, out: tts.synthesize(text, out),
-            playback_queue=playback_queue,
-            temp_dir=settings.temp_dir,
-        )
-        barge_in = BargeInController(
-            playback_queue=playback_queue,
-            streaming_pipeline=pipeline,
-        )
+    # Build streaming pipeline with sequential playback and barge-in controller
+    playback_queue = SequentialPlaybackQueue(lambda p: player.play(p, blocking=True))
+    pipeline = StreamingPipeline(
+        agent=brain,
+        tts_synthesizer=lambda text, out: tts.synthesize(text, out),
+        playback_queue=playback_queue,
+        temp_dir=settings.temp_dir,
+    )
+    barge_in = BargeInController(
+        playback_queue=playback_queue,
+        streaming_pipeline=pipeline,
+    )
 
+    if text_to_speak:
         asyncio.run(run_pipeline_turn(text_to_speak, pipeline, barge_in))
     else:
-        logger.info("Viernes ready. Provide a prompt to ask or use --test-tts.")
+        run_listener_loop(
+            pipeline=pipeline,
+            barge_in=barge_in,
+            temp_dir=settings.temp_dir,
+            continuous=args.continuous,
+        )
 
 
 if __name__ == "__main__":

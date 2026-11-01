@@ -125,3 +125,7 @@ class BargeInController:
             INTERRUPTION_LATENCY_TARGET_MS,
         )
         return True
+
+    def handle_user_speech_detected(self) -> None:
+        """Explicit trigger indicating user started speaking, aborting current playback."""
+        self.handle_voice_detected(mic_energy=1.0, speaker_energy=0.0, vad_active=True)
