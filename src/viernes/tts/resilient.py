@@ -36,7 +36,7 @@ class ResilientTTS(TTSProvider):
         self.on_fallback_activated = on_fallback_activated
         self.quota_exhausted: bool = False
 
-    def synthesize(self, text: str, output_path: Path) -> Path:
+    def synthesize(self, text: str, output_path: Path | None = None) -> Path:
         if not self.quota_exhausted:
             try:
                 logger.info("Attempting synthesis with primary TTS provider.")

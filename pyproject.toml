@@ -40,3 +40,18 @@ ignore = [
     "UP045",
 ]
 
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "sounddevice.*"
+ignore_missing_imports = true
+
+

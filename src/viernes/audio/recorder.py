@@ -132,7 +132,8 @@ class AudioRecorder:
         """Normalizes and validates a captured PCM frame to int16."""
         if frame.dtype != np.int16:
             if frame.dtype in (np.float32, np.float64):
-                return (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16)
+                clipped: np.ndarray = np.clip(frame, -1.0, 1.0)
+                return (clipped * 32767).astype(np.int16)
             return frame.astype(np.int16)
         return frame
 

@@ -18,8 +18,8 @@ class PiperProvider(TTSProvider):
     ):
         model = model_path if model_path is not None else os.getenv("PIPER_MODEL_PATH", "")
         self.model_path = str(model) if model else ""
-        self.piper_bin = piper_bin or os.getenv("PIPER_BIN", "piper")
-        self.temp_dir = Path(temp_dir or os.getenv("VIERNES_TEMP_DIR", "/tmp/viernes"))
+        self.piper_bin = piper_bin or os.getenv("PIPER_BIN") or "piper"
+        self.temp_dir = Path(temp_dir or os.getenv("VIERNES_TEMP_DIR") or "/tmp/viernes")
 
     def synthesize(self, text: str, output_path: Path | None = None) -> Path:
         """Synthesize text into WAV audio using Piper neural TTS."""

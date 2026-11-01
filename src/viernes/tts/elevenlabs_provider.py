@@ -33,7 +33,7 @@ class ElevenLabsProvider(TTSProvider):
         self.model_id = model_id
         self.output_format = output_format
         self.timeout = timeout
-        self.temp_dir = Path(temp_dir or os.getenv("VIERNES_TEMP_DIR", "/tmp/viernes"))
+        self.temp_dir = Path(temp_dir or os.getenv("VIERNES_TEMP_DIR") or "/tmp/viernes")
         self.client = client or ElevenLabs(api_key=api_key, timeout=timeout)
 
     def synthesize(self, text: str, output_path: Path | None = None) -> Path:
