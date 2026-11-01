@@ -102,3 +102,90 @@ def test_stop_all(tmp_path):
         mock_proc1.terminate.assert_called_once()
         mock_proc2.terminate.assert_not_called()
         assert len(player._active_processes) == 0
+
+
+def test_play_mpv_with_device_parameter(tmp_path):
+    audio_file = tmp_path / "sample.mp3"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/mpv"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer()
+        player.play(audio_file, device="alsa/hdmi:CARD=NVidia,DEV=0")
+
+        mock_popen.assert_called_once_with(
+            ["mpv", "--no-terminal", "--no-video", "--audio-device=alsa/hdmi:CARD=NVidia,DEV=0", str(audio_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def test_play_mpv_with_env_device(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIO_OUTPUT_DEVICE", "pulse/alsa_output.pci-0000_00_1f.3.analog-stereo")
+    audio_file = tmp_path / "sample.mp3"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/mpv"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer()
+        player.play(audio_file)
+
+        mock_popen.assert_called_once_with(
+            ["mpv", "--no-terminal", "--no-video", "--audio-device=pulse/alsa_output.pci-0000_00_1f.3.analog-stereo", str(audio_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def test_play_pw_play_with_device_parameter(tmp_path):
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/pw-play"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer(backend="pw-play")
+        player.play(audio_file, device="alsa_output.usb-device")
+
+        mock_popen.assert_called_once_with(
+            ["pw-play", "--target=alsa_output.usb-device", str(audio_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def test_play_pw_play_with_env_device(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIO_OUTPUT_DEVICE", "42")
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"mock audio data")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/pw-play"),
+        patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        player = AudioPlayer(backend="pw-play")
+        player.play(audio_file)
+
+        mock_popen.assert_called_once_with(
+            ["pw-play", "--target=42", str(audio_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
