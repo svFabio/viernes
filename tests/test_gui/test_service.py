@@ -47,8 +47,52 @@ def test_audio_device_listing() -> None:
         inputs = service.get_audio_input_devices()
         outputs = service.get_audio_output_devices()
 
+        assert inputs[0] == ("Por defecto del sistema", "")
+        assert outputs[0] == ("Por defecto del sistema", "")
         assert any("[0] Built-in Mic" in disp for disp, raw in inputs)
         assert any("[1] Headphones" in disp for disp, raw in outputs)
+
+
+def test_audio_device_listing_exception_fallback() -> None:
+    with patch("viernes.gui.service.list_audio_devices", side_effect=RuntimeError("PortAudio unavailable")):
+        service = ConfigService()
+        inputs = service.get_audio_input_devices()
+        outputs = service.get_audio_output_devices()
+
+        assert inputs == [("Por defecto del sistema", "")]
+        assert outputs == [("Por defecto del sistema", "")]
+
+
+def test_test_voice_with_device_parameter(tmp_path: Path) -> None:
+    service = ConfigService()
+    dummy_out = tmp_path / "audition_test.mp3"
+    dummy_out.write_bytes(b"dummy")
+
+    with (
+        patch("viernes.tts.elevenlabs_provider.ElevenLabsProvider.synthesize", return_value=dummy_out) as mock_synth,
+        patch("viernes.audio.player.AudioPlayer.__init__", return_value=None) as mock_player_init,
+        patch("viernes.audio.player.AudioPlayer.play") as mock_play,
+    ):
+        res = service.test_voice(
+            api_key="sk_test",
+            voice_id="custom_voice",
+            device="alsa/hw:0,0",
+            temp_dir=tmp_path,
+        )
+        assert res == dummy_out
+        mock_synth.assert_called_once()
+        mock_player_init.assert_called_once_with(device="alsa/hw:0,0")
+        mock_play.assert_called_once_with(dummy_out)
+
+
+def test_stop_playback() -> None:
+    service = ConfigService()
+    mock_player = MagicMock()
+    service._current_player = mock_player
+
+    service.stop_playback()
+    mock_player.stop_all.assert_called_once()
+    assert service._current_player is None
 
 
 def test_test_voice_empty_key_raises() -> None:

@@ -23,6 +23,9 @@ class ViernesControlCenter(ctk.CTk):
         self.geometry("680x760")
         self.minsize(620, 680)
 
+        self._is_closing = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
@@ -70,16 +73,56 @@ class ViernesControlCenter(ctk.CTk):
 
     def _build_tabs(self) -> None:
         """Constructs tab navigation."""
-        self.tabview = ctk.CTkTabview(self, corner_radius=10)
+        self.tabview = ctk.CTkTabview(self, corner_radius=10, command=self._on_tab_changed)
         self.tabview.pack(fill="both", expand=True, padx=16, pady=8)
 
         self.tab_voice = self.tabview.add("Credenciales & Voz")
-        self.tab_audio = self.tabview.add("Dispositivos de Audio")
+        self.tab_audio = self.tabview.add("Hardware de Audio")
         self.tab_service = self.tabview.add("Servicio & Estado")
 
         self._build_voice_tab()
         self._build_audio_tab()
         self._build_service_tab()
+
+    def _on_tab_changed(self) -> None:
+        """Invoked when user switches tabs."""
+        current_tab = self.tabview.get()
+        if current_tab == "Hardware de Audio":
+            self.refresh_audio_devices()
+        elif current_tab == "Servicio & Estado":
+            self._update_service_status_badge()
+
+    def refresh_audio_devices(self) -> None:
+        """Dynamically re-enumerates audio devices and updates option menus."""
+        self.input_devices = self.config_service.get_audio_input_devices()
+        input_displays = [disp for disp, _ in self.input_devices]
+        current_in = self.input_combo.get()
+        self.input_combo.configure(values=input_displays or ["Por defecto del sistema"])
+        if current_in in input_displays:
+            self.input_combo.set(current_in)
+        else:
+            input_dev = self.current_config.get("AUDIO_INPUT_DEVICE", "")
+            for disp, raw_val in self.input_devices:
+                if raw_val and (raw_val == input_dev or input_dev in disp):
+                    self.input_combo.set(disp)
+                    break
+            else:
+                self.input_combo.set("Por defecto del sistema")
+
+        self.output_devices = self.config_service.get_audio_output_devices()
+        output_displays = [disp for disp, _ in self.output_devices]
+        current_out = self.output_combo.get()
+        self.output_combo.configure(values=output_displays or ["Por defecto del sistema"])
+        if current_out in output_displays:
+            self.output_combo.set(current_out)
+        else:
+            output_dev = self.current_config.get("AUDIO_OUTPUT_DEVICE", "")
+            for disp, raw_val in self.output_devices:
+                if raw_val and (raw_val == output_dev or output_dev in disp):
+                    self.output_combo.set(disp)
+                    break
+            else:
+                self.output_combo.set("Por defecto del sistema")
 
     def _build_voice_tab(self) -> None:
         """Builds credentials and TTS voice selection tab."""
@@ -423,7 +466,8 @@ class ViernesControlCenter(ctk.CTk):
 
     def _on_silence_slider_changed(self, value: float) -> None:
         """Updates live silence timeout label."""
-        self.silence_val_label.configure(text=f"{int(value)} ms")
+        rounded = int(round(value / 100.0) * 100)
+        self.silence_val_label.configure(text=f"{rounded} ms")
 
     def _on_save_clicked(self) -> None:
         """Collects GUI values and persists them to the .env file."""
@@ -458,7 +502,7 @@ class ViernesControlCenter(ctk.CTk):
 
         # VAD & Silence
         updates["VAD_THRESHOLD"] = f"{self.vad_slider.get():.4f}"
-        updates["SILENCE_TIMEOUT_MS"] = str(int(self.silence_slider.get()))
+        updates["SILENCE_TIMEOUT_MS"] = str(int(round(self.silence_slider.get() / 100.0) * 100))
 
         try:
             self.config_service.save_config(updates)
@@ -483,21 +527,38 @@ class ViernesControlCenter(ctk.CTk):
 
         if not api_key:
             self.voice_test_status.configure(
-                text="⚠ Ingresa una API Key válida primero.",
+                text="⚠ Ingresa una API Key válida primero",
                 text_color="#f87171",
             )
             return
 
+        choice = self.voice_combo.get()
+        if choice and "Personalizada" not in choice and "Custom" not in choice:
+            voice_name = choice.split(" (")[0]
+        else:
+            voice_name = "Jessica"
+
         self.voice_test_status.configure(
-            text="Sintetizando y reproduciendo con Jessica...",
+            text=f"Sintetizando y reproduciendo con {voice_name}...",
             text_color="#38bdf8",
         )
         self.test_voice_btn.configure(state="disabled")
 
+        selected_out = self.output_combo.get()
+        out_device = ""
+        for disp, raw_val in self.output_devices:
+            if disp == selected_out:
+                out_device = raw_val
+                break
+
         def _worker() -> None:
             try:
-                self.config_service.test_voice(api_key=api_key, voice_id=voice_id)
-                self.after(
+                self.config_service.test_voice(
+                    api_key=api_key,
+                    voice_id=voice_id,
+                    device=out_device,
+                )
+                self._safe_after(
                     0,
                     lambda: self.voice_test_status.configure(
                         text="✔ Reproducción completada.",
@@ -505,18 +566,59 @@ class ViernesControlCenter(ctk.CTk):
                     ),
                 )
             except Exception as exc:
-                err_msg = str(exc)
-                self.after(
+                logger.warning("Voice audition failed: %s", exc)
+                err_msg = self.format_audition_error(exc)
+
+                self._safe_after(
                     0,
-                    lambda: self.voice_test_status.configure(
-                        text=f"✖ Error: {err_msg}",
+                    lambda msg=err_msg: self.voice_test_status.configure(
+                        text=msg,
                         text_color="#f87171",
                     ),
                 )
             finally:
-                self.after(0, lambda: self.test_voice_btn.configure(state="normal"))
+                self._safe_after(
+                    0,
+                    lambda: self.test_voice_btn.configure(state="normal"),
+                )
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    @staticmethod
+    def format_audition_error(exc: Exception) -> str:
+        """Translates backend audition exceptions into user-friendly localized messages."""
+        raw_err = str(exc)
+        err_lower = raw_err.lower()
+        if "401" in raw_err or "unauthorized" in err_lower:
+            return "⚠ Error 401: API Key no autorizada o inválida."
+        if "402" in raw_err or "429" in raw_err or "quota" in err_lower or "rate limit" in err_lower:
+            return "⚠ Error 429: Cuota de ElevenLabs agotada o rate limit."
+        if (
+            isinstance(exc, (TimeoutError, ConnectionError))
+            or "timeout" in err_lower
+            or "timed out" in err_lower
+            or "connect" in err_lower
+        ):
+            return "⚠ Error de red: Tiempo de espera agotado o sin conexión."
+        return f"✖ Error: {raw_err}"
+
+    def _safe_after(self, ms: int, func: Any) -> None:
+        """Schedules callback safely if window is still active."""
+        if getattr(self, "_is_closing", False):
+            return
+        try:
+            self.after(ms, func)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _on_close(self) -> None:
+        """Terminates active audio playback and closes GUI cleanly."""
+        self._is_closing = True
+        try:
+            self.config_service.stop_playback()
+        except Exception as exc:
+            logger.debug("Error stopping playback on close: %s", exc)
+        self.destroy()
 
     def _update_service_status_badge(self) -> None:
         """Refreshes systemd service state indicator."""
@@ -546,7 +648,7 @@ class ViernesControlCenter(ctk.CTk):
                 self.service_feedback_label.configure(text=msg, text_color=color)
                 self._update_service_status_badge()
 
-            self.after(0, _update_ui)
+            self._safe_after(0, _update_ui)
 
         threading.Thread(target=_worker, daemon=True).start()
 
