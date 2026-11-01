@@ -1,6 +1,10 @@
 from unittest.mock import MagicMock, patch
 
-from viernes.input.push_to_talk import PushToTalkController, PushToTalkState
+from viernes.input.push_to_talk import (
+    PushToTalkController,
+    PushToTalkState,
+    send_desktop_notification,
+)
 
 
 def test_push_to_talk_default_and_env_shortcut(monkeypatch):
@@ -111,3 +115,24 @@ def test_push_to_talk_ipc_commands():
 
         controller.handle_ipc_command("cancel")
         mock_esc.assert_called_once()
+
+
+def test_send_desktop_notification_silenced_in_test(monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_active")
+    with patch("subprocess.Popen") as mock_popen:
+        send_desktop_notification("Viernes", "Escuchando...")
+        mock_popen.assert_not_called()
+
+
+def test_send_desktop_notification_replaces_card(monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with (
+        patch("shutil.which", return_value="/usr/bin/notify-send"),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        send_desktop_notification("Viernes", "Escuchando...")
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "string:x-canonical-private-synchronous:viernes" in args
+        assert "-t" in args
+        assert "2000" in args

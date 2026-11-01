@@ -19,11 +19,26 @@ class PushToTalkState(str, Enum):
 
 def send_desktop_notification(title: str, message: str) -> None:
     """Sends a desktop notification using notify-send if available."""
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+
     notify_send_bin = shutil.which("notify-send")
     if notify_send_bin:
         try:
             subprocess.Popen(
-                [notify_send_bin, "-a", "Viernes", "-i", "audio-input-microphone", title, message],
+                [
+                    notify_send_bin,
+                    "-a",
+                    "Viernes",
+                    "-i",
+                    "audio-input-microphone",
+                    "-t",
+                    "2000",
+                    "-h",
+                    "string:x-canonical-private-synchronous:viernes",
+                    title,
+                    message,
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
