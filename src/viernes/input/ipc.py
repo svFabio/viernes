@@ -9,12 +9,13 @@ from viernes.input.push_to_talk import PushToTalkController
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SOCKET_PATH = Path(os.getenv("VIERNES_PTT_SOCKET", "/tmp/viernes_ptt.sock"))
+def get_default_socket_path() -> Path:
+    return Path(os.getenv("VIERNES_PTT_SOCKET", "/tmp/viernes_ptt.sock"))
 
 
 def send_ptt_ipc_command(command: str, socket_path: Path | str | None = None) -> bool:
     """Sends a Push-to-Talk IPC command ('press', 'release', 'cancel') to the daemon socket."""
-    sock_p = Path(socket_path or DEFAULT_SOCKET_PATH)
+    sock_p = Path(socket_path or get_default_socket_path())
     if not sock_p.exists():
         logger.debug("Push-to-Talk IPC socket does not exist: %s", sock_p)
         return False
@@ -39,7 +40,7 @@ class PushToTalkIPCServer:
         socket_path: Path | str | None = None,
     ) -> None:
         self.controller = controller
-        self.socket_path = Path(socket_path or DEFAULT_SOCKET_PATH)
+        self.socket_path = Path(socket_path or get_default_socket_path())
         self._running = False
         self._server_sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
