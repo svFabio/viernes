@@ -18,6 +18,11 @@ def main() -> None:
     parser.add_argument("prompt", nargs="*", help="Direct text prompt to speak or ask")
     parser.add_argument("--test-tts", action="store_true", help="Test TTS synthesis directly")
     parser.add_argument("--list-audio-devices", action="store_true", help="List available microphones and speakers")
+    parser.add_argument(
+        "--listen",
+        action="store_true",
+        help="Capture voice prompt via microphone, transcribe with Whisper, and execute command",
+    )
     args = parser.parse_args()
 
     if args.list_audio_devices:
@@ -53,7 +58,38 @@ def main() -> None:
 
     text_to_speak = " ".join(args.prompt) if args.prompt else "Hola, soy Viernes. ¿En qué te puedo ayudar?"
 
-    if args.test_tts or args.prompt:
+    if args.listen:
+        from viernes.audio.recorder import AudioRecorder
+
+        recorder = AudioRecorder()
+        logger.info("Listening for voice command... (speak into microphone)")
+        try:
+            audio_path = recorder.record_utterance(timeout_s=15.0)
+        except KeyboardInterrupt:
+            logger.info("Listening cancelled by user.")
+            return
+
+        if not audio_path:
+            logger.info("No speech detected.")
+            return
+
+        logger.info("Captured speech audio at: %s", audio_path)
+        try:
+            from viernes.stt.whisper_provider import WhisperSTTProvider
+
+            stt = WhisperSTTProvider()
+            transcription = stt.transcribe(audio_path)
+            if transcription:
+                text_to_speak = transcription
+                logger.info("Transcribed voice prompt: '%s'", text_to_speak)
+            else:
+                logger.info("Transcription yielded empty text.")
+                return
+        except (ImportError, RuntimeError, OSError) as exc:
+            logger.warning("Could not transcribe with Whisper: %s", exc)
+            return
+
+    if args.test_tts or args.prompt or args.listen:
         output_file = settings.temp_dir / "response.mp3"
         logger.info("Synthesizing: '%s'", text_to_speak)
         try:
