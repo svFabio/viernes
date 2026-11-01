@@ -50,19 +50,28 @@ class VoiceActivityDetector:
         self.noise_floor = 0.005
 
     def _to_float32(self, frame: np.ndarray | bytes) -> np.ndarray:
-        """Converts input frame (bytes or int16/float32 array) to normalized float32."""
+        """Converts input frame to normalized float32, sanitizes NaN/Inf, and removes DC offset."""
         if isinstance(frame, bytes):
             int16_arr = np.frombuffer(frame, dtype=np.int16)
-            return int16_arr.astype(np.float32) / 32768.0
+            arr = int16_arr.astype(np.float32) / 32768.0
         elif isinstance(frame, np.ndarray):
             if frame.dtype == np.int16:
-                return frame.astype(np.float32) / 32768.0
+                arr = frame.astype(np.float32) / 32768.0
             elif frame.dtype in (np.float32, np.float64):
-                return frame.astype(np.float32)
+                arr = frame.astype(np.float32)
             else:
-                return frame.astype(np.float32)
+                arr = frame.astype(np.float32)
         else:
             raise TypeError(f"Unsupported frame type: {type(frame)}")
+
+        # 1. Sanitize NaN and Inf from driver or buffer corruption
+        cleaned = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        if len(cleaned) == 0:
+            return cleaned
+
+        # 2. Remove DC offset to prevent false energy triggers
+        cleaned = cleaned - np.mean(cleaned)
+        return cleaned
 
     def compute_probability(self, frame: np.ndarray | bytes) -> float:
         """Evaluates a 20-30ms audio block and returns voice probability [0.0, 1.0]."""
