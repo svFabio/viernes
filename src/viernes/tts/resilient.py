@@ -52,7 +52,10 @@ class ResilientTTS(TTSProvider):
                     )
                     self.quota_exhausted = True
                     if self.on_fallback_activated:
-                        self.on_fallback_activated(exc)
+                        try:
+                            self.on_fallback_activated(exc)
+                        except Exception as cb_exc:
+                            logger.error("Error in on_fallback_activated callback: %s", cb_exc)
                 else:
                     logger.error(
                         "Primary TTS failed with transient error: %s. Routing this call to fallback.",
