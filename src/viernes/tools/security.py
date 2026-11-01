@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 import fnmatch
 import logging
+import re
 import time
 from typing import Any
 
@@ -47,6 +48,52 @@ FORBIDDEN_TOOLS: frozenset[str] = frozenset(
         "rm_rf",
     }
 )
+
+SHELL_INJECTION_REGEX = re.compile(r"[;&|`$<>\n\r]")
+FORBIDDEN_COMMAND_TOKENS: frozenset[str] = frozenset(
+    {
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "csh",
+        "eval",
+        "exec",
+        "rm",
+        "sudo",
+        "su",
+        "chmod",
+        "chown",
+        "dd",
+        "mkfs",
+        "nc",
+        "curl",
+        "wget",
+    }
+)
+
+
+def inspect_for_shell_injection(data: Any) -> None:
+    """Recursively checks arguments for shell metacharacters and dangerous shell commands."""
+    if isinstance(data, str):
+        if SHELL_INJECTION_REGEX.search(data):
+            raise SecurityViolationError(
+                f"Security violation: dangerous shell metacharacters detected in parameter: '{data}'"
+            )
+        tokens = data.lower().split()
+        for token in tokens:
+            if token in FORBIDDEN_COMMAND_TOKENS:
+                raise SecurityViolationError(
+                    f"Security violation: dangerous command '{token}' detected in parameter."
+                )
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            inspect_for_shell_injection(k)
+            inspect_for_shell_injection(v)
+    elif isinstance(data, (list, tuple, set, frozenset)):
+        for item in data:
+            inspect_for_shell_injection(item)
 
 SENSITIVE_PATTERNS: tuple[str, ...] = (
     "token",
@@ -199,6 +246,7 @@ class SecurityGate:
 
         try:
             self.policy.validate_tool(tool_name)
+            inspect_for_shell_injection(params or {})
         except SecurityViolationError as err:
             duration = (time.perf_counter() - start) * 1000
             entry = AuditLogEntry(
@@ -244,5 +292,6 @@ __all__ = [
     "SecurityGate",
     "SecurityPolicy",
     "SecurityViolationError",
+    "inspect_for_shell_injection",
     "sanitize_params",
 ]

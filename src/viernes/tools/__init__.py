@@ -6,6 +6,7 @@ from viernes.tools.security import (
     SecurityGate,
     SecurityPolicy,
     SecurityViolationError,
+    inspect_for_shell_injection,
     sanitize_params,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "SecurityViolationError",
     "ToolDefinition",
     "ToolRegistry",
+    "inspect_for_shell_injection",
     "sanitize_params",
 ]
