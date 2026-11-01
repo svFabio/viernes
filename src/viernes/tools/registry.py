@@ -44,12 +44,13 @@ class ToolRegistry:
         self,
         policy: SecurityPolicy | None = None,
         gate: SecurityGate | None = None,
+        allowlist: set[str] | frozenset[str] | None = None,
     ) -> None:
         if gate is not None:
             self.gate = gate
             self.policy = gate.policy
         else:
-            self.policy = policy or SecurityPolicy()
+            self.policy = policy or SecurityPolicy(allowlist=allowlist)
             self.gate = SecurityGate(policy=self.policy)
         self._tools: dict[str, ToolDefinition] = {}
 
@@ -58,10 +59,18 @@ class ToolRegistry:
         self.policy.validate_tool(tool.name)
         self._tools[tool.name] = tool
 
+    def is_allowed(self, tool_name: str) -> bool:
+        """Returns True if the tool name is permitted by security policy."""
+        return self.policy.is_allowed(tool_name)
+
     def get(self, tool_name: str) -> ToolDefinition | None:
         """Retrieves a registered tool if it is permitted by policy."""
         if not self.policy.is_allowed(tool_name):
             return None
+        return self._tools.get(tool_name)
+
+    def get_tool(self, tool_name: str) -> ToolDefinition | None:
+        """Alias for get() to retrieve a tool by name."""
         return self._tools.get(tool_name)
 
     def execute(self, tool_name: str, raw_params: dict[str, Any] | None = None) -> Any:
