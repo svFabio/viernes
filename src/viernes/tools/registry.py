@@ -7,7 +7,16 @@ from typing import Any
 from pydantic import BaseModel
 
 from viernes.tools.schemas import validate_tool_params
-from viernes.tools.security import SecurityGate, SecurityPolicy, SecurityViolationError
+from viernes.tools.security import SecurityGate, SecurityPolicy
+
+DEFAULT_CRITICAL_TOOLS: frozenset[str] = frozenset(
+    {
+        "system_delete_file",
+        "ticktick_delete_task",
+        "system_reboot",
+        "system_poweroff",
+    }
+)
 
 
 @dataclass
@@ -19,6 +28,7 @@ class ToolDefinition:
     param_schema: type[BaseModel]
     handler: Callable[[BaseModel], Any]
     requires_confirmation: bool = False
+    impact_template: str | None = None
 
 
 class ToolRegistry:
@@ -28,6 +38,7 @@ class ToolRegistry:
         self,
         policy: SecurityPolicy | None = None,
         gate: SecurityGate | None = None,
+        critical_tools: frozenset[str] | set[str] | None = None,
     ) -> None:
         if gate is not None:
             self.gate = gate
@@ -35,11 +46,24 @@ class ToolRegistry:
         else:
             self.policy = policy or SecurityPolicy()
             self.gate = SecurityGate(policy=self.policy)
+        self.critical_tools = (
+            frozenset(critical_tools)
+            if critical_tools is not None
+            else DEFAULT_CRITICAL_TOOLS
+        )
         self._tools: dict[str, ToolDefinition] = {}
 
     def register(self, tool: ToolDefinition) -> None:
-        """Registers a tool after checking that it conforms to the strict allowlist."""
+        """Registers a tool after checking that it conforms to the strict allowlist.
+
+        Automatically enforces requires_confirmation=True for known critical/destructive tools.
+        """
         self.policy.validate_tool(tool.name)
+
+        # Enforce requires_confirmation if the tool is recognized as critical
+        if tool.name in self.critical_tools:
+            tool.requires_confirmation = True
+
         self._tools[tool.name] = tool
 
     def get(self, tool_name: str) -> ToolDefinition | None:
@@ -47,6 +71,13 @@ class ToolRegistry:
         if not self.policy.is_allowed(tool_name):
             return None
         return self._tools.get(tool_name)
+
+    def requires_confirmation(self, tool_name: str) -> bool:
+        """Returns True if the tool requires explicit confirmation before execution."""
+        tool = self.get(tool_name)
+        if not tool:
+            return tool_name in self.critical_tools
+        return tool.requires_confirmation
 
     def execute(self, tool_name: str, raw_params: dict[str, Any] | None = None) -> Any:
         """Validates tool against allowlist, parses Pydantic parameters, and executes."""
@@ -70,5 +101,9 @@ class ToolRegistry:
         """Returns sorted list of actively registered tool names."""
         return sorted(self._tools.keys())
 
+    def list_critical_tools(self) -> list[str]:
+        """Returns sorted list of tools marked as requiring explicit voice confirmation."""
+        return sorted([name for name, tool in self._tools.items() if tool.requires_confirmation])
 
-__all__ = ["ToolDefinition", "ToolRegistry"]
+
+__all__ = ["DEFAULT_CRITICAL_TOOLS", "ToolDefinition", "ToolRegistry"]
