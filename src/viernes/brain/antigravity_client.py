@@ -10,7 +10,7 @@ from viernes.brain.prompt import VIERNES_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SECONDS = 25.0
+DEFAULT_TIMEOUT_SECONDS = 45.0
 FALLBACK_DEGRADED_RESPONSE = (
     "Disculpa, tardé demasiado en pensar la respuesta. Por favor intenta de nuevo."
 )
@@ -95,7 +95,18 @@ class AntigravityAgent(Agent):
             return f"Respuesta simulada para: {prompt}"
 
         full_prompt = f"{self.system_prompt}\n\n{prompt}"
-        cmd = [executable, "--output-format", "text", "-p", full_prompt]
+        cmd = [
+            executable,
+            "--model",
+            "gemini-3.8-flash-low",
+            "--effort",
+            "low",
+            "--disable-slash-commands",
+            "--output-format",
+            "text",
+            "-p",
+            full_prompt,
+        ]
         try:
             proc = subprocess.run(
                 cmd,
@@ -117,7 +128,18 @@ class AntigravityAgent(Agent):
             return
 
         full_prompt = f"{self.system_prompt}\n\n{prompt}"
-        cmd = [executable, "--output-format", "text", "-p", full_prompt]
+        cmd = [
+            executable,
+            "--model",
+            "gemini-3.8-flash-low",
+            "--effort",
+            "low",
+            "--disable-slash-commands",
+            "--output-format",
+            "text",
+            "-p",
+            full_prompt,
+        ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
