@@ -95,3 +95,30 @@ async def test_antigravity_agent_stream_timeout() -> None:
     chunks = [chunk async for chunk in agent.ask_stream("Consulta lenta")]
 
     assert FALLBACK_DEGRADED_RESPONSE in "".join(chunks)
+
+
+@pytest.mark.anyio
+async def test_antigravity_agent_custom_stream_with_tool_callback() -> None:
+    tool_events: list[str] = []
+
+    async def mock_streamer(prompt: str, timeout: float):
+        if agent.on_tool_activity:
+            agent.on_tool_activity("run_command")
+        yield "Resultado "
+        yield "de la terminal."
+
+    agent = AntigravityAgent(
+        custom_streamer=mock_streamer,
+        on_tool_activity=lambda t: tool_events.append(t),
+    )
+    chunks = [chunk async for chunk in agent.ask_stream("Ejecuta ls")]
+    assert tool_events == ["run_command"]
+    assert "".join(chunks) == "Resultado de la terminal."
+
+
+@pytest.mark.anyio
+async def test_antigravity_agent_close_lifecycle() -> None:
+    agent = AntigravityAgent()
+    assert agent._resident_proc is None
+    await agent.close()
+    assert agent._resident_proc is None

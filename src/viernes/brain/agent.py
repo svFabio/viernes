@@ -1,10 +1,12 @@
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 
 class Agent(ABC):
     """Abstract interface for the reasoning engine."""
+
+    on_tool_activity: Callable[[str], None] | None = None
 
     @abstractmethod
     def ask(self, prompt: str) -> str:

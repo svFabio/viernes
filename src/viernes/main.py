@@ -102,6 +102,17 @@ def run_listener_loop(
     is_turn_active = False
     turn_lock = threading.Lock()
 
+    # Create a persistent asyncio event loop to keep the resident brain process alive
+    worker_loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=worker_loop.run_forever, daemon=True)
+    loop_thread.start()
+
+    if isinstance(pipeline.agent, AntigravityAgent):
+        logger.info("Pre-warming resident Antigravity process in background loop...")
+        asyncio.run_coroutine_threadsafe(
+            pipeline.agent._ensure_resident_proc(), worker_loop
+        )
+
     def handle_speech_capture() -> None:
         nonlocal is_turn_active
         with turn_lock:
@@ -117,7 +128,10 @@ def run_listener_loop(
                 prompt = whisper.transcribe(wav_path)
                 logger.info("Recognized prompt: '%s'", prompt)
                 if prompt and prompt.strip():
-                    asyncio.run(run_pipeline_turn(prompt, pipeline, barge_in))
+                    fut = asyncio.run_coroutine_threadsafe(
+                        run_pipeline_turn(prompt, pipeline, barge_in), worker_loop
+                    )
+                    fut.result()
         except Exception as exc:
             logger.error("Error during speech turn: %s", exc)
         finally:
@@ -221,12 +235,22 @@ def main() -> None:
         return
 
     # Build streaming pipeline with sequential playback and barge-in controller
+    from viernes.audio.fillers import FillerAudioCache
+    import threading
+
+    filler_cache = FillerAudioCache()
+    threading.Thread(
+        target=lambda: filler_cache.prewarm(lambda text, out: tts.synthesize(text, out)),
+        daemon=True,
+    ).start()
+
     playback_queue = SequentialPlaybackQueue(lambda p: player.play(p, blocking=True))
     pipeline = StreamingPipeline(
         agent=brain,
         tts_synthesizer=lambda text, out: tts.synthesize(text, out),
         playback_queue=playback_queue,
         temp_dir=settings.temp_dir,
+        filler_cache=filler_cache,
     )
     barge_in = BargeInController(
         playback_queue=playback_queue,
