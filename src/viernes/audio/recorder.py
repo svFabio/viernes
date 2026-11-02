@@ -161,6 +161,8 @@ class AudioRecorder:
         else:
             raise TypeError(f"Unsupported frame type: {type(frame)}")
 
+        samples = samples.flatten()
+
         # Resample if incoming audio sample rate differs from target rate (16kHz)
         if self.input_sample_rate != self.sample_rate:
             samples = resample_audio(samples, self.input_sample_rate, self.sample_rate)

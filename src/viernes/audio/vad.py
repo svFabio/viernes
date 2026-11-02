@@ -66,19 +66,20 @@ class BaseVAD(ABC):
         self.consecutive_speech_count: int = 0
 
     def _to_float32(self, frame: np.ndarray | bytes) -> np.ndarray:
-        """Converts input frame (bytes or int16/float32 array) to normalized float32."""
+        """Converts input frame (bytes or int16/float32 array) to normalized 1D float32 array."""
         if isinstance(frame, bytes):
             int16_arr = np.frombuffer(frame, dtype=np.int16)
-            return int16_arr.astype(np.float32) / 32768.0
+            arr = int16_arr.astype(np.float32) / 32768.0
         elif isinstance(frame, np.ndarray):
             if frame.dtype == np.int16:
-                return frame.astype(np.float32) / 32768.0
+                arr = frame.astype(np.float32) / 32768.0
             elif frame.dtype in (np.float32, np.float64):
-                return frame.astype(np.float32)
+                arr = frame.astype(np.float32)
             else:
-                return frame.astype(np.float32)
+                arr = frame.astype(np.float32)
         else:
             raise TypeError(f"Unsupported frame type: {type(frame)}")
+        return arr.flatten()
 
     @abstractmethod
     def compute_probability(self, frame: np.ndarray | bytes) -> float:
