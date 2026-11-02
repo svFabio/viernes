@@ -161,3 +161,49 @@ async def test_streaming_pipeline_enqueues_tool_filler(tmp_path: Path) -> None:
     assert len(played_items) >= 2
     tool_filler_path = cache.get_tool_filler("read_file")
     assert tool_filler_path in played_items
+
+
+def test_load_and_save_custom_fillers(tmp_path: Path) -> None:
+    config_file = tmp_path / "fillers.json"
+    from viernes.audio.fillers import load_custom_fillers, save_custom_fillers
+
+    # When file does not exist, returns defaults
+    generic, tools, patience = load_custom_fillers(config_path=config_file)
+    assert len(generic) > 0
+    assert "files" in tools
+    assert len(patience) > 0
+
+    # Save custom phrases
+    custom_generic = ["Frase personalizada uno", "Frase personalizada dos"]
+    custom_tools = {"files": ["Mirando archivos"]}
+    custom_patience = ["Espere un momento por favor"]
+
+    save_custom_fillers(
+        generic=custom_generic,
+        tool_phrases=custom_tools,
+        patience=custom_patience,
+        config_path=config_file,
+    )
+
+    # Load again and verify
+    loaded_gen, loaded_tools, loaded_pat = load_custom_fillers(config_path=config_file)
+    assert loaded_gen == custom_generic
+    assert loaded_tools == custom_tools
+    assert loaded_pat == custom_patience
+
+
+def test_filler_cache_loads_from_config(tmp_path: Path) -> None:
+    config_file = tmp_path / "fillers.json"
+    from viernes.audio.fillers import save_custom_fillers
+
+    save_custom_fillers(
+        generic=["Mi relleno único"],
+        tool_phrases={"terminal": ["Terminal personalizada"]},
+        patience=["Paciencia personalizada"],
+        config_path=config_file,
+    )
+
+    cache = FillerAudioCache(cache_dir=tmp_path / "audio", config_path=config_file)
+    assert cache.phrases == ["Mi relleno único"]
+    assert cache.tool_phrases == {"terminal": ["Terminal personalizada"]}
+    assert cache.patience_phrases == ["Paciencia personalizada"]

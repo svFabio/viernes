@@ -1,6 +1,9 @@
 import hashlib
+import json
 import logging
+import os
 import random
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -47,6 +50,108 @@ TOOL_CATEGORY_MAP: dict[str, str] = {
 }
 
 
+def get_default_fillers_config_file() -> Path:
+    """Returns standard path to the custom filler phrases JSON configuration."""
+    override = os.getenv("VIERNES_FILLERS_FILE")
+    if override:
+        return Path(override)
+    return Path.home() / ".config" / "viernes" / "fillers.json"
+
+
+def load_custom_fillers(
+    config_path: Path | None = None,
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Loads configured filler phrases from file or returns standard defaults."""
+    path = config_path or get_default_fillers_config_file()
+    if not path.is_file():
+        return (
+            list(DEFAULT_FILLER_PHRASES),
+            {k: list(v) for k, v in TOOL_FILLER_PHRASES.items()},
+            list(PATIENCE_FILLER_PHRASES),
+        )
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        raw_generic = data.get("generic")
+        generic = (
+            [p.strip() for p in raw_generic if isinstance(p, str) and p.strip()]
+            if isinstance(raw_generic, list)
+            else list(DEFAULT_FILLER_PHRASES)
+        )
+
+        raw_patience = data.get("patience")
+        patience = (
+            [p.strip() for p in raw_patience if isinstance(p, str) and p.strip()]
+            if isinstance(raw_patience, list)
+            else list(PATIENCE_FILLER_PHRASES)
+        )
+
+        raw_tools = data.get("tools")
+        tools: dict[str, list[str]] = {}
+        if isinstance(raw_tools, dict):
+            for cat, cat_list in raw_tools.items():
+                if isinstance(cat_list, list):
+                    clean_list = [p.strip() for p in cat_list if isinstance(p, str) and p.strip()]
+                    if clean_list:
+                        tools[str(cat)] = clean_list
+
+        if not tools:
+            tools = {k: list(v) for k, v in TOOL_FILLER_PHRASES.items()}
+
+        return (
+            generic or list(DEFAULT_FILLER_PHRASES),
+            tools,
+            patience or list(PATIENCE_FILLER_PHRASES),
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read custom fillers config from %s: %s", path, exc)
+        return (
+            list(DEFAULT_FILLER_PHRASES),
+            {k: list(v) for k, v in TOOL_FILLER_PHRASES.items()},
+            list(PATIENCE_FILLER_PHRASES),
+        )
+
+
+def save_custom_fillers(
+    generic: list[str],
+    tool_phrases: dict[str, list[str]],
+    patience: list[str],
+    config_path: Path | None = None,
+) -> None:
+    """Atomically persists custom filler phrases to JSON configuration file."""
+    path = config_path or get_default_fillers_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "generic": [p.strip() for p in generic if p.strip()],
+        "patience": [p.strip() for p in patience if p.strip()],
+        "tools": {
+            cat: [p.strip() for p in phrases if p.strip()] for cat, phrases in tool_phrases.items()
+        },
+    }
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=path.parent,
+        encoding="utf-8",
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+        try:
+            json.dump(data, temp_file, indent=2, ensure_ascii=False)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+
+    temp_path.replace(path)
+    logger.info("Saved custom filler phrases to %s", path)
+
+
 class FillerAudioCache:
     """Pre-caches and instantly serves conversational verbal acknowledgments (fillers).
 
@@ -61,12 +166,22 @@ class FillerAudioCache:
         phrases: list[str] | None = None,
         tool_phrases: dict[str, list[str]] | None = None,
         patience_phrases: list[str] | None = None,
+        config_path: Path | None = None,
     ) -> None:
         self.cache_dir = cache_dir or Path("/tmp/viernes/fillers")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.phrases = phrases or DEFAULT_FILLER_PHRASES
-        self.tool_phrases = tool_phrases or TOOL_FILLER_PHRASES
-        self.patience_phrases = patience_phrases or PATIENCE_FILLER_PHRASES
+        self.config_path = config_path or get_default_fillers_config_file()
+
+        if phrases is None and tool_phrases is None and patience_phrases is None:
+            custom_generic, custom_tools, custom_patience = load_custom_fillers(self.config_path)
+            self.phrases = custom_generic
+            self.tool_phrases = custom_tools
+            self.patience_phrases = custom_patience
+        else:
+            self.phrases = phrases or DEFAULT_FILLER_PHRASES
+            self.tool_phrases = tool_phrases or TOOL_FILLER_PHRASES
+            self.patience_phrases = patience_phrases or PATIENCE_FILLER_PHRASES
+
         self._cached_files: list[Path] = []
         self._cached_tool_files: dict[str, list[Path]] = {}
         self._cached_patience_files: list[Path] = []

@@ -75,10 +75,12 @@ class ViernesControlCenter(ctk.CTk):
 
         self.tab_voice = self.tabview.add("Credenciales & Voz")
         self.tab_audio = self.tabview.add("Dispositivos de Audio")
+        self.tab_fillers = self.tabview.add("Frases de Relleno")
         self.tab_service = self.tabview.add("Servicio & Estado")
 
         self._build_voice_tab()
         self._build_audio_tab()
+        self._build_fillers_tab()
         self._build_service_tab()
 
     def _build_voice_tab(self) -> None:
@@ -256,6 +258,179 @@ class ViernesControlCenter(ctk.CTk):
             text_color="gray70",
         )
         self.silence_val_label.pack(anchor="w", pady=(0, 8))
+
+    def _build_fillers_tab(self) -> None:
+        """Builds conversational filler phrase configuration tab."""
+        container = ctk.CTkScrollableFrame(self.tab_fillers, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=8, pady=8)
+
+        intro_label = ctk.CTkLabel(
+            container,
+            text="Personalización de Frases de Relleno (Conversational Fillers):",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        intro_label.pack(anchor="w", pady=(4, 2))
+
+        desc_label = ctk.CTkLabel(
+            container,
+            text=(
+                "Estas frases son dichas por Viernes de inmediato para enmascarar la latencia de red "
+                "mientras Antigravity procesa o ejecuta herramientas. Modifíquelas (una frase por línea)."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color="gray70",
+            wraplength=700,
+            justify="left",
+        )
+        desc_label.pack(anchor="w", pady=(0, 12))
+
+        from viernes.audio.fillers import load_custom_fillers
+
+        generic, tools, patience = load_custom_fillers()
+
+        # 1. Generic fillers
+        gen_label = ctk.CTkLabel(
+            container,
+            text="Frases Inmediatas / Genéricas (al detectar voz, < 200ms):",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        gen_label.pack(anchor="w", pady=(4, 2))
+        self.fillers_generic_txt = ctk.CTkTextbox(container, height=90)
+        self.fillers_generic_txt.pack(fill="x", pady=(0, 10))
+        self.fillers_generic_txt.insert("1.0", "\n".join(generic))
+
+        # 2. Patience fillers
+        pat_label = ctk.CTkLabel(
+            container,
+            text="Frases de Paciencia (si la respuesta tarda más de 6.5s):",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        pat_label.pack(anchor="w", pady=(4, 2))
+        self.fillers_patience_txt = ctk.CTkTextbox(container, height=60)
+        self.fillers_patience_txt.pack(fill="x", pady=(0, 10))
+        self.fillers_patience_txt.insert("1.0", "\n".join(patience))
+
+        # 3. Tool fillers - Files
+        files_label = ctk.CTkLabel(
+            container,
+            text="Herramientas: Lectura y Búsqueda de Archivos:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        files_label.pack(anchor="w", pady=(4, 2))
+        self.fillers_files_txt = ctk.CTkTextbox(container, height=55)
+        self.fillers_files_txt.pack(fill="x", pady=(0, 10))
+        self.fillers_files_txt.insert("1.0", "\n".join(tools.get("files", [])))
+
+        # 4. Tool fillers - Terminal
+        term_label = ctk.CTkLabel(
+            container,
+            text="Herramientas: Ejecución en Terminal:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        term_label.pack(anchor="w", pady=(4, 2))
+        self.fillers_term_txt = ctk.CTkTextbox(container, height=55)
+        self.fillers_term_txt.pack(fill="x", pady=(0, 10))
+        self.fillers_term_txt.insert("1.0", "\n".join(tools.get("terminal", [])))
+
+        # 5. Tool fillers - Search
+        search_label = ctk.CTkLabel(
+            container,
+            text="Herramientas: Búsqueda en la Web:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        search_label.pack(anchor="w", pady=(4, 2))
+        self.fillers_search_txt = ctk.CTkTextbox(container, height=45)
+        self.fillers_search_txt.pack(fill="x", pady=(0, 12))
+        self.fillers_search_txt.insert("1.0", "\n".join(tools.get("search", [])))
+
+        # Buttons
+        btn_row = ctk.CTkFrame(container, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(4, 8))
+
+        self.btn_save_fillers = ctk.CTkButton(
+            btn_row,
+            text="✔ Guardar Frases de Relleno",
+            height=36,
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._on_save_fillers_clicked,
+        )
+        self.btn_save_fillers.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.btn_reset_fillers = ctk.CTkButton(
+            btn_row,
+            text="↺ Restablecer Predeterminadas",
+            height=36,
+            fg_color="#475569",
+            hover_color="#334155",
+            command=self._on_reset_fillers_clicked,
+        )
+        self.btn_reset_fillers.pack(side="right", padx=(6, 0))
+
+        self.fillers_status_label = ctk.CTkLabel(
+            container,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="gray70",
+        )
+        self.fillers_status_label.pack(anchor="w", pady=(2, 6))
+
+    def _on_save_fillers_clicked(self) -> None:
+        """Saves custom filler phrases from textboxes into fillers.json."""
+        from viernes.audio.fillers import save_custom_fillers
+
+        def _lines(txt_widget: ctk.CTkTextbox) -> list[str]:
+            raw = txt_widget.get("1.0", "end")
+            return [line.strip() for line in raw.splitlines() if line.strip()]
+
+        generic = _lines(self.fillers_generic_txt)
+        patience = _lines(self.fillers_patience_txt)
+        tools = {
+            "files": _lines(self.fillers_files_txt),
+            "terminal": _lines(self.fillers_term_txt),
+            "search": _lines(self.fillers_search_txt),
+        }
+
+        try:
+            save_custom_fillers(generic=generic, tool_phrases=tools, patience=patience)
+            self.fillers_status_label.configure(
+                text="✔ Frases de relleno guardadas exitosamente.",
+                text_color="#22c55e",
+            )
+        except Exception as exc:
+            self.fillers_status_label.configure(
+                text=f"Error al guardar: {exc}",
+                text_color="#ef4444",
+            )
+
+    def _on_reset_fillers_clicked(self) -> None:
+        """Resets textboxes to the default built-in filler phrases."""
+        from viernes.audio.fillers import (
+            DEFAULT_FILLER_PHRASES,
+            PATIENCE_FILLER_PHRASES,
+            TOOL_FILLER_PHRASES,
+        )
+
+        self.fillers_generic_txt.delete("1.0", "end")
+        self.fillers_generic_txt.insert("1.0", "\n".join(DEFAULT_FILLER_PHRASES))
+
+        self.fillers_patience_txt.delete("1.0", "end")
+        self.fillers_patience_txt.insert("1.0", "\n".join(PATIENCE_FILLER_PHRASES))
+
+        self.fillers_files_txt.delete("1.0", "end")
+        self.fillers_files_txt.insert("1.0", "\n".join(TOOL_FILLER_PHRASES.get("files", [])))
+
+        self.fillers_term_txt.delete("1.0", "end")
+        self.fillers_term_txt.insert("1.0", "\n".join(TOOL_FILLER_PHRASES.get("terminal", [])))
+
+        self.fillers_search_txt.delete("1.0", "end")
+        self.fillers_search_txt.insert("1.0", "\n".join(TOOL_FILLER_PHRASES.get("search", [])))
+
+        self.fillers_status_label.configure(
+            text="Frases predeterminadas restauradas en el formulario. Haga clic en Guardar para confirmar.",
+            text_color="#38bdf8",
+        )
 
     def _build_service_tab(self) -> None:
         """Builds background service and system management tab."""
