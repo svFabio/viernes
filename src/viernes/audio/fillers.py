@@ -11,7 +11,7 @@ DEFAULT_FILLER_PHRASES: list[str] = [
     "Enseguida, Señor, estoy consultando información.",
     "Un momento, Señor.",
     "Revisando sus registros, deme un segundo.",
-    "Entendido, Señor, procesando.",
+    "Lo escucho, Señor, un segundo.",
 ]
 
 TOOL_FILLER_PHRASES: dict[str, list[str]] = {
