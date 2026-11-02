@@ -36,6 +36,9 @@ class Settings(BaseModel):
     elevenlabs_voice_id: str = Field(
         default_factory=lambda: os.getenv("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
     )
+    elevenlabs_model_id: str = Field(
+        default_factory=lambda: os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+    )
     piper_bin: str = Field(default_factory=lambda: os.getenv("PIPER_BIN", "piper"))
     piper_model_path: str = Field(default_factory=lambda: os.getenv("PIPER_MODEL_PATH", ""))
     temp_dir: Path = Field(

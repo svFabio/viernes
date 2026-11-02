@@ -31,6 +31,7 @@ def build_tts_engine(temp_dir: Path) -> ResilientTTS:
             primary = KeyPoolElevenLabsProvider(
                 api_keys=settings.elevenlabs_api_keys,
                 voice_id=settings.elevenlabs_voice_id,
+                model_id=settings.elevenlabs_model_id,
                 temp_dir=temp_dir,
             )
         except (ValueError, RuntimeError) as exc:
@@ -40,6 +41,7 @@ def build_tts_engine(temp_dir: Path) -> ResilientTTS:
             primary = ElevenLabsProvider(
                 api_key=settings.elevenlabs_api_key,
                 voice_id=settings.elevenlabs_voice_id,
+                model_id=settings.elevenlabs_model_id,
             )
         except (ValueError, RuntimeError) as exc:
             logger.warning("Could not initialize ElevenLabs: %s", exc)

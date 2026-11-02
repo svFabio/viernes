@@ -41,7 +41,7 @@ class KeyPoolElevenLabsProvider(TTSProvider):
         self,
         api_keys: list[str],
         voice_id: str = "cgSgspJ2msm6clMCkdW9",
-        model_id: str = "eleven_multilingual_v2",
+        model_id: str = "eleven_turbo_v2_5",
         temp_dir: Path | None = None,
         provider_factory: Callable[[str, str], TTSProvider] | None = None,
     ) -> None:
