@@ -52,7 +52,9 @@ class StreamingPipeline:
         speech_end_timestamp: float | None = None,
     ) -> PipelineMetrics:
         self._is_cancelled = False
-        start_time = speech_end_timestamp if speech_end_timestamp is not None else time.perf_counter()
+        start_time = (
+            speech_end_timestamp if speech_end_timestamp is not None else time.perf_counter()
+        )
         first_audio_latency: float | None = None
         sentence_index = 0
         tokenizer = SentenceTokenizer()
@@ -65,14 +67,20 @@ class StreamingPipeline:
         if self.filler_cache is not None:
             filler = self.filler_cache.get_random_filler()
             if filler and filler.is_file():
-                logger.info("Instantly playing conversational filler to mask latency: %s", filler.name)
+                logger.info(
+                    "Instantly playing conversational filler to mask latency: %s", filler.name
+                )
                 first_audio_latency = time.perf_counter() - start_time
                 await self.playback_queue.enqueue(filler)
 
         # Hook into agent tool activity to trigger tool-specific fillers (e.g. terminal / files)
         def handle_tool(tool_name: str) -> None:
             nonlocal tool_filler_played
-            if not first_token_received and not tool_filler_played and self.filler_cache is not None:
+            if (
+                not first_token_received
+                and not tool_filler_played
+                and self.filler_cache is not None
+            ):
                 tool_filler = self.filler_cache.get_tool_filler(tool_name)
                 if tool_filler and tool_filler.is_file():
                     logger.info(
@@ -120,7 +128,9 @@ class StreamingPipeline:
                     break
 
                 sentence_index += 1
-                chunk_path = self.temp_dir / f"stream_chunk_{int(time.time() * 1000)}_{sentence_index}.mp3"
+                chunk_path = (
+                    self.temp_dir / f"stream_chunk_{int(time.time() * 1000)}_{sentence_index}.mp3"
+                )
 
                 try:
                     # Run synthesis in executor if blocking

@@ -61,14 +61,17 @@ def test_main_cli_ptt_command(monkeypatch):
 
     from viernes.main import main
 
-    with patch("viernes.input.ipc.send_ptt_ipc_command", return_value=True) as mock_send, \
-         patch("sys.argv", ["viernes", "--ptt", "press"]):
+    with (
+        patch("viernes.input.ipc.send_ptt_ipc_command", return_value=True) as mock_send,
+        patch("sys.argv", ["viernes", "--ptt", "press"]),
+    ):
         main()
         mock_send.assert_called_once_with("press")
 
-    with patch("viernes.input.ipc.send_ptt_ipc_command", return_value=False), \
-         patch("sys.argv", ["viernes", "--ptt", "cancel"]), \
-         pytest.raises(SystemExit) as exc_info:
+    with (
+        patch("viernes.input.ipc.send_ptt_ipc_command", return_value=False),
+        patch("sys.argv", ["viernes", "--ptt", "cancel"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
         main()
         assert exc_info.value.code == 1
-

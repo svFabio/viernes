@@ -9,6 +9,7 @@ from viernes.input.push_to_talk import PushToTalkController
 
 logger = logging.getLogger(__name__)
 
+
 def get_default_socket_path() -> Path:
     return Path(os.getenv("VIERNES_PTT_SOCKET", "/tmp/viernes_ptt.sock"))
 
@@ -62,7 +63,9 @@ class PushToTalkIPCServer:
         self._server_sock.settimeout(0.5)
 
         self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True, name="viernes-ptt-ipc")
+        self._thread = threading.Thread(
+            target=self._listen_loop, daemon=True, name="viernes-ptt-ipc"
+        )
         self._thread.start()
         logger.info("Push-to-Talk IPC server listening on %s", self.socket_path)
 

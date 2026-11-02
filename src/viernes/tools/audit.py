@@ -27,9 +27,7 @@ def sanitize_params(data: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(v, dict):
             sanitized[k] = sanitize_params(v)
         elif isinstance(v, list):
-            sanitized[k] = [
-                sanitize_params(elem) if isinstance(elem, dict) else elem for elem in v
-            ]
+            sanitized[k] = [sanitize_params(elem) if isinstance(elem, dict) else elem for elem in v]
         else:
             sanitized[k] = v
     return sanitized

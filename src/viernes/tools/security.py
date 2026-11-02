@@ -153,9 +153,7 @@ class SecurityPolicy:
             frozenset(allowlist) if allowlist is not None else DEFAULT_ALLOWLIST
         )
         self.forbidden_tools: frozenset[str] = (
-            frozenset(forbidden_tools)
-            if forbidden_tools is not None
-            else FORBIDDEN_TOOLS
+            frozenset(forbidden_tools) if forbidden_tools is not None else FORBIDDEN_TOOLS
         )
 
     def is_forbidden(self, tool_name: str) -> bool:

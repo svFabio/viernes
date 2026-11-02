@@ -35,6 +35,7 @@ from viernes.tools.security import SecurityViolationError
 # QA TEST 1: BRAIN ORCHESTRATION & TIMEOUT RESILIENCE (HU-09)
 # ============================================================================
 
+
 def test_qa_brain_memory_and_system_prompt() -> None:
     """Verifies that the brain retains recent conversational context and system prompt."""
     memory = ConversationMemory(max_turns=3)
@@ -55,6 +56,7 @@ def test_qa_brain_memory_and_system_prompt() -> None:
 
 def test_qa_brain_timeout_degradation() -> None:
     """Verifies that an agent call exceeding 10s degrades gracefully without crashing."""
+
     def timeout_invoker(p: str, to: float) -> str:
         raise TimeoutError("Reasoning timed out")
 
@@ -66,6 +68,7 @@ def test_qa_brain_timeout_degradation() -> None:
 # ============================================================================
 # QA TEST 2: MCP SECURITY GATE & INJECTION BLOCKING (HU-10)
 # ============================================================================
+
 
 def test_qa_mcp_security_allowlist_and_injection_gate() -> None:
     """Verifies strict allowlist enforcement and blocks arbitrary shell injections."""
@@ -104,6 +107,7 @@ def test_qa_mcp_security_allowlist_and_injection_gate() -> None:
 # ============================================================================
 # QA TEST 3: VOICE CONFIRMATION FOR DESTRUCTIVE ACTIONS (HU-11)
 # ============================================================================
+
 
 @pytest.mark.anyio
 async def test_qa_voice_confirmation_lifecycle() -> None:
@@ -145,6 +149,7 @@ async def test_qa_voice_confirmation_lifecycle() -> None:
 # QA TEST 4: ERROR HANDLING & NATURAL SPOKEN TRANSLATION (HU-12)
 # ============================================================================
 
+
 def test_qa_error_translation_and_idle_recovery() -> None:
     """Verifies global exception capture, jargon-free speech, and clean IDLE transition."""
     spoken_history: list[str] = []
@@ -169,6 +174,7 @@ def test_qa_error_translation_and_idle_recovery() -> None:
 # QA TEST 5: SENTENCE STREAMING PIPELINE & CONCURRENCY (HU-13)
 # ============================================================================
 
+
 @pytest.mark.anyio
 async def test_qa_sentence_streaming_pipeline(tmp_path: Path) -> None:
     """Verifies tokenizer, async TTS synthesis dispatch, and zero audio overlap."""
@@ -177,12 +183,14 @@ async def test_qa_sentence_streaming_pipeline(tmp_path: Path) -> None:
     )
 
     synthesized_chunks: list[str] = []
+
     def fake_tts(text: str, out: Path) -> Path:
         synthesized_chunks.append(text)
         out.write_bytes(b"dummy_audio")
         return out
 
     played_chunks: list[Path] = []
+
     async def fake_player(path: Path) -> None:
         await asyncio.sleep(0.02)
         played_chunks.append(path)
@@ -209,6 +217,7 @@ async def test_qa_sentence_streaming_pipeline(tmp_path: Path) -> None:
 # QA TEST 6: BARGE-IN INTERRUPTION & ZERO-ZOMBIE STRESS TEST (HU-14)
 # ============================================================================
 
+
 def test_qa_barge_in_and_zombie_stress_test(tmp_path: Path) -> None:
     """Verifies barge-in stops playback in < 150ms, clears queue, and leaves 0 zombie processes."""
     proc: subprocess.Popen | None = None
@@ -233,7 +242,9 @@ def test_qa_barge_in_and_zombie_stress_test(tmp_path: Path) -> None:
         assert proc.poll() is None
 
         start = time.perf_counter()
-        interrupted = controller.handle_voice_detected(mic_energy=0.9, speaker_energy=0.1, vad_active=True)
+        interrupted = controller.handle_voice_detected(
+            mic_energy=0.9, speaker_energy=0.1, vad_active=True
+        )
         duration_ms = (time.perf_counter() - start) * 1000
 
         assert interrupted is True

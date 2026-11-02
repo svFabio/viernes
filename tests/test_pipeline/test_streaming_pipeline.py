@@ -26,7 +26,19 @@ class MockTokenStreamAgent(Agent):
 def test_sentence_tokenizer_basic_and_abbreviations() -> None:
     tokenizer = SentenceTokenizer(min_words_per_sentence=1)
 
-    tokens = ["Hola.", " Hoy", " es", " un", " buen", " día!", " El", " Dr.", " Smith", " vendrá", " pronto."]
+    tokens = [
+        "Hola.",
+        " Hoy",
+        " es",
+        " un",
+        " buen",
+        " día!",
+        " El",
+        " Dr.",
+        " Smith",
+        " vendrá",
+        " pronto.",
+    ]
     sentences: list[str] = []
     for tok in tokens:
         sentences.extend(tokenizer.process_token(tok))

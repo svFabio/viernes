@@ -52,5 +52,9 @@ def test_concurrent_push_to_talk_hammering():
             f.result()
 
     # The controller must never deadlock or end in an unknown state
-    assert controller.state in (PushToTalkState.IDLE, PushToTalkState.PROCESSING, PushToTalkState.LISTENING)
+    assert controller.state in (
+        PushToTalkState.IDLE,
+        PushToTalkState.PROCESSING,
+        PushToTalkState.LISTENING,
+    )
     assert starts > 0

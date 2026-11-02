@@ -24,7 +24,9 @@ class SystemState(str, Enum):
 class AcousticEchoFilter:
     """Filters speaker output reflection to prevent the assistant from interrupting itself."""
 
-    def __init__(self, echo_margin_ratio: float = 1.3, min_voice_energy_threshold: float = 0.05) -> None:
+    def __init__(
+        self, echo_margin_ratio: float = 1.3, min_voice_energy_threshold: float = 0.05
+    ) -> None:
         self.echo_margin = echo_margin_ratio
         self.min_voice_threshold = min_voice_energy_threshold
 

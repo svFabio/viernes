@@ -76,9 +76,7 @@ async def test_confirmation_branch_rejected() -> None:
     async def fake_negative_voice():
         return "No, cancela por favor"
 
-    decision, msg = await confirmation_mgr.wait_for_voice_confirmation(
-        action, fake_negative_voice
-    )
+    decision, msg = await confirmation_mgr.wait_for_voice_confirmation(action, fake_negative_voice)
     assert decision == ConfirmationDecision.REJECTED
     assert msg == "Acción cancelada."
     assert confirmation_mgr.pending_action is None
@@ -95,9 +93,7 @@ async def test_confirmation_branch_timeout() -> None:
         await asyncio.sleep(0.5)
         return ""
 
-    decision, msg = await confirmation_mgr.wait_for_voice_confirmation(
-        action, silent_voice
-    )
+    decision, msg = await confirmation_mgr.wait_for_voice_confirmation(action, silent_voice)
     assert decision == ConfirmationDecision.TIMEOUT
     assert "Tiempo de espera agotado" in msg
     assert confirmation_mgr.pending_action is None

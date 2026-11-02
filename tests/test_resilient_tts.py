@@ -27,7 +27,9 @@ def test_fallback_on_quota_exceeded():
     output_path = Path("/tmp/test.mp3")
 
     # Simulate ElevenLabs 429 quota error
-    primary.synthesize.side_effect = RuntimeError("Status 429: quota_exceeded, insufficient credits")
+    primary.synthesize.side_effect = RuntimeError(
+        "Status 429: quota_exceeded, insufficient credits"
+    )
     fallback.synthesize.return_value = output_path
 
     on_fallback = MagicMock()

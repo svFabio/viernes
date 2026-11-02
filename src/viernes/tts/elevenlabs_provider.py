@@ -61,7 +61,9 @@ class ElevenLabsProvider(TTSProvider):
                 else:
                     f.writelines(audio_stream)
         except (httpx.TimeoutException, TimeoutError) as exc:
-            raise TimeoutError(f"ElevenLabs request timed out after {self.timeout}s: {exc}") from exc
+            raise TimeoutError(
+                f"ElevenLabs request timed out after {self.timeout}s: {exc}"
+            ) from exc
 
         return output_path.resolve()
 

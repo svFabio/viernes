@@ -12,7 +12,9 @@ from viernes.audio.vad import (
 )
 
 
-def _make_chunk(num_samples: int = 480, sample_rate: int = 16000, freq: float = 400.0, is_speech: bool = True) -> np.ndarray:
+def _make_chunk(
+    num_samples: int = 480, sample_rate: int = 16000, freq: float = 400.0, is_speech: bool = True
+) -> np.ndarray:
     t = np.linspace(0, num_samples / sample_rate, num_samples, endpoint=False)
     if is_speech:
         # Combination of human fundamental and formant frequencies
@@ -142,7 +144,7 @@ def test_vad_chunk_sizes_and_formats():
     assert vad.is_speech(bytes_chunk)
 
     # Float32 normalized array
-    float_chunk = (chunk_512.astype(np.float32) / 32768.0)
+    float_chunk = chunk_512.astype(np.float32) / 32768.0
     assert vad.is_speech(float_chunk)
 
 

@@ -44,7 +44,9 @@ def test_fallback_on_quota_exceeded():
     output_path = Path("/tmp/test.mp3")
 
     # Simulate ElevenLabs 429 quota error
-    primary.synthesize.side_effect = RuntimeError("Status 429: quota_exceeded, insufficient credits")
+    primary.synthesize.side_effect = RuntimeError(
+        "Status 429: quota_exceeded, insufficient credits"
+    )
     fallback.synthesize.return_value = output_path
 
     on_fallback = MagicMock()
@@ -100,7 +102,9 @@ def test_callback_error_does_not_block_fallback():
     fallback.synthesize.return_value = output_path
 
     broken_callback = MagicMock(side_effect=Exception("Logger crashed"))
-    resilient = ResilientTTS(primary=primary, fallback=fallback, on_fallback_activated=broken_callback)
+    resilient = ResilientTTS(
+        primary=primary, fallback=fallback, on_fallback_activated=broken_callback
+    )
 
     result = resilient.synthesize("Message with broken callback", output_path)
     assert result == output_path

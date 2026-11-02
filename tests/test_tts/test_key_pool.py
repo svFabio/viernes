@@ -78,7 +78,10 @@ def test_key_pool_all_exhausted_raises(tmp_path: Path) -> None:
         provider_factory=lambda key, vid: factory_map[key],
     )
 
-    with pytest.raises(RuntimeError, match="Quota exceeded: all 2 ElevenLabs API keys in credential pool are exhausted"):
+    with pytest.raises(
+        RuntimeError,
+        match="Quota exceeded: all 2 ElevenLabs API keys in credential pool are exhausted",
+    ):
         pool.synthesize("Texto", target_out)
 
     assert pool.remaining_keys_count == 0

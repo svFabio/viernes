@@ -39,8 +39,10 @@ MOCK_DEVICES = [
 
 
 def test_list_audio_devices_mocked():
-    with patch("sounddevice.query_devices", return_value=MOCK_DEVICES), \
-         patch("sounddevice.default.device", (0, 1)):
+    with (
+        patch("sounddevice.query_devices", return_value=MOCK_DEVICES),
+        patch("sounddevice.default.device", (0, 1)),
+    ):
         devices = list_audio_devices()
         assert len(devices) == 3
         assert devices[0]["name"] == "Built-in Microphone"

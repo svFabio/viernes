@@ -79,7 +79,9 @@ class WhisperSTTProvider(STTProvider):
             raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
 
         if audio_path.stat().st_size == 0:
-            logger.debug("Audio file %s is empty (0 bytes). Returning empty transcription.", audio_path)
+            logger.debug(
+                "Audio file %s is empty (0 bytes). Returning empty transcription.", audio_path
+            )
             return ""
 
         logger.debug("Transcribing audio file: %s (language=%s)", audio_path, self.language)

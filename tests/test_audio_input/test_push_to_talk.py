@@ -103,10 +103,11 @@ def test_push_to_talk_barge_in_concurrency():
 def test_push_to_talk_ipc_commands():
     controller = PushToTalkController()
 
-    with patch.object(controller, "handle_key_down") as mock_down, \
-         patch.object(controller, "handle_key_up") as mock_up, \
-         patch.object(controller, "handle_escape") as mock_esc:
-
+    with (
+        patch.object(controller, "handle_key_down") as mock_down,
+        patch.object(controller, "handle_key_up") as mock_up,
+        patch.object(controller, "handle_escape") as mock_esc,
+    ):
         controller.handle_ipc_command("press")
         mock_down.assert_called_once()
 

@@ -77,9 +77,7 @@ class ToolDispatcher:
         # 4. Critical destructive action confirmation gate
         if tool.requires_confirmation and not is_confirmed:
             impact = self.registry.format_impact(tool_name, validated_params)
-            action = self.confirmation_manager.prepare_request(
-                tool_name, validated_params, impact
-            )
+            action = self.confirmation_manager.prepare_request(tool_name, validated_params, impact)
             duration = (time.perf_counter() - start_time) * 1000
             self.audit_logger.log(
                 tool_name=tool_name,

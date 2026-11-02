@@ -14,9 +14,7 @@ from viernes.brain.prompt import VIERNES_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = float(os.getenv("VIERNES_BRAIN_TIMEOUT", "120.0"))
-FALLBACK_DEGRADED_RESPONSE = (
-    "Señor, la operación tomó más tiempo del límite esperado para responder. Por favor indíqueme si desea que lo intente nuevamente."
-)
+FALLBACK_DEGRADED_RESPONSE = "Señor, la operación tomó más tiempo del límite esperado para responder. Por favor indíqueme si desea que lo intente nuevamente."
 
 
 class AntigravityAgent(Agent):
@@ -77,9 +75,7 @@ class AntigravityAgent(Agent):
         try:
             async with asyncio.timeout(self.timeout):
                 if self._custom_streamer is not None:
-                    async for chunk in self._custom_streamer(
-                        contextualized_prompt, self.timeout
-                    ):
+                    async for chunk in self._custom_streamer(contextualized_prompt, self.timeout):
                         full_response_chunks.append(chunk)
                         yield chunk
                 else:

@@ -131,9 +131,11 @@ async def test_streaming_pipeline_enqueues_tool_filler(tmp_path: Path) -> None:
         phrases=["Instant filler."],
         tool_phrases={"files": ["Permítame leer los archivos, Señor."]},
     )
+
     def dummy_synth(text: str, out: Path) -> Path:
         out.write_bytes(b"audio")
         return out
+
     cache.prewarm(dummy_synth)
 
     played_items: list[Path] = []

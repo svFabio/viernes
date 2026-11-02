@@ -19,7 +19,11 @@ def format_spoken_error(exc: BaseException, tool_name: str | None = None) -> str
     """Translates technical exceptions into concise, natural spoken messages without technical jargon."""
     err_str = str(exc).lower()
 
-    if isinstance(exc, (TimeoutError, ConnectionError)) or "timeout" in err_str or "connection" in err_str:
+    if (
+        isinstance(exc, (TimeoutError, ConnectionError))
+        or "timeout" in err_str
+        or "connection" in err_str
+    ):
         return "No pude completar la solicitud porque el servicio no responde. Intenta de nuevo más tarde."
     if isinstance(exc, PermissionError) or "permission" in err_str or "allowlist" in err_str:
         return "No tengo autorización de seguridad para realizar esa acción."

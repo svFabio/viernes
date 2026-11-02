@@ -162,9 +162,11 @@ def test_recorder_keyboard_interrupt_handling(temp_audio_dir: Path):
     def fake_start():
         recorder._is_listening = True
 
-    with patch.object(recorder, "start_stream", side_effect=fake_start) as mock_start, \
-         patch.object(recorder, "stop_stream") as mock_stop, \
-         patch.object(recorder._audio_queue, "get", side_effect=KeyboardInterrupt):
+    with (
+        patch.object(recorder, "start_stream", side_effect=fake_start) as mock_start,
+        patch.object(recorder, "stop_stream") as mock_stop,
+        patch.object(recorder._audio_queue, "get", side_effect=KeyboardInterrupt),
+    ):
         with pytest.raises(KeyboardInterrupt):
             recorder.record_utterance()
 

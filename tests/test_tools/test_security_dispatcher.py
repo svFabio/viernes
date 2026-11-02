@@ -34,7 +34,9 @@ def test_unauthorized_tool_rejected() -> None:
     registry = ToolRegistry()
     dispatcher = ToolDispatcher(registry=registry)
 
-    with pytest.raises(SecurityViolationError, match="not permitted by the strict security allowlist"):
+    with pytest.raises(
+        SecurityViolationError, match="not permitted by the strict security allowlist"
+    ):
         dispatcher.dispatch("unauthorized_shell_tool", {})
 
     assert len(dispatcher.audit_logger.records) == 1

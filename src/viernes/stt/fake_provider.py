@@ -37,7 +37,9 @@ class FakeSTTProvider(STTProvider):
 
         if isinstance(self.responses, dict):
             # Key lookup by filename or exact path
-            result = self.responses.get(audio_path.name, self.responses.get(str(audio_path), self.default_text))
+            result = self.responses.get(
+                audio_path.name, self.responses.get(str(audio_path), self.default_text)
+            )
         elif isinstance(self.responses, list) and self.responses:
             idx = (self._call_count - 1) % len(self.responses)
             result = self.responses[idx]

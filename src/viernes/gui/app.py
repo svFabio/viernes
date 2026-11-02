@@ -545,9 +545,7 @@ class ViernesControlCenter(ctk.CTk):
 
     def _trigger_service_action(self, action: str) -> None:
         """Executes a systemctl service command and updates display."""
-        self.service_feedback_label.configure(
-            text=f"Ejecutando {action}...", text_color="#38bdf8"
-        )
+        self.service_feedback_label.configure(text=f"Ejecutando {action}...", text_color="#38bdf8")
 
         def _worker() -> None:
             success, msg = self.config_service.control_service(action)

@@ -58,11 +58,7 @@ class PushToTalkController:
         on_interrupt: Callable[[], Any] | None = None,
         notify_fn: Callable[[str, str], None] | None = None,
     ) -> None:
-        self.shortcut = (
-            shortcut
-            or os.getenv("PUSH_TO_TALK_KEY")
-            or "Super+V"
-        ).strip()
+        self.shortcut = (shortcut or os.getenv("PUSH_TO_TALK_KEY") or "Super+V").strip()
 
         self.on_start = on_start
         self.on_finish = on_finish

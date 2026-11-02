@@ -63,7 +63,9 @@ def test_test_voice_success(tmp_path: Path) -> None:
     dummy_out.write_bytes(b"dummy")
 
     with (
-        patch("viernes.tts.elevenlabs_provider.ElevenLabsProvider.synthesize", return_value=dummy_out) as mock_synth,
+        patch(
+            "viernes.tts.elevenlabs_provider.ElevenLabsProvider.synthesize", return_value=dummy_out
+        ) as mock_synth,
         patch("viernes.audio.player.AudioPlayer.play") as mock_play,
     ):
         res = service.test_voice(

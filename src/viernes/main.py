@@ -120,9 +120,7 @@ def run_listener_loop(
 
     if isinstance(pipeline.agent, AntigravityAgent):
         logger.info("Pre-warming resident Antigravity process in background loop...")
-        asyncio.run_coroutine_threadsafe(
-            pipeline.agent._ensure_resident_proc(), worker_loop
-        )
+        asyncio.run_coroutine_threadsafe(pipeline.agent._ensure_resident_proc(), worker_loop)
 
     def handle_speech_capture() -> None:
         nonlocal is_turn_active
@@ -150,7 +148,9 @@ def run_listener_loop(
                 is_turn_active = False
 
     if continuous:
-        logger.info("Viernes is listening CONTINUOUSLY on your microphone. Speak whenever you want.")
+        logger.info(
+            "Viernes is listening CONTINUOUSLY on your microphone. Speak whenever you want."
+        )
         try:
             while True:
                 handle_speech_capture()
@@ -180,7 +180,9 @@ def run_listener_loop(
     logger.info("Starting Viernes Daemon. IPC socket: %s", socket_path)
 
     with PushToTalkIPCServer(controller=controller, socket_path=socket_path):
-        logger.info("Viernes is ACTIVE and listening for PTT commands ('viernes --ptt press' or global hotkey).")
+        logger.info(
+            "Viernes is ACTIVE and listening for PTT commands ('viernes --ptt press' or global hotkey)."
+        )
         try:
             while True:
                 time.sleep(1)
@@ -192,27 +194,40 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Viernes: Modular Voice Assistant")
     parser.add_argument("prompt", nargs="*", help="Direct text prompt to speak or ask")
     parser.add_argument("--test-tts", action="store_true", help="Test TTS synthesis directly")
-    parser.add_argument("--mock-brain", action="store_true", help="Use MockAgent for offline execution")
-    parser.add_argument("--echo-brain", action="store_true", help="Use EchoAgent for simple roundtrip tests")
+    parser.add_argument(
+        "--mock-brain", action="store_true", help="Use MockAgent for offline execution"
+    )
+    parser.add_argument(
+        "--echo-brain", action="store_true", help="Use EchoAgent for simple roundtrip tests"
+    )
     parser.add_argument("--list-tools", action="store_true", help="List security-allowed MCP tools")
-    parser.add_argument("--list-audio-devices", action="store_true", help="List detected microphones and speakers")
-    parser.add_argument("--ptt", choices=["press", "release", "cancel"], help="Send Push-to-Talk IPC command")
+    parser.add_argument(
+        "--list-audio-devices", action="store_true", help="List detected microphones and speakers"
+    )
+    parser.add_argument(
+        "--ptt", choices=["press", "release", "cancel"], help="Send Push-to-Talk IPC command"
+    )
     parser.add_argument("--gui", action="store_true", help="Launch the Viernes Control Center GUI")
-    parser.add_argument("--continuous", action="store_true", help="Continuously listen on microphone with VAD")
+    parser.add_argument(
+        "--continuous", action="store_true", help="Continuously listen on microphone with VAD"
+    )
     args = parser.parse_args()
 
     if args.gui:
         from viernes.gui.app import main as gui_main
+
         gui_main()
         return
 
     if args.list_audio_devices:
         from viernes.audio.devices import print_audio_devices
+
         print_audio_devices()
         return
 
     if args.ptt:
         from viernes.input.ipc import send_ptt_ipc_command
+
         success = send_ptt_ipc_command(args.ptt)
         if not success:
             logger.error("Failed to deliver Push-to-Talk IPC command '%s'", args.ptt)

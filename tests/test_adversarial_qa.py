@@ -23,7 +23,9 @@ def test_adversarial_tts_circuit_breaker_stress():
     fallback = MagicMock(spec=TTSProvider)
     output_path = Path("/tmp/test_stress.wav")
 
-    primary.synthesize.side_effect = RuntimeError("429 Too Many Requests: quota_exceeded, payment_required")
+    primary.synthesize.side_effect = RuntimeError(
+        "429 Too Many Requests: quota_exceeded, payment_required"
+    )
     fallback.synthesize.return_value = output_path
     on_fallback = MagicMock()
 
@@ -39,7 +41,7 @@ def test_adversarial_tts_circuit_breaker_stress():
 
     # Subsequent 10 attempts: must NEVER touch primary again
     for i in range(10):
-        resilient.synthesize(f"Hello {i+2}", output_path)
+        resilient.synthesize(f"Hello {i + 2}", output_path)
 
     assert primary.synthesize.call_count == 1
     assert fallback.synthesize.call_count == 11

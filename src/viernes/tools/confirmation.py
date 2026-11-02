@@ -99,7 +99,11 @@ class ConfirmationManager:
                 logger.info("Voice action '%s' confirmed by user.", action.tool_name)
                 return decision, "Confirmación recibida. Procediendo con la acción."
             else:
-                logger.info("Voice action '%s' cancelled by user response: '%s'", action.tool_name, user_spoken)
+                logger.info(
+                    "Voice action '%s' cancelled by user response: '%s'",
+                    action.tool_name,
+                    user_spoken,
+                )
                 return ConfirmationDecision.REJECTED, "Acción cancelada."
 
         except TimeoutError:
@@ -108,7 +112,10 @@ class ConfirmationManager:
                 self.timeout_seconds,
                 action.tool_name,
             )
-            return ConfirmationDecision.TIMEOUT, "Tiempo de espera agotado. Acción cancelada por seguridad."
+            return (
+                ConfirmationDecision.TIMEOUT,
+                "Tiempo de espera agotado. Acción cancelada por seguridad.",
+            )
         finally:
             # Guarantee no cumulative lingering state
             self.pending_action = None

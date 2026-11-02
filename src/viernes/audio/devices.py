@@ -39,14 +39,18 @@ def print_audio_devices() -> None:
         print("  (No input devices found)")
     for dev in inputs:
         default_marker = " * [DEFAULT]" if dev.get("is_default_input") else ""
-        print(f"  [{dev['index']}] {dev['name']}{default_marker} ({dev['max_input_channels']} channels, {int(dev.get('default_samplerate', 0))}Hz)")
+        print(
+            f"  [{dev['index']}] {dev['name']}{default_marker} ({dev['max_input_channels']} channels, {int(dev.get('default_samplerate', 0))}Hz)"
+        )
 
     print("\nAvailable Audio Output Devices (Speakers / Headphones):")
     if not outputs:
         print("  (No output devices found)")
     for dev in outputs:
         default_marker = " * [DEFAULT]" if dev.get("is_default_output") else ""
-        print(f"  [{dev['index']}] {dev['name']}{default_marker} ({dev['max_output_channels']} channels, {int(dev.get('default_samplerate', 0))}Hz)")
+        print(
+            f"  [{dev['index']}] {dev['name']}{default_marker} ({dev['max_output_channels']} channels, {int(dev.get('default_samplerate', 0))}Hz)"
+        )
     print()
 
 
