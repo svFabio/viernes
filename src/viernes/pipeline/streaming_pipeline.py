@@ -85,6 +85,29 @@ class StreamingPipeline:
 
         self.agent.on_tool_activity = handle_tool
 
+        # Patience reminder if processing takes longer (> 6.5s without tokens)
+        patience_filler_played = False
+
+        async def patience_watchdog() -> None:
+            nonlocal patience_filler_played
+            try:
+                await asyncio.sleep(6.5)
+                if (
+                    not first_token_received
+                    and not patience_filler_played
+                    and not self._is_cancelled
+                    and self.filler_cache is not None
+                ):
+                    patience = self.filler_cache.get_patience_filler()
+                    if patience and patience.is_file():
+                        logger.info("Enqueuing patience reminder filler: %s", patience.name)
+                        patience_filler_played = True
+                        await self.playback_queue.enqueue(patience)
+            except asyncio.CancelledError:
+                pass
+
+        watchdog_task = asyncio.create_task(patience_watchdog())
+
         # Background synthesis worker that receives sentences from a queue
         sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
@@ -131,6 +154,8 @@ class StreamingPipeline:
             nonlocal first_token_received
             async for token in self.agent.ask_stream(prompt):
                 first_token_received = True
+                if not watchdog_task.done():
+                    watchdog_task.cancel()
                 yield token
 
         try:
@@ -141,6 +166,8 @@ class StreamingPipeline:
                 await sentence_queue.put(sentence)
 
         finally:
+            if not watchdog_task.done():
+                watchdog_task.cancel()
             self.agent.on_tool_activity = None
             await sentence_queue.put(None)
             await synthesis_task

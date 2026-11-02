@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Callable
@@ -12,9 +13,9 @@ from viernes.brain.prompt import VIERNES_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SECONDS = 45.0
+DEFAULT_TIMEOUT_SECONDS = float(os.getenv("VIERNES_BRAIN_TIMEOUT", "120.0"))
 FALLBACK_DEGRADED_RESPONSE = (
-    "Disculpa, tardé demasiado en pensar la respuesta. Por favor intenta de nuevo."
+    "Señor, la operación tomó más tiempo del límite esperado para responder. Por favor indíqueme si desea que lo intente nuevamente."
 )
 
 

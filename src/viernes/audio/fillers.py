@@ -28,6 +28,11 @@ TOOL_FILLER_PHRASES: dict[str, list[str]] = {
     ],
 }
 
+PATIENCE_FILLER_PHRASES: list[str] = [
+    "Señor, demoraré un momento en responder, por favor espéreme.",
+    "Esta operación tomará unos segundos más, Señor, por favor espéreme.",
+]
+
 TOOL_CATEGORY_MAP: dict[str, str] = {
     "read_file": "files",
     "view_file": "files",
@@ -47,7 +52,7 @@ class FillerAudioCache:
 
     Masks brain thinking latency by immediately playing natural acknowledgments
     like 'Deme un segundo, Señor...' within < 200ms of user finishing speech,
-    as well as context-aware tool acknowledgments when actions are triggered.
+    as well as context-aware tool acknowledgments and patience reminders for longer tasks.
     """
 
     def __init__(
@@ -55,13 +60,16 @@ class FillerAudioCache:
         cache_dir: Path | None = None,
         phrases: list[str] | None = None,
         tool_phrases: dict[str, list[str]] | None = None,
+        patience_phrases: list[str] | None = None,
     ) -> None:
         self.cache_dir = cache_dir or Path("/tmp/viernes/fillers")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.phrases = phrases or DEFAULT_FILLER_PHRASES
         self.tool_phrases = tool_phrases or TOOL_FILLER_PHRASES
+        self.patience_phrases = patience_phrases or PATIENCE_FILLER_PHRASES
         self._cached_files: list[Path] = []
         self._cached_tool_files: dict[str, list[Path]] = {}
+        self._cached_patience_files: list[Path] = []
 
     def get_filler_path_for_phrase(self, phrase: str) -> Path:
         slug = hashlib.md5(phrase.encode("utf-8")).hexdigest()[:8]
@@ -105,10 +113,25 @@ class FillerAudioCache:
                     cat_list.append(target)
             self._cached_tool_files[category] = cat_list
 
+        self._cached_patience_files = []
+        for phrase in self.patience_phrases:
+            target = self.get_filler_path_for_phrase(phrase)
+            if not target.exists() or target.stat().st_size == 0:
+                try:
+                    logger.debug("Pre-caching patience filler audio: '%s'", phrase)
+                    synthesizer(phrase, target)
+                except Exception as exc:
+                    logger.warning("Failed pre-caching patience filler '%s': %s", phrase, exc)
+                    continue
+
+            if target.exists() and target.stat().st_size > 0:
+                self._cached_patience_files.append(target)
+
         logger.info(
-            "Filler audio cache warmed up with %d generic and %d tool phrases.",
+            "Filler audio cache warmed up with %d generic, %d tool, and %d patience phrases.",
             len(self._cached_files),
             sum(len(v) for v in self._cached_tool_files.values()),
+            len(self._cached_patience_files),
         )
 
     def get_random_filler(self) -> Path | None:
@@ -134,13 +157,26 @@ class FillerAudioCache:
         cat_files = self._cached_tool_files.get(category, [])
         available = [f for f in cat_files if f.is_file() and f.stat().st_size > 0]
         if not available:
-            # Fall back to checking on disk
             phrases = self.tool_phrases.get(category, [])
             for phrase in phrases:
                 p = self.get_filler_path_for_phrase(phrase)
                 if p.is_file() and p.stat().st_size > 0:
                     available.append(p)
             self._cached_tool_files[category] = available
+
+        if not available:
+            return None
+        return random.choice(available)
+
+    def get_patience_filler(self) -> Path | None:
+        """Returns a pre-cached patience reminder audio path for longer operations."""
+        available = [f for f in self._cached_patience_files if f.is_file() and f.stat().st_size > 0]
+        if not available:
+            for phrase in self.patience_phrases:
+                p = self.get_filler_path_for_phrase(phrase)
+                if p.is_file() and p.stat().st_size > 0:
+                    available.append(p)
+            self._cached_patience_files = available
 
         if not available:
             return None

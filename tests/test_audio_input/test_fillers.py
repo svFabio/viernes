@@ -62,6 +62,22 @@ def test_filler_cache_tool_fillers(tmp_path: Path) -> None:
     assert unknown is None
 
 
+def test_filler_cache_patience_fillers(tmp_path: Path) -> None:
+    cache = FillerAudioCache(
+        cache_dir=tmp_path,
+        patience_phrases=["Señor, demoraré un momento en responder."],
+    )
+
+    def dummy_synth(text: str, out: Path) -> Path:
+        out.write_bytes(b"dummy_patience_audio")
+        return out
+
+    cache.prewarm(dummy_synth)
+    patience = cache.get_patience_filler()
+    assert patience is not None
+    assert patience.exists()
+
+
 @pytest.mark.anyio
 async def test_streaming_pipeline_enqueues_filler_first(tmp_path: Path) -> None:
     cache = FillerAudioCache(cache_dir=tmp_path, phrases=["Deme un segundo, Señor."])
