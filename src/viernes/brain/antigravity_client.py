@@ -10,7 +10,7 @@ from viernes.brain.prompt import VIERNES_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_TIMEOUT_SECONDS = 25.0
 FALLBACK_DEGRADED_RESPONSE = (
     "Disculpa, tardé demasiado en pensar la respuesta. Por favor intenta de nuevo."
 )
@@ -94,7 +94,8 @@ class AntigravityAgent(Agent):
             logger.info("CLI %s not found in PATH; falling back to simulated engine.", self.cli_bin)
             return f"Respuesta simulada para: {prompt}"
 
-        cmd = [executable, "--system-prompt", self.system_prompt, "--headless", prompt]
+        full_prompt = f"{self.system_prompt}\n\n{prompt}"
+        cmd = [executable, "--output-format", "text", "-p", full_prompt]
         try:
             proc = subprocess.run(
                 cmd,
@@ -115,7 +116,8 @@ class AntigravityAgent(Agent):
             yield f"Respuesta simulada para: {prompt}"
             return
 
-        cmd = [executable, "--system-prompt", self.system_prompt, "--headless", "--stream", prompt]
+        full_prompt = f"{self.system_prompt}\n\n{prompt}"
+        cmd = [executable, "--output-format", "text", "-p", full_prompt]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
