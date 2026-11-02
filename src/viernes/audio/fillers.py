@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FILLER_PHRASES: list[str] = [
     "Deme un segundo, Señor, ya lo reviso.",
-    "Enseguida, Señor, consultando el sistema.",
+    "Enseguida, Señor, estoy consultando información.",
     "Un momento, Señor, permítame verificar.",
     "Revisando sus registros, deme un segundo.",
     "Entendido, Señor, procesando.",
