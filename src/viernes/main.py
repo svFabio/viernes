@@ -164,7 +164,8 @@ def run_listener_loop(
         threading.Thread(target=handle_speech_capture, daemon=True).start()
 
     def on_ptt_finish() -> None:
-        logger.debug("Push-to-Talk released.")
+        logger.info("Push-to-Talk released: finalizing speech recording.")
+        recorder.finish_recording()
 
     def on_ptt_cancel() -> None:
         logger.info("Push-to-Talk cancelled.")

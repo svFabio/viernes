@@ -394,10 +394,18 @@ class ViernesControlCenter(ctk.CTk):
 
         try:
             save_custom_fillers(generic=generic, tool_phrases=tools, patience=patience)
-            self.fillers_status_label.configure(
-                text="✔ Frases de relleno guardadas exitosamente.",
-                text_color="#22c55e",
-            )
+            is_active, _ = self.config_service.get_service_status()
+            if is_active:
+                self.config_service.control_service("restart")
+                self.fillers_status_label.configure(
+                    text="✔ Frases guardadas y servicio reiniciado con el nuevo caché.",
+                    text_color="#22c55e",
+                )
+            else:
+                self.fillers_status_label.configure(
+                    text="✔ Frases de relleno guardadas exitosamente.",
+                    text_color="#22c55e",
+                )
         except Exception as exc:
             self.fillers_status_label.configure(
                 text=f"Error al guardar: {exc}",
@@ -707,10 +715,18 @@ class ViernesControlCenter(ctk.CTk):
         try:
             self.config_service.save_config(updates)
             self.current_config = self.config_service.read_config()
-            self.footer_status.configure(
-                text="✔ Cambios guardados exitosamente en .env",
-                text_color="#4ade80",
-            )
+            is_active, _ = self.config_service.get_service_status()
+            if is_active:
+                self.config_service.control_service("restart")
+                self.footer_status.configure(
+                    text="✔ Cambios guardados y servicio reiniciado exitosamente.",
+                    text_color="#4ade80",
+                )
+            else:
+                self.footer_status.configure(
+                    text="✔ Cambios guardados exitosamente en .env",
+                    text_color="#4ade80",
+                )
             # Re-read status
             self._update_service_status_badge()
         except Exception as exc:

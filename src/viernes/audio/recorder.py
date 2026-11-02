@@ -110,6 +110,7 @@ class AudioRecorder:
         self._stream: sd.InputStream | None = None
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self._is_listening: bool = False
+        self._finish_requested: bool = False
 
     @property
     def is_listening(self) -> bool:
@@ -303,6 +304,10 @@ class AudioRecorder:
                 self._stream = None
         logger.info("Audio stream closed and resources freed.")
 
+    def finish_recording(self) -> None:
+        """Signals active recording loop to finalize and export captured utterance immediately."""
+        self._finish_requested = True
+
     def record_utterance(
         self,
         timeout_s: float | None = None,
@@ -312,6 +317,7 @@ class AudioRecorder:
 
         Handles Ctrl+C and timeouts gracefully, guaranteeing resource release.
         """
+        self._finish_requested = False
         self.reset()
         self.start_stream()
         start_time = time.time()
@@ -319,12 +325,22 @@ class AudioRecorder:
 
         try:
             while self._is_listening:
+                if self._finish_requested:
+                    logger.debug("Recording finish requested explicitly.")
+                    if self._recorded_frames:
+                        self.state = RecorderState.PROCESSING
+                        return self.export_wav(self._recorded_frames)
+                    break
+
                 if timeout_s and (time.time() - start_time) > timeout_s:
                     logger.debug("Listening timed out after %.1fs", timeout_s)
+                    if self._recorded_frames:
+                        self.state = RecorderState.PROCESSING
+                        return self.export_wav(self._recorded_frames)
                     break
 
                 try:
-                    frame = self._audio_queue.get(timeout=0.1)
+                    frame = self._audio_queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
 
