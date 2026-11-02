@@ -211,7 +211,28 @@ def main() -> None:
     parser.add_argument(
         "--continuous", action="store_true", help="Continuously listen on microphone with VAD"
     )
+    parser.add_argument(
+        "--new-conversation",
+        action="store_true",
+        help="Rotate and start a fresh Antigravity conversation session",
+    )
     args = parser.parse_args()
+
+    if args.new_conversation:
+        from viernes.brain.session_manager import ConversationSessionManager
+
+        sm = ConversationSessionManager()
+        archived = sm.rotate_conversation()
+        if archived:
+            print(f"Conversación anterior archivada: {archived}")
+            print(
+                "Listo, Señor. Viernes iniciará una nueva conversación limpia en el próximo comando."
+            )
+        else:
+            print(
+                "Listo, Señor. No había conversación previa guardada; se iniciará una nueva limpia."
+            )
+        return
 
     if args.gui:
         from viernes.gui.app import main as gui_main

@@ -10,6 +10,10 @@ from pathlib import Path
 from viernes.brain.agent import Agent
 from viernes.brain.memory import ConversationMemory
 from viernes.brain.prompt import VIERNES_SYSTEM_PROMPT
+from viernes.brain.session_manager import (
+    ConversationSessionManager,
+    is_reset_conversation_intent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,7 @@ class AntigravityAgent(Agent):
         system_prompt: str = VIERNES_SYSTEM_PROMPT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         memory: ConversationMemory | None = None,
+        session_manager: ConversationSessionManager | None = None,
         custom_invoker: Callable[[str, float], str] | None = None,
         custom_streamer: Callable[[str, float], AsyncIterator[str]] | None = None,
         on_tool_activity: Callable[[str], None] | None = None,
@@ -38,6 +43,7 @@ class AntigravityAgent(Agent):
         self.system_prompt = system_prompt
         self.timeout = timeout
         self.memory = memory or ConversationMemory()
+        self.session_manager = session_manager or ConversationSessionManager()
         self._custom_invoker = custom_invoker
         self._custom_streamer = custom_streamer
         self.on_tool_activity = on_tool_activity
@@ -45,8 +51,20 @@ class AntigravityAgent(Agent):
         self._resident_loop: asyncio.AbstractEventLoop | None = None
         self._proc_lock: asyncio.Lock | None = None
 
+    def rotate_conversation(self) -> str | None:
+        """Archives active conversation, terminates resident proc, and clears local turn memory."""
+        archived_id = self.session_manager.rotate_conversation()
+        self._kill_resident_proc()
+        self.memory.clear()
+        logger.info("Rotated conversation. Archived ID: %s", archived_id)
+        return archived_id
+
     def ask(self, prompt: str) -> str:
         """Synchronously processes prompt with timeout and graceful degradation."""
+        if is_reset_conversation_intent(prompt):
+            self.rotate_conversation()
+            return "Listo, Señor. He iniciado una nueva conversación limpia."
+
         contextualized_prompt = self.memory.format_context_prompt(prompt)
 
         try:
@@ -69,6 +87,11 @@ class AntigravityAgent(Agent):
 
     async def ask_stream(self, prompt: str) -> AsyncIterator[str]:
         """Asynchronously streams response tokens via resident channel with graceful degradation."""
+        if is_reset_conversation_intent(prompt):
+            self.rotate_conversation()
+            yield "Listo, Señor. He iniciado una nueva conversación limpia."
+            return
+
         contextualized_prompt = self.memory.format_context_prompt(prompt)
         full_response_chunks: list[str] = []
 
@@ -115,6 +138,7 @@ class AntigravityAgent(Agent):
         if not executable:
             raise RuntimeError(f"CLI binary '{self.cli_bin}' not found in PATH")
 
+        current_conv_id = self.session_manager.get_current_conversation_id()
         cmd = [
             executable,
             "--model",
@@ -128,6 +152,9 @@ class AntigravityAgent(Agent):
             "--output-format",
             "stream-json",
         ]
+        if current_conv_id:
+            cmd.extend(["--conversation", current_conv_id])
+
         logger.info("Spawning resident Antigravity CLI process: %s", " ".join(cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -138,7 +165,17 @@ class AntigravityAgent(Agent):
         assert proc.stdout is not None
         # Consume the startup 'init' event
         init_line = await proc.stdout.readline()
-        logger.debug("Resident CLI initialized: %s", init_line.decode("utf-8").strip()[:100])
+        init_text = init_line.decode("utf-8").strip()
+        logger.debug("Resident CLI initialized: %s", init_text[:100])
+        try:
+            init_data = json.loads(init_text)
+            new_conv_id = init_data.get("conversation_id")
+            if new_conv_id and new_conv_id != current_conv_id:
+                logger.info("Setting active conversation ID from init event: %s", new_conv_id)
+                self.session_manager.set_current_conversation_id(new_conv_id)
+        except Exception as exc:
+            logger.warning("Could not parse conversation_id from init event: %s", exc)
+
         self._resident_proc = proc
         self._resident_loop = current_loop
         self._proc_lock = asyncio.Lock()
@@ -243,6 +280,7 @@ class AntigravityAgent(Agent):
             return f"Respuesta simulada para: {prompt}"
 
         full_prompt = f"{self.system_prompt}\n\n{prompt}"
+        current_conv_id = self.session_manager.get_current_conversation_id()
         cmd = [
             executable,
             "--model",
@@ -252,9 +290,10 @@ class AntigravityAgent(Agent):
             "--disable-slash-commands",
             "--output-format",
             "text",
-            "-p",
-            full_prompt,
         ]
+        if current_conv_id:
+            cmd.extend(["--conversation", current_conv_id])
+        cmd.extend(["-p", full_prompt])
         try:
             proc = subprocess.run(
                 cmd,

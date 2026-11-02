@@ -8,6 +8,10 @@ class Agent(ABC):
 
     on_tool_activity: Callable[[str], None] | None = None
 
+    def rotate_conversation(self) -> str | None:
+        """Rotates the conversation session if supported by the engine."""
+        return None
+
     @abstractmethod
     def ask(self, prompt: str) -> str:
         """Processes user input synchronously and returns a textual response."""

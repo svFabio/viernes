@@ -318,6 +318,64 @@ class ViernesControlCenter(ctk.CTk):
         )
         self.service_feedback_label.pack(anchor="w", pady=(4, 8))
 
+        # Brain Conversation & Memory Management Card
+        memory_card = ctk.CTkFrame(container, fg_color=("gray80", "gray20"), corner_radius=8)
+        memory_card.pack(fill="x", pady=(12, 16), padx=4)
+
+        mem_title = ctk.CTkLabel(
+            memory_card,
+            text="Memoria de Antigravity (Conversación Activa):",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        mem_title.pack(anchor="w", padx=12, pady=(12, 4))
+
+        from viernes.brain.session_manager import ConversationSessionManager
+
+        self.session_manager = ConversationSessionManager()
+        active_id = self.session_manager.get_current_conversation_id()
+        preview_id = active_id if active_id else "(Nueva / No inicializada aún)"
+
+        self.conv_id_label = ctk.CTkLabel(
+            memory_card,
+            text=f"ID: {preview_id}",
+            font=ctk.CTkFont(size=11),
+            text_color="gray70",
+        )
+        self.conv_id_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        self.btn_new_conv = ctk.CTkButton(
+            memory_card,
+            text="🔄 Iniciar Nueva Conversación (Rotar Memoria)",
+            command=self._on_rotate_conversation_clicked,
+            fg_color="#475569",
+            hover_color="#334155",
+            height=36,
+        )
+        self.btn_new_conv.pack(fill="x", padx=12, pady=(0, 12))
+
+        self.conv_feedback_label = ctk.CTkLabel(
+            container,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="gray70",
+        )
+        self.conv_feedback_label.pack(anchor="w", pady=(0, 8))
+
+    def _on_rotate_conversation_clicked(self) -> None:
+        """Rotates the active Antigravity conversation and updates UI."""
+        archived = self.session_manager.rotate_conversation()
+        self.conv_id_label.configure(text="ID: (Nueva / No inicializada aún)")
+        if archived:
+            self.conv_feedback_label.configure(
+                text=f"Conversación archivada: {archived[:8]}... Lista para iniciar limpia.",
+                text_color="#22c55e",
+            )
+        else:
+            self.conv_feedback_label.configure(
+                text="Lista para iniciar una conversación nueva y limpia.",
+                text_color="#22c55e",
+            )
+
     def _build_footer(self) -> None:
         """Builds bottom action bar with persistent Save button."""
         footer_frame = ctk.CTkFrame(self, corner_radius=10, fg_color=("gray85", "gray17"))
