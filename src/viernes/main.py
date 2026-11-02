@@ -46,10 +46,19 @@ def build_tts_engine(temp_dir: Path) -> ResilientTTS:
         except (ValueError, RuntimeError) as exc:
             logger.warning("Could not initialize ElevenLabs: %s", exc)
 
-    fallback = PiperProvider(
-        model_path=settings.piper_model_path,
-        piper_bin=settings.piper_bin,
-    )
+    from viernes.tts.edge_provider import EdgeTTSProvider
+
+    fallback: TTSProvider
+    if settings.piper_model_path and Path(settings.piper_model_path).exists():
+        fallback = PiperProvider(
+            model_path=settings.piper_model_path,
+            piper_bin=settings.piper_bin,
+        )
+    else:
+        fallback = EdgeTTSProvider(
+            voice=settings.edge_tts_voice,
+            temp_dir=temp_dir,
+        )
 
     return ResilientTTS(
         primary=primary or fallback,

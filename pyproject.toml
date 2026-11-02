@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "av<14",
     "customtkinter>=6.0.0",
+    "edge-tts>=7.3.1",
     "elevenlabs>=2.75.0",
     "faster-whisper>=1.2.1",
     "numpy>=2.5.4",
