@@ -59,7 +59,7 @@ class ConfigService:
 
     def get_audio_input_devices(self) -> list[tuple[str, str]]:
         """Returns input devices formatted as (display_name, raw_id)."""
-        devices: list[tuple[str, str]] = [("Por defecto del sistema", "")]
+        devices: list[tuple[str, str]] = [("Por defecto del sistema (Recomendado)", "")]
         for dev in list_audio_devices():
             if dev.get("max_input_channels", 0) > 0:
                 idx = dev.get("index", 0)
@@ -70,7 +70,7 @@ class ConfigService:
 
     def get_audio_output_devices(self) -> list[tuple[str, str]]:
         """Returns output devices formatted as (display_name, raw_id)."""
-        devices: list[tuple[str, str]] = [("Por defecto del sistema", "")]
+        devices: list[tuple[str, str]] = [("Por defecto del sistema (Recomendado)", "")]
         for dev in list_audio_devices():
             if dev.get("max_output_channels", 0) > 0:
                 idx = dev.get("index", 0)

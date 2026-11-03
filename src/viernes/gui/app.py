@@ -615,7 +615,7 @@ class ViernesControlCenter(ctk.CTk):
                 self.input_combo.set(disp)
                 break
         else:
-            self.input_combo.set("Por defecto del sistema")
+            self.input_combo.set("Por defecto del sistema (Recomendado)")
 
         # 4. Audio output device
         output_dev = cfg.get("AUDIO_OUTPUT_DEVICE", "")
@@ -624,7 +624,7 @@ class ViernesControlCenter(ctk.CTk):
                 self.output_combo.set(disp)
                 break
         else:
-            self.output_combo.set("Por defecto del sistema")
+            self.output_combo.set("Por defecto del sistema (Recomendado)")
 
         # 5. VAD Threshold
         try:
@@ -693,19 +693,21 @@ class ViernesControlCenter(ctk.CTk):
         # Input device
         selected_in = self.input_combo.get()
         in_id = ""
-        for disp, raw_val in self.input_devices:
-            if disp == selected_in:
-                in_id = raw_val
-                break
+        if not selected_in.startswith("Por defecto"):
+            for disp, raw_val in self.input_devices:
+                if disp == selected_in:
+                    in_id = raw_val
+                    break
         updates["AUDIO_INPUT_DEVICE"] = in_id
 
         # Output device
         selected_out = self.output_combo.get()
         out_id = ""
-        for disp, raw_val in self.output_devices:
-            if disp == selected_out:
-                out_id = raw_val
-                break
+        if not selected_out.startswith("Por defecto"):
+            for disp, raw_val in self.output_devices:
+                if disp == selected_out:
+                    out_id = raw_val
+                    break
         updates["AUDIO_OUTPUT_DEVICE"] = out_id
 
         # VAD & Silence

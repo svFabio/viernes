@@ -280,15 +280,34 @@ class AudioRecorder:
             self.sample_rate,
             self.frame_size,
         )
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.dtype,
-            blocksize=self.frame_size,
-            device=self.device,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=self.dtype,
+                blocksize=self.frame_size,
+                device=self.device,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except sd.PortAudioError as exc:
+            logger.warning(
+                "Failed to open audio input on device '%s' at %dHz: %s. Falling back to default system device.",
+                self.device,
+                self.sample_rate,
+                exc,
+            )
+            self.device = None
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=self.dtype,
+                blocksize=self.frame_size,
+                device=None,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+            logger.info("Successfully recovered audio input using default system device.")
 
     def stop_stream(self) -> None:
         """Stops and closes the live audio stream, releasing all hardware resources."""
