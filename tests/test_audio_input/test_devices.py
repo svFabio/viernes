@@ -59,7 +59,9 @@ def test_print_audio_devices_runs(capsys):
         assert "[1] USB Gaming Headset" in captured.out
 
 
-def test_resolve_audio_device_default_and_none():
+def test_resolve_audio_device_default_and_none(monkeypatch):
+    monkeypatch.delenv("AUDIO_INPUT_DEVICE", raising=False)
+    monkeypatch.delenv("AUDIO_OUTPUT_DEVICE", raising=False)
     assert resolve_audio_device(None, devices=MOCK_DEVICES) is None
     assert resolve_audio_device("", devices=MOCK_DEVICES) is None
     assert resolve_audio_device("default", devices=MOCK_DEVICES) is None

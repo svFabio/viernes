@@ -68,7 +68,13 @@ jobs:
       - name: Install system dependencies (Audio & Headless X11)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libportaudio2 libasound2-dev xvfb alsa-utils
+          sudo apt-get install -y --no-install-recommends libportaudio2 libasound2-dev xvfb alsa-utils pulseaudio
+
+      - name: Configure Headless Audio Sinks
+        run: |
+          mkdir -p ~/.config/pulse
+          echo "pcm.!default { type null }" > ~/.asoundrc
+          pulseaudio --start --exit-idle-time=-1 || true
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
