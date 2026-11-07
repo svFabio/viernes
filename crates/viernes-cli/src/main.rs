@@ -51,10 +51,21 @@ struct CliArgs {
     /// Run synthetic workload benchmark for PGO training and performance analysis
     #[arg(long)]
     benchmark: bool,
+
+    /// Send Push-to-Talk IPC trigger to running daemon (e.g. "press", "release", "cancel")
+    #[arg(long, value_name = "COMMAND")]
+    ptt: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = CliArgs::parse();
+
+    // Fast-path: Dispatch PTT IPC command directly without initializing heavy subsystems
+    if let Some(ref cmd) = args.ptt {
+        return send_ptt_command(cmd).await;
+    }
+
     // Initialize structured tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -62,8 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let args = CliArgs::parse();
 
     info!(
         "Initializing Viernes Rust Core v{}",
@@ -405,6 +414,32 @@ async fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Sends a Push-to-Talk IPC trigger command directly to the active Viernes daemon socket.
+async fn send_ptt_command(command: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let socket_path = std::env::var("VIERNES_PTT_SOCKET")
+        .unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
+
+    let path = std::path::Path::new(&socket_path);
+    if !path.exists() {
+        eprintln!(
+            "Error: Viernes daemon is not running (socket {:?} not found).",
+            socket_path
+        );
+        eprintln!("Start the daemon first with: viernes --daemon");
+        std::process::exit(1);
+    }
+
+    let mut stream = UnixStream::connect(path).await?;
+    stream
+        .write_all(format!("{}\n", command.trim()).as_bytes())
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +449,9 @@ mod tests {
         let parsed = CliArgs::try_parse_from(["viernes", "--check-config"]);
         assert!(parsed.is_ok());
         assert!(parsed.unwrap().check_config);
+
+        let parsed_ptt = CliArgs::try_parse_from(["viernes", "--ptt", "press"]);
+        assert!(parsed_ptt.is_ok());
+        assert_eq!(parsed_ptt.unwrap().ptt.as_deref(), Some("press"));
     }
 }
