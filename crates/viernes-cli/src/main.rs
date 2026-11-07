@@ -70,6 +70,19 @@ struct CliArgs {
     tui: bool,
 }
 
+/// Silences verbose C-level stderr output (such as ALSA/libasound diagnostic messages)
+/// to prevent terminal and TUI corruption, without violating `#![forbid(unsafe_code)]`.
+#[cfg(target_os = "linux")]
+fn silence_c_stderr() {
+    if let Ok(devnull) = std::fs::File::create("/dev/null") {
+        use std::os::unix::io::AsRawFd;
+        let _ = nix::unistd::dup2(devnull.as_raw_fd(), 2);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn silence_c_stderr() {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
@@ -79,14 +92,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return send_ptt_command(cmd).await;
     }
 
+    // Silence verbose C-level stderr (e.g. ALSA pcm_route warnings) to keep TUI and daemon output pristine
+    silence_c_stderr();
+
     // Launch interactive TUI
     if args.tui {
         let config = ViernesConfig::load_from_env(None).unwrap_or_default();
         return tui::run_tui(config).await;
     }
 
-    // Initialize structured tracing
+    // Initialize structured tracing to stdout
     tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -488,6 +505,7 @@ async fn process_speech_turn(
     // Strict Filler policy: At most 2 fillers per turn (1 immediate acknowledgment + at most 1 tool filler if delayed)
     let mut total_fillers_played = 0;
     let mut last_filler_time = std::time::Instant::now();
+    let response_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // 1. Instantly play conversational filler phrase to eliminate perceived latency (< 150ms)
     if let Some(filler) = fillers.select_immediate().await {
@@ -496,9 +514,19 @@ async fn process_speech_turn(
         last_filler_time = std::time::Instant::now();
         let tts_filler = tts.clone();
         let player_filler = player.clone();
+        let resp_started = response_started.clone();
         tokio::spawn(async move {
             if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
+                // If the real response already started, discard filler immediately to prevent race conditions
+                if resp_started.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!("Discarding instant filler because assistant response already arrived");
+                    return;
+                }
                 let mut p = player_filler.lock().await;
+                if resp_started.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!("Discarding instant filler because assistant response already enqueued");
+                    return;
+                }
                 let _ = p.enqueue_chunk(audio).await;
             }
         });
@@ -512,12 +540,14 @@ async fn process_speech_turn(
     let player_worker = player.clone();
     let sm_worker = sm.clone();
     let status_worker = status.clone();
+    let resp_started_worker = response_started.clone();
     let synthesis_worker = tokio::spawn(async move {
         while let Some(sentence) = rx.recv().await {
             let trimmed = sentence.trim();
             if trimmed.is_empty() {
                 continue;
             }
+            resp_started_worker.store(true, std::sync::atomic::Ordering::SeqCst);
             info!("Synthesizing sentence: '{}'", trimmed);
             {
                 let mut st = status_worker.lock().await;
@@ -566,12 +596,14 @@ async fn process_speech_turn(
                 match client.next_event().await {
                     Ok(Some(BrainEvent::TextChunk { content })) => {
                         response_received = true;
+                        response_started.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = tokenizer.feed_token(&content).await;
                     }
                     Ok(Some(BrainEvent::ToolCall { name, .. })) => {
                         info!("Brain active tool call: '{}'", name);
                         // Strict limit: Maximum 2 fillers TOTAL per turn, spaced at least 3.5s apart
                         if total_fillers_played < 2
+                            && !response_started.load(std::sync::atomic::Ordering::SeqCst)
                             && last_filler_time.elapsed() >= std::time::Duration::from_millis(3500)
                         {
                             if let Some(tool_filler) = fillers.select_tool_filler(&name).await {
@@ -584,11 +616,20 @@ async fn process_speech_turn(
                                 last_filler_time = std::time::Instant::now();
                                 let tts_tool = tts.clone();
                                 let player_tool = player.clone();
+                                let resp_started_tool = response_started.clone();
                                 tokio::spawn(async move {
                                     if let Ok(audio) =
                                         tts_tool.synthesize_resilient(&tool_filler).await
                                     {
+                                        if resp_started_tool.load(std::sync::atomic::Ordering::SeqCst) {
+                                            tracing::debug!("Discarding tool filler because assistant response already arrived");
+                                            return;
+                                        }
                                         let mut p = player_tool.lock().await;
+                                        if resp_started_tool.load(std::sync::atomic::Ordering::SeqCst) {
+                                            tracing::debug!("Discarding tool filler because assistant response already enqueued");
+                                            return;
+                                        }
                                         let _ = p.enqueue_chunk(audio).await;
                                     }
                                 });
