@@ -1,0 +1,263 @@
+//! Subprocess NDJSON streaming client for Antigravity.
+
+use futures::{Stream, StreamExt};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio_stream::wrappers::LinesStream;
+use tracing::{debug, error, info, warn};
+
+use crate::error::BrainError;
+
+/// Inactivity timeout threshold for tokens stream (15 seconds).
+pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Graceful shutdown timeout before sending SIGKILL (3 seconds).
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Typed NDJSON events emitted by Antigravity streaming process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrainEvent {
+    /// Internal reasoning token or status update.
+    Thought {
+        /// Content of the thought.
+        content: String,
+    },
+    /// Incremental natural language response chunk.
+    TextChunk {
+        /// Text fragment.
+        content: String,
+    },
+    /// Subagent or tool execution intent.
+    ToolCall {
+        /// Name of the tool.
+        name: String,
+        /// Tool input arguments as JSON.
+        args: serde_json::Value,
+    },
+    /// Subprocess or engine error message.
+    Error {
+        /// Error diagnostic message.
+        message: String,
+    },
+    /// Completion marker for the current response stream.
+    Done,
+}
+
+/// Asynchronous streaming client communicating over NDJSON with `antigravity-cli`.
+pub struct AntigravityClient {
+    child: Child,
+    stdin: ChildStdin,
+    lines_stream: LinesStream<BufReader<ChildStdout>>,
+    binary_path: PathBuf,
+}
+
+impl AntigravityClient {
+    /// Return the path to the configured antigravity binary.
+    #[must_use]
+    pub fn binary_path(&self) -> &Path {
+        &self.binary_path
+    }
+
+    /// Spawn a new `antigravity-cli` child process with piped standard I/O streams.
+    pub fn spawn<P: AsRef<Path>>(binary_path: P, args: &[String]) -> Result<Self, BrainError> {
+        let path_buf = binary_path.as_ref().to_path_buf();
+        info!(binary = %path_buf.display(), "Spawning Antigravity process");
+
+        let mut child = Command::new(&path_buf)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(BrainError::ProcessSpawn)?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BrainError::Internal("failed to capture child stdin".into()))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BrainError::Internal("failed to capture child stdout".into()))?;
+
+        let lines_stream = LinesStream::new(BufReader::new(stdout).lines());
+
+        Ok(Self {
+            child,
+            stdin,
+            lines_stream,
+            binary_path: path_buf,
+        })
+    }
+
+    /// Send a user prompt line to the process stdin.
+    pub async fn send_prompt(&mut self, prompt: &str) -> Result<(), BrainError> {
+        debug!(
+            prompt_len = prompt.len(),
+            "Writing prompt line to Antigravity stdin"
+        );
+        let payload = format!("{}\n", prompt.trim());
+        self.stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(BrainError::ProcessSpawn)?;
+        self.stdin.flush().await.map_err(BrainError::ProcessSpawn)?;
+        Ok(())
+    }
+
+    /// Read the next event from the stream, bounded by the 15-second inactivity timeout.
+    pub async fn next_event(&mut self) -> Result<Option<BrainEvent>, BrainError> {
+        match tokio::time::timeout(INACTIVITY_TIMEOUT, self.lines_stream.next()).await {
+            Ok(Some(Ok(line))) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                debug!(raw_line = %trimmed, "Received NDJSON line from child process");
+                let event: BrainEvent =
+                    serde_json::from_str(trimmed).map_err(BrainError::SerdeError)?;
+                Ok(Some(event))
+            }
+            Ok(Some(Err(io_err))) => Err(BrainError::ProcessSpawn(io_err)),
+            Ok(None) => {
+                // Stream reached EOF; verify exit status
+                let exit_status = self.child.try_wait().map_err(BrainError::ProcessSpawn)?;
+                if let Some(status) = exit_status {
+                    if !status.success() {
+                        let stderr_content = self.read_remaining_stderr().await;
+                        return Err(BrainError::ProcessPrematureExit {
+                            code: status.code(),
+                            stderr: stderr_content,
+                        });
+                    }
+                }
+                Ok(None)
+            }
+            Err(_) => {
+                error!("Antigravity process inactive for >15s; raising inactivity timeout");
+                Err(BrainError::InactivityTimeout {
+                    duration_secs: INACTIVITY_TIMEOUT.as_secs(),
+                })
+            }
+        }
+    }
+
+    /// Read any accumulated stderr output for diagnostics.
+    async fn read_remaining_stderr(&mut self) -> String {
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let mut buf = Vec::new();
+            use tokio::io::AsyncReadExt;
+            let _ = stderr.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Perform clean termination: SIGTERM -> wait up to 3 seconds -> SIGKILL if needed.
+    pub async fn shutdown(mut self) -> Result<(), BrainError> {
+        if let Some(pid_val) = self.child.id() {
+            let pid = Pid::from_raw(pid_val as i32);
+            info!(pid = %pid_val, "Terminating Antigravity process with SIGTERM");
+            let _ = kill(pid, Signal::SIGTERM);
+
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+                Ok(Ok(status)) => {
+                    info!(code = ?status.code(), "Antigravity process exited cleanly");
+                }
+                _ => {
+                    warn!(pid = %pid_val, "Process did not terminate within 3s; forcing SIGKILL");
+                    let _ = kill(pid, Signal::SIGKILL);
+                    let _ = self.child.wait().await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Simulated Antigravity NDJSON engine for unit and integration testing without binary dependencies.
+pub struct MockAntigravityServer {
+    events_to_emit: Vec<BrainEvent>,
+}
+
+impl MockAntigravityServer {
+    /// Create a new mock server configured with predetermined events.
+    #[must_use]
+    pub fn new(events: Vec<BrainEvent>) -> Self {
+        Self {
+            events_to_emit: events,
+        }
+    }
+
+    /// Return an async stream of NDJSON serialized lines.
+    pub fn into_event_stream(
+        self,
+    ) -> impl Stream<Item = Result<BrainEvent, BrainError>> + Send + 'static {
+        futures::stream::iter(self.events_to_emit.into_iter().map(Ok))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serde_brain_events_roundtrip() {
+        let events = vec![
+            BrainEvent::Thought {
+                content: "Consultando contexto de usuario...".into(),
+            },
+            BrainEvent::TextChunk {
+                content: "Hola Señor, ¿en qué puedo ayudarle?".into(),
+            },
+            BrainEvent::ToolCall {
+                name: "run_command".into(),
+                args: serde_json::json!({"command": "ls -la"}),
+            },
+            BrainEvent::Error {
+                message: "API quota exceeded".into(),
+            },
+            BrainEvent::Done,
+        ];
+
+        for ev in events {
+            let json = serde_json::to_string(&ev).expect("serialization failed");
+            let deserialized: BrainEvent =
+                serde_json::from_str(&json).expect("deserialization failed");
+            assert_eq!(ev, deserialized);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_antigravity_streaming() {
+        let expected = vec![
+            BrainEvent::Thought {
+                content: "Analizando".into(),
+            },
+            BrainEvent::TextChunk {
+                content: "Buenas noches".into(),
+            },
+            BrainEvent::Done,
+        ];
+
+        let mock = MockAntigravityServer::new(expected.clone());
+        let mut stream = Box::pin(mock.into_event_stream());
+
+        let mut collected = Vec::new();
+        while let Some(res) = stream.next().await {
+            collected.push(res.unwrap());
+        }
+
+        assert_eq!(collected, expected);
+    }
+}

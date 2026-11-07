@@ -1,0 +1,27 @@
+[package]
+name = "viernes-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Microphone capture, VAD signal processing, and Whisper STT for Viernes"
+
+[dependencies]
+viernes-core.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+cpal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+
+
+[dev-dependencies]
+hound.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

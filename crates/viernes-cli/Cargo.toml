@@ -1,0 +1,26 @@
+[package]
+name = "viernes-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Executive Command Line Interface and Systemd Daemon for Viernes Voice Assistant"
+
+[[bin]]
+name = "viernes"
+path = "src/main.rs"
+
+[dependencies]
+viernes-core.workspace = true
+viernes-audio.workspace = true
+viernes-brain.workspace = true
+viernes-tts.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

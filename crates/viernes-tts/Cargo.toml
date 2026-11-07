@@ -1,0 +1,38 @@
+[package]
+name = "viernes-tts"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ElevenLabs multi-account pool, Edge-TTS fallback, and Rodio non-blocking audio playback for Viernes"
+
+[dependencies]
+viernes-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+bytes = "1.6"
+tokio-util = "0.7"
+url = "2.5"
+futures = "0.3"
+
+# ElevenLabs HTTP client with streaming & TLS
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
+
+# Edge-TTS native WebSocket client
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
+
+# Non-blocking audio playback
+rodio = { version = "0.19", default-features = false, features = ["symphonia-mp3"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile.workspace = true
+
+[lints]
+workspace = true

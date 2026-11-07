@@ -1,0 +1,79 @@
+{
+  "project_name": "viernes",
+  "legacy_language": "Python",
+  "user": "svfabio",
+  "model": null,
+  "source_url": "https://github.com/svFabio/viernes",
+  "scope_summary": "Voice assistant core runtime, audio capture, local STT, brain NDJSON, and TTS resilient fallback",
+  "started_at_epoch": 1794013628.358003,
+  "completed_at": null,
+  "_active_bucket": {
+    "name": "rewrite",
+    "started_at": 1794013656.3899107
+  },
+  "_bucket_seconds": {
+    "discovery": 0.0,
+    "blueprint": 0.0,
+    "rewrite": 0.0,
+    "test_heal": 0.0,
+    "parity": 0.0,
+    "pgo_bench": 0.0
+  },
+  "story": {
+    "headline": "",
+    "intro": "",
+    "ch1_narrative": "",
+    "ch2_narrative": "",
+    "ch3_narrative": "",
+    "ch4_narrative": "",
+    "ch5_narrative": ""
+  },
+  "census": {
+    "before": {
+      "scanned": true,
+      "files": 46,
+      "code_loc": 5025,
+      "comment_loc": 142,
+      "comment_pct": 2.8,
+      "max_file_loc": 963,
+      "avg_file_loc": 112,
+      "files_under_400_pct": 97.8,
+      "doc_tests": 0,
+      "max_nesting_depth": 8,
+      "avg_fn_loc": 21,
+      "hazards_count": 14,
+      "latent_bugs_found": 0
+    },
+    "after": {
+      "scanned": false,
+      "files": 0,
+      "code_loc": 0,
+      "comment_loc": 0,
+      "comment_pct": null,
+      "max_file_loc": 0,
+      "avg_file_loc": 0,
+      "files_under_400_pct": null,
+      "doc_tests": 0,
+      "max_nesting_depth": null,
+      "avg_fn_loc": null,
+      "unsafe_blocks": null,
+      "forbid_unsafe": false,
+      "branch_coverage_pct": null,
+      "clippy_warnings": null
+    }
+  },
+  "opportunities": [],
+  "test_iterations": [],
+  "parity_iterations": [],
+  "benchmarks": [],
+  "time_buckets": [],
+  "scorecard": [],
+  "roi": {},
+  "spotlight": {
+    "explanation": "",
+    "legacy_file": "",
+    "legacy_code": "",
+    "rust_file": "",
+    "rust_code": ""
+  }
+}
