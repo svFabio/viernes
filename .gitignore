@@ -24,4 +24,7 @@ wt-*
 # Rust build artifacts
 target/
 **/*.rs.bk
+pgo-data/
+*.profdata
+*.profraw
 

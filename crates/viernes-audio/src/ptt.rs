@@ -3,12 +3,15 @@
 //! Provides deterministic keyboard press/release lifecycle management, sub-10ms capture initiation,
 //! instantaneous buffer termination on key release, and precedence arbitration over active VAD.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{debug, info};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixListener;
+use tracing::{debug, info, warn};
 use viernes_core::error::ViernesError;
 
 /// Push-to-talk discrete key events.
@@ -81,6 +84,129 @@ impl PttListener for MockPttListener {
     }
 
     async fn stop(&mut self) -> Result<(), ViernesError> {
+        self.active.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn event_receiver(&self) -> Receiver<PttEvent> {
+        self.receiver.clone()
+    }
+}
+
+/// Real-time Unix domain socket PTT listener for Wayland / Hyprland global shortcuts.
+pub struct IpcSocketPttListener {
+    socket_path: PathBuf,
+    sender: Sender<PttEvent>,
+    receiver: Receiver<PttEvent>,
+    active: Arc<AtomicBool>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl IpcSocketPttListener {
+    /// Constructs a new Unix Domain Socket PTT listener at the given path.
+    pub fn new<P: AsRef<Path>>(socket_path: P) -> Self {
+        let (sender, receiver) = bounded(32);
+        Self {
+            socket_path: socket_path.as_ref().to_path_buf(),
+            sender,
+            receiver,
+            active: Arc::new(AtomicBool::new(false)),
+            shutdown_tx: None,
+        }
+    }
+
+    /// Constructs a default Unix Domain Socket PTT listener at `/tmp/viernes_ptt.sock`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let path = std::env::var("VIERNES_PTT_SOCKET")
+            .unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
+        Self::new(path)
+    }
+}
+
+#[async_trait]
+impl PttListener for IpcSocketPttListener {
+    async fn start(&mut self) -> Result<(), ViernesError> {
+        if self.active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Clean up stale socket file if it exists
+        if self.socket_path.exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+
+        let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
+            ViernesError::Audio(format!(
+                "Failed to bind PTT IPC socket at {:?}: {e}",
+                self.socket_path
+            ))
+        })?;
+
+        info!("PTT IPC server listening on {:?}", self.socket_path);
+        self.active.store(true, Ordering::SeqCst);
+
+        let active = self.active.clone();
+        let sender = self.sender.clone();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        self.shutdown_tx = Some(shutdown_tx);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        debug!("PTT IPC server received shutdown signal");
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((stream, _)) => {
+                                let s = sender.clone();
+                                tokio::spawn(async move {
+                                    let mut reader = BufReader::new(stream);
+                                    let mut line = String::new();
+                                    while let Ok(n) = reader.read_line(&mut line).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        let cmd = line.trim().to_lowercase();
+                                        line.clear();
+                                        match cmd.as_str() {
+                                            "press" | "pressed" | "start" => {
+                                                let _ = s.send(PttEvent::Pressed);
+                                            }
+                                            "release" | "released" | "finish" | "stop" => {
+                                                let _ = s.send(PttEvent::Released);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                });
+                            }
+                            Err(err) => {
+                                warn!("PTT IPC accept error: {err}");
+                            }
+                        }
+                    }
+                }
+            }
+            active.store(false, Ordering::SeqCst);
+        });
+
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), ViernesError> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if self.socket_path.exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
         self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -209,5 +335,29 @@ mod tests {
         // Releasing PTT returns system to Idle
         arb.on_ptt_released();
         assert_eq!(arb.mode(), CaptureArbitrationMode::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_socket_ptt_listener() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sock_path = temp_dir.path().join("test_ptt.sock");
+        let mut listener = IpcSocketPttListener::new(&sock_path);
+        let rx = listener.event_receiver();
+
+        assert!(listener.start().await.is_ok());
+        assert!(listener.is_active());
+
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        stream.write_all(b"press\n").await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(rx.try_recv(), Ok(PttEvent::Pressed));
+
+        stream.write_all(b"release\n").await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(rx.try_recv(), Ok(PttEvent::Released));
+
+        assert!(listener.stop().await.is_ok());
+        assert!(!listener.is_active());
     }
 }

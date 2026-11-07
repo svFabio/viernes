@@ -17,10 +17,10 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
-
+uuid.workspace = true
+hound.workspace = true
 
 [dev-dependencies]
-hound.workspace = true
 tempfile.workspace = true
 
 [lints]

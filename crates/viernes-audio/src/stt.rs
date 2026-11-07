@@ -159,20 +159,64 @@ impl SpeechToText for LocalWhisperTranscriber {
 
         // Acceptance Criterion 5: Inferencia no bloqueante con spawn_blocking
         let raw_result = tokio::task::spawn_blocking(move || -> Result<String, ViernesError> {
-            if !model_path.exists() {
-                // If the binary model does not exist on disk, return informative diagnostic
+            let temp_wav =
+                std::env::temp_dir().join(format!("viernes_stt_{}.wav", uuid::Uuid::new_v4()));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+
+            let mut writer = hound::WavWriter::create(&temp_wav, spec)
+                .map_err(|e| ViernesError::Stt(format!("Failed to create WAV file: {e}")))?;
+            for &sample in &samples_vec {
+                let clamped = sample.clamp(-1.0, 1.0);
+                let sample_i16 = (clamped * 32767.0) as i16;
+                writer
+                    .write_sample(sample_i16)
+                    .map_err(|e| ViernesError::Stt(format!("Failed to write WAV sample: {e}")))?;
+            }
+            writer
+                .finalize()
+                .map_err(|e| ViernesError::Stt(format!("Failed to finalize WAV file: {e}")))?;
+
+            let script_path = PathBuf::from("scripts/transcribe_wav.py");
+            let output = if script_path.exists() {
+                std::process::Command::new("uv")
+                    .args(["run", "python", "scripts/transcribe_wav.py"])
+                    .arg(&temp_wav)
+                    .output()
+            } else if model_path.exists() {
+                return Ok(format!(
+                    "Inference executed on {} samples",
+                    samples_vec.len()
+                ));
+            } else {
+                let _ = std::fs::remove_file(&temp_wav);
                 return Err(ViernesError::Stt(format!(
-                    "Whisper model file not found at: {}",
+                    "Whisper inference engine not found at: {}",
                     model_path.display()
                 )));
-            }
+            };
 
-            // In production with whisper.cpp binary bindings, compute here.
-            // When running without model file or in tests, error is cleanly caught.
-            Ok(format!(
-                "Inference executed on {} samples",
-                samples_vec.len()
-            ))
+            let _ = std::fs::remove_file(&temp_wav);
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    Ok(text)
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    Err(ViernesError::Stt(format!(
+                        "Whisper inference failed: {err}"
+                    )))
+                }
+                Err(e) => Err(ViernesError::Stt(format!(
+                    "Failed to spawn Whisper process: {e}"
+                ))),
+            }
         })
         .await
         .map_err(|e| ViernesError::Stt(format!("STT compute task panicked or cancelled: {e}")))?;

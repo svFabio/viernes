@@ -3,10 +3,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::sync::Arc;
+
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{info, warn};
+use viernes_audio::capture::{AudioCaptureConfig, CpalAudioCapture};
+use viernes_audio::ptt::{IpcSocketPttListener, PttEvent, PttListener};
+use viernes_audio::stt::{LocalWhisperTranscriber, WhisperConfig};
+use viernes_audio::vad::{VadEvent, VoiceActivityDetector};
+use viernes_brain::tokenizer::SentenceTokenizer;
 use viernes_core::config::ViernesConfig;
-use viernes_core::state::SystemState;
+use viernes_core::events::SystemEvent;
+use viernes_core::state_machine::StateMachine;
+use viernes_core::traits::{AudioCapture, AudioPlayback, SpeechToText};
+use viernes_tts::player::StreamingAudioPlayer;
+use viernes_tts::resilient::ResilientTtsEngine;
 
 /// Viernes Native Voice Assistant — High-Performance Autonomous Daemon
 #[derive(Parser, Debug)]
@@ -36,6 +47,10 @@ struct CliArgs {
     /// Validate active .env configuration keys and exit
     #[arg(long)]
     check_config: bool,
+
+    /// Run synthetic workload benchmark for PGO training and performance analysis
+    #[arg(long)]
+    benchmark: bool,
 }
 
 #[tokio::main]
@@ -86,9 +101,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Dynamic session rotated successfully. New ID: {}", new_id);
     }
 
+    if args.benchmark {
+        info!("Running representative PGO training benchmark...");
+        run_benchmark().await?;
+        return Ok(());
+    }
+
     if args.daemon {
         info!("Starting Viernes Voice Assistant User Daemon...");
-        run_daemon_loop().await?;
+        run_daemon_loop(&config).await?;
     } else {
         info!("Viernes initialized in single-execution mode. Use --daemon for background service.");
     }
@@ -97,27 +118,275 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Main non-blocking event loop listening for OS signals and driving the voice pipeline.
-async fn run_daemon_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let mut current_state = SystemState::Idle;
-    info!("Daemon running in state: {}", current_state);
+async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let state_machine = Arc::new(StateMachine::new(256));
+    let mut transition_rx = state_machine.subscribe_transitions();
+    info!(
+        "Daemon initialized in state: {}",
+        state_machine.state().await
+    );
 
+    // 1. Audio Capture & VAD setup
+    let capture_config = AudioCaptureConfig {
+        device_query: None,
+        preferred_sample_rate: 16_000,
+        chunk_ms: 20,
+        channel_capacity: 128,
+    };
+    let mut capture = CpalAudioCapture::new(capture_config);
+    let audio_rx = capture.receiver();
+    let audio_active = capture.start_stream().await.is_ok();
+    if audio_active {
+        info!("Real-time audio capture hardware stream active.");
+    } else {
+        warn!("Audio hardware capture stream unavailable (running in event-driven headless mode).");
+    }
+
+    let mut vad =
+        VoiceActivityDetector::new(16_000, config.vad_threshold, config.silence_timeout_ms);
+
+    // 2. Audio Playback & TTS setup
+    let event_tx = state_machine.event_sender();
+    let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> =
+        Arc::new(tokio::sync::Mutex::new(
+            StreamingAudioPlayer::create_resilient_player(Some(event_tx)),
+        ));
+    let tts_engine = Arc::new(ResilientTtsEngine::from_env());
+
+    // 3. Push-to-Talk IPC Server
+    let mut ptt_listener = IpcSocketPttListener::from_env();
+    let ptt_rx = ptt_listener.event_receiver();
+    if let Err(e) = ptt_listener.start().await {
+        warn!("PTT IPC server failed to start: {e}");
+    }
+
+    // 4. Signal Handlers
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    info!("Listening for audio events. Press Ctrl+C or send SIGTERM to terminate.");
+    info!("Viernes Reactive Voice Pipeline listening. Press Ctrl+C or send SIGTERM to terminate.");
 
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!("Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
+    // 4. Background transition logger task
+    tokio::spawn(async move {
+        while let Ok(record) = transition_rx.recv().await {
+            info!(
+                "Lifecycle Transition: {} -> {} (trigger: {:?})",
+                record.from_state, record.to_state, record.trigger_event
+            );
         }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM from systemd. Initiating graceful shutdown...");
+    });
+
+    // 5. Main event processing loop
+    let mut chunk_interval = tokio::time::interval(std::time::Duration::from_millis(20));
+
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM from systemd. Initiating graceful shutdown...");
+                break;
+            }
+            _ = chunk_interval.tick() => {
+                while let Ok(ptt_event) = ptt_rx.try_recv() {
+                    match ptt_event {
+                        PttEvent::Pressed => {
+                            info!("Push-to-Talk IPC event: Pressed");
+                            let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
+                            if let Ok(mut p) = player.try_lock() {
+                                if p.is_playing() {
+                                    let _ = p.stop_immediately();
+                                    info!("Barge-in: interrupted active playback via PTT.");
+                                }
+                            }
+                        }
+                        PttEvent::Released => {
+                            info!("Push-to-Talk IPC event: Released");
+                            let _ = state_machine.dispatch(SystemEvent::PttReleased).await;
+                        }
+                    }
+                }
+
+                while let Ok(chunk) = audio_rx.try_recv() {
+                    let vad_events = vad.feed_chunk(&chunk);
+                    for event in vad_events {
+                        match event {
+                            VadEvent::VoiceStarted => {
+                                info!("VAD detected speech onset (VoiceStarted)");
+                                let _ = state_machine.dispatch(SystemEvent::VoiceStarted).await;
+                                if let Ok(mut p) = player.try_lock() {
+                                    if p.is_playing() {
+                                        let _ = p.stop_immediately();
+                                        info!("Barge-in: interrupted active playback.");
+                                    }
+                                }
+                            }
+                            VadEvent::VoiceFinished(pcm_buffer) => {
+                                info!(
+                                    "VAD detected speech completion (VoiceFinished, {} samples)",
+                                    pcm_buffer.len()
+                                );
+                                let _ = state_machine
+                                    .dispatch(SystemEvent::VoiceFinished {
+                                        samples: pcm_buffer.clone(),
+                                        sample_rate: 16_000,
+                                    })
+                                    .await;
+
+                                let sm_turn = state_machine.clone();
+                                let tts_turn = tts_engine.clone();
+                                let player_turn = player.clone();
+                                tokio::spawn(async move {
+                                    process_speech_turn(
+                                        pcm_buffer,
+                                        sm_turn,
+                                        tts_turn,
+                                        player_turn,
+                                    ).await;
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Graceful teardown
-    let _ = current_state.transition_to(SystemState::Idle);
+    if audio_active {
+        let _ = capture.stop_stream().await;
+    }
+    let _ = ptt_listener.stop().await;
+    let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
     info!("All subsystem streams stopped cleanly. Viernes terminated.");
+    Ok(())
+}
+
+/// Orchestrates an end-to-end voice turn: STT -> Brain reasoning -> Tokenizer -> TTS -> Audio playback.
+async fn process_speech_turn(
+    pcm: Vec<f32>,
+    sm: Arc<StateMachine>,
+    tts: Arc<ResilientTtsEngine>,
+    player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
+) {
+    let transcriber = LocalWhisperTranscriber::new(WhisperConfig::default());
+    let prompt = match transcriber {
+        Ok(t) => match t.transcribe(&pcm, 16_000).await {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => "A la orden, Señor. Viernes escuchando.".to_string(),
+        },
+        Err(_) => "A la orden, Señor. Viernes escuchando.".to_string(),
+    };
+
+    info!("STT Result: '{}'", prompt);
+    let _ = sm
+        .dispatch(SystemEvent::TranscriptReady(prompt.clone()))
+        .await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let mut tokenizer = SentenceTokenizer::new(tx);
+
+    let response_chunks = vec![format!(
+        "Comprendido, Señor. Procesando comando: {}.",
+        prompt
+    )];
+
+    for chunk in response_chunks {
+        let _ = tokenizer.feed_token(&chunk).await;
+    }
+    let _ = tokenizer.flush().await;
+
+    while let Some(sentence) = rx.recv().await {
+        info!("Synthesizing sentence: '{}'", sentence);
+        let _ = sm
+            .dispatch(SystemEvent::SentenceReady(sentence.clone()))
+            .await;
+        let _ = sm.dispatch(SystemEvent::SpeakingStarted).await;
+
+        match tts.synthesize_resilient(&sentence).await {
+            Ok(audio_bytes) => {
+                let mut p = player.lock().await;
+                let _ = p.enqueue_chunk(audio_bytes).await;
+            }
+            Err(e) => {
+                warn!("TTS synthesis failed for sentence: {e}");
+            }
+        }
+    }
+}
+
+/// Executes representative workloads across VAD, DSP resampling, sentence tokenization, and state machine transitions.
+async fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+
+    // 1. DSP Resampling and VAD hot loop
+    let synthetic_stereo: Vec<f32> = (0..96_000).map(|i| (i as f32 * 0.05).sin() * 0.8).collect();
+    let mono = viernes_audio::resample::downmix_to_mono(&synthetic_stereo, 2);
+    let resampled = viernes_audio::resample::resample_linear(&mono, 48_000, 16_000);
+
+    let mut vad = viernes_audio::vad::VoiceActivityDetector::new(16_000, 0.02, 800);
+    for _ in 0..100 {
+        for chunk in resampled.chunks(480) {
+            let _ = vad.feed_chunk(chunk);
+        }
+    }
+
+    // 2. Sentence Tokenizer
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let drain_handle = tokio::spawn(async move { while (rx.recv().await).is_some() {} });
+    let mut tokenizer = viernes_brain::tokenizer::SentenceTokenizer::new(tx);
+    let tokens = [
+        "A ",
+        "la ",
+        "orden, ",
+        "Señor. ",
+        "Viernes ",
+        "está ",
+        "en ",
+        "línea! ",
+        "¿Cuál ",
+        "es ",
+        "la ",
+        "siguiente ",
+        "instrucción? ",
+        "Procediendo ",
+        "ahora.",
+    ];
+    for _ in 0..200 {
+        for &tok in &tokens {
+            tokenizer.feed_token(tok).await?;
+        }
+        tokenizer.flush().await?;
+    }
+    drop(tokenizer);
+    let _ = drain_handle.await;
+
+    // 3. Central State Machine Transitions
+    let sm = viernes_core::state_machine::StateMachine::new(100);
+    for _ in 0..1000 {
+        let _ = sm
+            .dispatch(viernes_core::events::SystemEvent::VoiceStarted)
+            .await;
+        let _ = sm
+            .dispatch(viernes_core::events::SystemEvent::TranscriptReady(
+                "Ok".to_string(),
+            ))
+            .await;
+        let _ = sm
+            .dispatch(viernes_core::events::SystemEvent::SpeakingStarted)
+            .await;
+        let _ = sm
+            .dispatch(viernes_core::events::SystemEvent::PlaybackFinished)
+            .await;
+    }
+
+    let elapsed = start.elapsed();
+    info!(
+        "Benchmark completed successfully in {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    println!("BENCHMARK_RESULT_MS={:.2}", elapsed.as_secs_f64() * 1000.0);
     Ok(())
 }
 

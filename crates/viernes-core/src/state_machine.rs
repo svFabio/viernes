@@ -69,6 +69,12 @@ impl StateMachine {
         self.barge_in_active.store(false, Ordering::Release);
     }
 
+    /// Obtains a clone of the system events broadcast sender.
+    #[must_use]
+    pub fn event_sender(&self) -> broadcast::Sender<SystemEvent> {
+        self.event_tx.clone()
+    }
+
     /// Broadcast an external event to all subscribers and process state transitions.
     pub async fn dispatch(
         &self,

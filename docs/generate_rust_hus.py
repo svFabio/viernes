@@ -732,6 +732,276 @@ $ systemctl --user status viernes-rust
             ("ST-RUST-20.3", "Crear unidad systemd viernes-rust.service y validar en entorno local"),
         ],
     },
+    # -------------------------------------------------------------------------
+    # EXTENSIÓN: Herramientas, Memoria, Piper e IPC (Cobertura 100% de Paridad)
+    # -------------------------------------------------------------------------
+    {
+        "id": "HU-RUST-21",
+        "title": "Despachador de herramientas Tool Dispatcher con registro dinámico y allowlist",
+        "points": 5,
+        "priority": "Highest",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:medio",
+        "desc": "El agente asistente despacha herramientas locales registradas de forma segura y tipada mediante el Tool Dispatcher para ejecutar acciones en el sistema sin comprometer la estabilidad del proceso.",
+        "flow": """[Intención de ToolCall desde Brain]
+                 │
+                 ▼
+     ┌────────────────────────┐
+     │ ToolRegistry (Allowlist)│ ── Si no está permitida ──► [ToolRejectedError]
+     └────────────────────────┘
+                 │ (Aprobada)
+                 ▼
+     ┌────────────────────────┐
+     │ ToolDispatcher Async   │ ── Ejecución no bloqueante
+     └────────────────────────┘
+                 │
+                 ▼
+     [Resultado estructurado JSON emitido al Brain]""",
+        "criteria": [
+            "1. **Registro concurrente:** Permite registrar dinámicamente implementaciones de herramientas que satisfagan el trait `Tool`.",
+            "2. **Allowlist estricto:** Solo las herramientas registradas en la lista blanca (`DEFAULT_ALLOWLIST`) pueden ser invocadas; llamadas ajenas se rechazan de inmediato.",
+            "3. **Despacho asíncrono:** La ejecución de herramientas complejas corre en tareas asíncronas de Tokio sin bloquear el bucle de eventos del asistente.",
+            "4. **Validación de parámetros:** Los argumentos JSON se deserializan y validan de forma fuertemente tipada con Serde antes de la ejecución.",
+            "5. **Manejo de timeouts:** Cada invocación tiene un límite de tiempo configurable (default 30s) cancelando tareas colgadas.",
+            "6. **Pruebas unitarias:** 100% de cobertura en registro, ejecución exitosa, herramienta desconocida y timeout.",
+        ],
+        "subtasks": [
+            ("ST-RUST-21.1", "Diseñar trait Tool y estructura ToolRegistry con allowlist dinámico"),
+            ("ST-RUST-21.2", "Implementar ToolDispatcher asíncrono con control de timeouts y Serde"),
+            ("ST-RUST-21.3", "Pruebas unitarias exhaustivas y mock tools para validación"),
+        ],
+    },
+    {
+        "id": "HU-RUST-22",
+        "title": "Motor de validación de seguridad sandbox y sanitización de comandos",
+        "points": 5,
+        "priority": "Highest",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:alto",
+        "desc": "El usuario ejecuta comandos y herramientas mediante el motor de validación de seguridad para evitar inyecciones de shell, accesos a rutas prohibidas y operaciones destructivas no autorizadas.",
+        "flow": """[Entrada de comando / ruta]
+                 │
+                 ▼
+     ┌────────────────────────┐
+     │ SecurityValidator      │ <── Reglas de rutas permitidas & blacklists
+     └────────────────────────┘
+                 │
+          Es seguro? ──► NO ──► [SecurityViolationError + Log Forense]
+                 │
+                SÍ
+                 ▼
+     [Comando sanitizado listo para ejecución]""",
+        "criteria": [
+            "1. **Sanitización de argumentos:** Rechaza caracteres peligrosos de interpolación de shell (`|`, `;`, `&`, `$`, `` ` ``) en herramientas de comandos.",
+            "2. **Validación de rutas:** Impide Directory Traversal (`../`) restringiendo lecturas y escrituras al espacio de trabajo permitido.",
+            "3. **Comandos destructivos:** Identifica comandos con riesgo de pérdida de datos (`rm -rf`, `mkfs`, `dd`, `truncate`) y exige flag de confirmación.",
+            "4. **Revisión estricta:** Cero falsos negativos en la suite de inyección de payloads conocidos.",
+            "5. **Pruebas con proptest:** Genera cadenas aleatorias arbitrarias para demostrar que ninguna secuencia escapa a la sanitización.",
+        ],
+        "subtasks": [
+            ("ST-RUST-22.1", "Implementar SecurityValidator con reglas de traversal y sanitización de shell"),
+            ("ST-RUST-22.2", "Integrar clasificador de operaciones destructivas y flags de confirmación"),
+            ("ST-RUST-22.3", "Suite de tests de penetración sintética y fuzzing con proptest"),
+        ],
+    },
+    {
+        "id": "HU-RUST-23",
+        "title": "Auditoría estructurada y logging forense de ejecución de herramientas",
+        "points": 3,
+        "priority": "Medium",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:bajo",
+        "desc": "El administrador del sistema audita todas las llamadas a herramientas mediante registros forenses estructurados en formato JSONL para trazabilidad total de acciones.",
+        "flow": """[Invocación de Tool] ──► [AuditLogger::record_start]
+                                       │
+                                       ▼ (JSONL append)
+                                  [~/.local/state/viernes/audit.jsonl]
+                                       │
+[Completada / Fallida] ──► [AuditLogger::record_finish con duración y status]""",
+        "criteria": [
+            "1. **Formato JSONL estándar:** Cada entrada contiene timestamp UTC, tool name, argumentos sanitizados, duración en ms y código de retorno.",
+            "2. **Rotación atómica:** El archivo de auditoría rota automáticamente al alcanzar 10 MB preservando los últimos 5 archivos históricos.",
+            "3. **Redacción de secretos:** API keys, tokens y credenciales se enmascaran automáticamente antes de persistir.",
+            "4. **Sin bloqueo:** El logging opera mediante canales no bloqueantes para no retrasar la ejecución principal.",
+        ],
+        "subtasks": [
+            ("ST-RUST-23.1", "Implementar AuditLogger concurrente con rotación de archivos"),
+            ("ST-RUST-23.2", "Agregar redactor de datos sensibles y formateador JSONL"),
+            ("ST-RUST-23.3", "Pruebas de rotación y verificación de no-bloqueo bajo carga"),
+        ],
+    },
+    {
+        "id": "HU-RUST-24",
+        "title": "Manejador resiliente de errores e interceptor con políticas de reintento",
+        "points": 3,
+        "priority": "Medium",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:bajo",
+        "desc": "El sistema recupera fallos transitorios en ejecución de herramientas y servicios mediante una política de retroceso exponencial (exponential backoff) con jitter.",
+        "flow": """[Llamada a servicio / tool falla con error transitorio]
+                 │
+                 ▼
+     ┌────────────────────────┐
+     │ ErrorInterceptor       │ ── Reintentos restantes? ── NO ──► [Error fatal reportado]
+     └────────────────────────┘
+                 │ SÍ
+                 ▼ (Espera con backoff + jitter)
+     [Reintento automático]""",
+        "criteria": [
+            "1. **Clasificación de errores:** Distingue entre errores recuperables (red, timeout, 429) e irrecuperables (autenticación, sintaxis).",
+            "2. **Backoff con jitter:** Implementa backoff exponencial truncado con fluctuación aleatoria para evitar efecto rebaño.",
+            "3. **Límite de reintentos:** Configura un máximo de 3 reintentos antes de devolver el error estructurado.",
+            "4. **Pruebas unitarias:** Simula fallos transitorios con mocks y verifica la recuperación en el intento N.",
+        ],
+        "subtasks": [
+            ("ST-RUST-24.1", "Diseñar clasificador de recuperabilidad de ViernesError"),
+            ("ST-RUST-24.2", "Implementar combinador de retry con backoff exponencial y jitter"),
+            ("ST-RUST-24.3", "Pruebas unitarias con fallos simulados y límites de reintento"),
+        ],
+    },
+    {
+        "id": "HU-RUST-25",
+        "title": "Memoria conversacional persistente con retención local y compactación de contexto",
+        "points": 5,
+        "priority": "High",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:medio",
+        "desc": "El usuario mantiene conversaciones fluidas a lo largo del tiempo mediante la memoria local persistente que retiene turnos recientes y compacta sesiones anteriores.",
+        "flow": """[Turno conversacional completado]
+                 │
+                 ▼
+     ┌────────────────────────┐
+     │ ConversationStore      │ ── Persistencia atómica en SQLite / JSON local
+     └────────────────────────┘
+                 │ Si supera límite de tokens
+                 ▼
+     ┌────────────────────────┐
+     │ ContextCompactor       │ ── Genera resumen compacto de turnos viejos
+     └────────────────────────┘""",
+        "criteria": [
+            "1. **Persistencia local:** Guarda mensajes con roles (`user`, `assistant`, `tool`) en disco local de forma atómica.",
+            "2. **Recuperación histórica:** Carga los últimos N turnos o K tokens al iniciar una nueva sesión.",
+            "3. **Compactación automática:** Cuando el historial supera el presupuesto de tokens, comprime turnos antiguos preservando datos clave.",
+            "4. **Rotación segura:** Permite limpiar o reiniciar la memoria mediante comando explícito o flag `--new-conversation`.",
+            "5. **Pruebas de integridad:** Pruebas de crash durante escritura validan que la base de datos nunca se corrompe.",
+        ],
+        "subtasks": [
+            ("ST-RUST-25.1", "Implementar almacenamiento conversacional local y esquema de mensajes"),
+            ("ST-RUST-25.2", "Desarrollar algoritmo de ventana deslizante y compactación de tokens"),
+            ("ST-RUST-25.3", "Pruebas unitarias de persistencia concurrente y recuperación ante fallos"),
+        ],
+    },
+    {
+        "id": "HU-RUST-26",
+        "title": "Inyección de plantillas de sistema Prompt Templates y modulación de personalidad",
+        "points": 3,
+        "priority": "Medium",
+        "version": 1,
+        "agent": "Agente 2 (Brain & Pipeline)",
+        "epic": "epic:B",
+        "risk": "risk:bajo",
+        "desc": "El usuario interactúa con Viernes con su personalidad cálida, concisa y profesional mediante plantillas de prompt de sistema dinámicamente inyectadas.",
+        "flow": """[Inicio de sesión / turn]
+                 │
+                 ▼
+     ┌────────────────────────┐
+     │ PromptTemplateEngine   │ <── Contexto de usuario, herramientas y fecha/hora
+     └────────────────────────┘
+                 │
+                 ▼
+     [System Prompt compilado inyectado en Antigravity]""",
+        "criteria": [
+            "1. **Plantilla modular:** Ensambla dinámicamente identidad, restricciones operativas, lista de tools y variables de entorno.",
+            "2. **Inyección temporal:** Incorpora fecha, hora local y zona horaria actualizadas en cada turno.",
+            "3. **Zero-copy templating:** Renders de plantillas con buffers prealocados sin alocaciones innecesarias.",
+            "4. **Pruebas unitarias:** Verifica que las variables críticas siempre están presentes en el prompt final.",
+        ],
+        "subtasks": [
+            ("ST-RUST-26.1", "Crear motor de plantillas de sistema con variables dinámicas"),
+            ("ST-RUST-26.2", "Integrar ensamblado de catálogo de herramientas en el prompt"),
+            ("ST-RUST-26.3", "Pruebas de renderizado y validación de restricciones de personalidad"),
+        ],
+    },
+    {
+        "id": "HU-RUST-27",
+        "title": "Motor TTS Piper local offline con fallback ultrarrápido sin conexión",
+        "points": 5,
+        "priority": "High",
+        "version": 1,
+        "agent": "Agente 3 (TTS & Output)",
+        "epic": "epic:B",
+        "risk": "risk:medio",
+        "desc": "El usuario escucha las respuestas de Viernes incluso sin conexión a internet mediante el motor de síntesis local Piper ejecutado como fallback nativo.",
+        "flow": """[Texto de oración listo para TTS]
+                 │
+                 ▼
+     ElevenLabs disponible? ── SÍ ──► [ElevenLabs Client]
+                 │ NO
+                 ▼
+     Internet disponible? ── SÍ ──► [Edge-TTS Client]
+                 │ NO
+                 ▼
+     ┌────────────────────────┐
+     │ PiperLocalProvider     │ ── Inferencia ONNX / binario local en < 150ms
+     └────────────────────────┘
+                 │ (Audio WAV/PCM)
+                 ▼
+     [Reproductor de audio local]""",
+        "criteria": [
+            "1. **Inferencia local Piper:** Ejecuta el binario o runtime de Piper local apuntando al modelo ONNX en español configurado.",
+            "2. **Integración en ResilientTts:** Actúa como el nivel 3 de fallback automático ante pérdida total de conectividad.",
+            "3. **Baja latencia:** Genera el primer chunk de audio en < 200 ms desde la entrega del texto.",
+            "4. **Manejo de ausencia de modelo:** Si el archivo ONNX no existe en disco, emite diagnóstico claro sin pánico.",
+            "5. **Pruebas unitarias:** Mock provider para CI sin requerir modelos ONNX binarios pesados.",
+        ],
+        "subtasks": [
+            ("ST-RUST-27.1", "Implementar PiperLocalProvider invocando modelo ONNX o CLI de Piper"),
+            ("ST-RUST-27.2", "Incorporar Piper como tercer escalón en la cadena ResilientTtsEngine"),
+            ("ST-RUST-27.3", "Pruebas unitarias con streams simulados y benchmarks de latencia"),
+        ],
+    },
+    {
+        "id": "HU-RUST-28",
+        "title": "Servidor y cliente IPC Unix Domain Socket para control externo viernes-ctl",
+        "points": 3,
+        "priority": "Medium",
+        "version": 1,
+        "agent": "Agente Orquestador",
+        "epic": "epic:B",
+        "risk": "risk:bajo",
+        "desc": "El usuario controla y consulta el estado del daemon Viernes desde atajos de teclado o scripts mediante el cliente de línea de comandos viernes-ctl sobre Unix Domain Sockets.",
+        "flow": """$ viernes-ctl press
+          │ (Conexión /tmp/viernes_ptt.sock)
+          ▼
+     ┌────────────────────────┐
+     │ Daemon IPC Server      │ ── Despacha PttPressed & BargeIn
+     └────────────────────────┘
+          │
+          ▼
+     [Captura de voz iniciada en sub-10ms]""",
+        "criteria": [
+            "1. **Comandos IPC soportados:** `press`, `release`, `cancel`, `status`, `reload`.",
+            "2. **Subcomando CLI:** `viernes ctl <COMMAND>` envía el comando al socket y reporta el status con código de salida 0 en éxito.",
+            "3. **Protocolo ligero:** Formato texto plano delimitado por `\n` o NDJSON de baja sobrecarga.",
+            "4. **Respuesta rápida:** Tiempo de respuesta entre comando y procesamiento en el daemon < 10 ms.",
+            "5. **Pruebas de integración:** Prueba de socket cliente/servidor punta a punta automatizada.",
+        ],
+        "subtasks": [
+            ("ST-RUST-28.1", "Implementar subcomando CLI 'ctl' con cliente de socket Unix"),
+            ("ST-RUST-28.2", "Estandarizar parser de comandos IPC en el servidor del daemon"),
+            ("ST-RUST-28.3", "Pruebas de integración cliente-servidor con sockets temporales"),
+        ],
+    },
 ]
 
 for hu in HUS:
