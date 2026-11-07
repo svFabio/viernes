@@ -106,6 +106,27 @@ impl VoiceActivityDetector {
         self.pre_roll_buffer.clear();
     }
 
+    /// Force finish the current speech segment immediately (e.g. on PTT release),
+    /// returning the accumulated PCM buffer if it meets minimum speech length.
+    pub fn force_finish(&mut self) -> Option<Vec<f32>> {
+        if self.speech_buffer.is_empty() {
+            return None;
+        }
+        let buffer = std::mem::take(&mut self.speech_buffer);
+        self.reset();
+        if buffer.len() >= self.min_speech_samples {
+            Some(buffer)
+        } else {
+            None
+        }
+    }
+
+    /// Explicitly transitions VAD into speech accumulation mode (e.g. on PTT press).
+    pub fn start_speech_capture(&mut self) {
+        self.reset();
+        self.state = VadState::Speech;
+    }
+
     /// Returns current state of the VAD machine.
     #[must_use]
     pub fn state(&self) -> VadState {

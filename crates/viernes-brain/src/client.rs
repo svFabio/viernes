@@ -20,6 +20,17 @@ pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Graceful shutdown timeout before sending SIGKILL (3 seconds).
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Canonical system prompt defining Viernes voice-optimized persona and rules.
+pub const VIERNES_SYSTEM_PROMPT: &str = "\
+Sos Viernes, una asistente personal por voz inteligente, precisa y directa. \
+Tus respuestas deben estar optimizadas exclusivamente para síntesis de voz (TTS): \
+1. Sé concisa y responde en una o dos oraciones siempre que sea posible. \
+2. No uses formato Markdown (sin negritas, sin cursivas, sin encabezados, sin viñetas ni bloques de código). \
+3. No uses emojis ni caracteres especiales extraños. \
+4. Expresa números, fechas y horas en texto natural fluido. \
+5. Si necesitas listar elementos, hazlo en prosa conversacional breve (máximo 3 elementos). \
+6. Trata al usuario siempre con la máxima deferencia dirigiéndote a él exclusivamente como 'Señor' (nunca por su nombre de pila ni de manera informal).";
+
 /// Typed NDJSON events emitted by Antigravity streaming process.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -101,11 +112,24 @@ impl AntigravityClient {
 
     /// Send a user prompt line to the process stdin.
     pub async fn send_prompt(&mut self, prompt: &str) -> Result<(), BrainError> {
+        let trimmed = prompt.trim();
         debug!(
-            prompt_len = prompt.len(),
+            prompt_len = trimmed.len(),
             "Writing prompt line to Antigravity stdin"
         );
-        let payload = format!("{}\n", prompt.trim());
+        let payload = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            format!("{}\n", trimmed)
+        } else {
+            let full_prompt = format!("{}\n\n{}", VIERNES_SYSTEM_PROMPT, trimmed);
+            let msg = serde_json::json!({
+                "event": "user",
+                "message": {
+                    "content": full_prompt
+                }
+            });
+            format!("{}\n", serde_json::to_string(&msg).unwrap_or_default())
+        };
+
         self.stdin
             .write_all(payload.as_bytes())
             .await
@@ -116,37 +140,83 @@ impl AntigravityClient {
 
     /// Read the next event from the stream, bounded by the 15-second inactivity timeout.
     pub async fn next_event(&mut self) -> Result<Option<BrainEvent>, BrainError> {
-        match tokio::time::timeout(INACTIVITY_TIMEOUT, self.lines_stream.next()).await {
-            Ok(Some(Ok(line))) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+        loop {
+            match tokio::time::timeout(INACTIVITY_TIMEOUT, self.lines_stream.next()).await {
+                Ok(Some(Ok(line))) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    debug!(raw_line = %trimmed, "Received NDJSON line from child process");
+
+                    // 1. Try parsing agy stream-json protocol
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(event_str) = value.get("event").and_then(|v| v.as_str()) {
+                            match event_str {
+                                "init" => {
+                                    continue;
+                                }
+                                "step_update" => {
+                                    if let Some(su) = value.get("step_update") {
+                                        let step_type =
+                                            su.get("step_type").and_then(|v| v.as_str());
+                                        let state = su.get("state").and_then(|v| v.as_str());
+                                        let delta = su.get("text_delta").and_then(|v| v.as_str());
+
+                                        if step_type == Some("tool") && state == Some("ACTIVE") {
+                                            let tool_name = su
+                                                .get("tool_name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("tool");
+                                            return Ok(Some(BrainEvent::ToolCall {
+                                                name: tool_name.to_string(),
+                                                args: serde_json::Value::Null,
+                                            }));
+                                        }
+
+                                        if let Some(text) = delta {
+                                            if !text.is_empty() {
+                                                return Ok(Some(BrainEvent::TextChunk {
+                                                    content: text.to_string(),
+                                                }));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                "result" => {
+                                    return Ok(Some(BrainEvent::Done));
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+
+                    // 2. Direct BrainEvent deserialization fallback (e.g. tests & mock servers)
+                    let event: BrainEvent =
+                        serde_json::from_str(trimmed).map_err(BrainError::SerdeError)?;
+                    return Ok(Some(event));
+                }
+                Ok(Some(Err(io_err))) => return Err(BrainError::ProcessSpawn(io_err)),
+                Ok(None) => {
+                    let exit_status = self.child.try_wait().map_err(BrainError::ProcessSpawn)?;
+                    if let Some(status) = exit_status {
+                        if !status.success() {
+                            let stderr_content = self.read_remaining_stderr().await;
+                            return Err(BrainError::ProcessPrematureExit {
+                                code: status.code(),
+                                stderr: stderr_content,
+                            });
+                        }
+                    }
                     return Ok(None);
                 }
-                debug!(raw_line = %trimmed, "Received NDJSON line from child process");
-                let event: BrainEvent =
-                    serde_json::from_str(trimmed).map_err(BrainError::SerdeError)?;
-                Ok(Some(event))
-            }
-            Ok(Some(Err(io_err))) => Err(BrainError::ProcessSpawn(io_err)),
-            Ok(None) => {
-                // Stream reached EOF; verify exit status
-                let exit_status = self.child.try_wait().map_err(BrainError::ProcessSpawn)?;
-                if let Some(status) = exit_status {
-                    if !status.success() {
-                        let stderr_content = self.read_remaining_stderr().await;
-                        return Err(BrainError::ProcessPrematureExit {
-                            code: status.code(),
-                            stderr: stderr_content,
-                        });
-                    }
+                Err(_) => {
+                    error!("Antigravity process inactive for >15s; raising inactivity timeout");
+                    return Err(BrainError::InactivityTimeout {
+                        duration_secs: INACTIVITY_TIMEOUT.as_secs(),
+                    });
                 }
-                Ok(None)
-            }
-            Err(_) => {
-                error!("Antigravity process inactive for >15s; raising inactivity timeout");
-                Err(BrainError::InactivityTimeout {
-                    duration_secs: INACTIVITY_TIMEOUT.as_secs(),
-                })
             }
         }
     }

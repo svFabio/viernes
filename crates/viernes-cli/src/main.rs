@@ -11,6 +11,8 @@ use viernes_audio::capture::{AudioCaptureConfig, CpalAudioCapture};
 use viernes_audio::ptt::{IpcSocketPttListener, PttEvent, PttListener};
 use viernes_audio::stt::{LocalWhisperTranscriber, WhisperConfig};
 use viernes_audio::vad::{VadEvent, VoiceActivityDetector};
+use viernes_brain::client::{AntigravityClient, BrainEvent};
+use viernes_brain::fillers::FillerCacheManager;
 use viernes_brain::tokenizer::SentenceTokenizer;
 use viernes_core::config::ViernesConfig;
 use viernes_core::events::SystemEvent;
@@ -177,20 +179,54 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
         ));
     let tts_engine = Arc::new(ResilientTtsEngine::from_env());
 
-    // 3. Push-to-Talk IPC Server
+    // 3. Fillers Manager & Pre-warming
+    let fillers_mgr = Arc::new(FillerCacheManager::new(None::<&str>).unwrap_or_else(|_| {
+        FillerCacheManager::new(Some("/home/svfabio/.config/viernes/fillers.json")).unwrap()
+    }));
+    info!("Conversational Fillers engine active (loaded from config).");
+
+    // 4. Resident Antigravity Brain Client
+    let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+    let agy_model =
+        std::env::var("VIERNES_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
+    let agy_args = vec![
+        "--model".to_string(),
+        agy_model,
+        "--effort".to_string(),
+        "low".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--disable-slash-commands".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+    ];
+    let brain_client: Arc<tokio::sync::Mutex<Option<AntigravityClient>>> =
+        match AntigravityClient::spawn(&agy_bin, &agy_args) {
+            Ok(client) => {
+                info!("Resident Antigravity brain spawned successfully ({agy_bin})");
+                Arc::new(tokio::sync::Mutex::new(Some(client)))
+            }
+            Err(e) => {
+                warn!("Resident Antigravity client unavailable ({agy_bin}): {e}");
+                Arc::new(tokio::sync::Mutex::new(None))
+            }
+        };
+
+    // 5. Push-to-Talk IPC Server
     let mut ptt_listener = IpcSocketPttListener::from_env();
     let ptt_rx = ptt_listener.event_receiver();
     if let Err(e) = ptt_listener.start().await {
         warn!("PTT IPC server failed to start: {e}");
     }
 
-    // 4. Signal Handlers
+    // 6. Signal Handlers
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     info!("Viernes Reactive Voice Pipeline listening. Press Ctrl+C or send SIGTERM to terminate.");
 
-    // 4. Background transition logger task
+    // 7. Background transition logger task
     tokio::spawn(async move {
         while let Ok(record) = transition_rx.recv().await {
             info!(
@@ -200,7 +236,7 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
         }
     });
 
-    // 5. Main event processing loop
+    // 8. Main event processing loop
     let mut chunk_interval = tokio::time::interval(std::time::Duration::from_millis(20));
 
     loop {
@@ -225,10 +261,39 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                                     info!("Barge-in: interrupted active playback via PTT.");
                                 }
                             }
+                            vad.start_speech_capture();
                         }
                         PttEvent::Released => {
                             info!("Push-to-Talk IPC event: Released");
                             let _ = state_machine.dispatch(SystemEvent::PttReleased).await;
+                            if let Some(pcm_buffer) = vad.force_finish() {
+                                info!(
+                                    "PTT speech finished instantly ({} samples)",
+                                    pcm_buffer.len()
+                                );
+                                let _ = state_machine
+                                    .dispatch(SystemEvent::VoiceFinished {
+                                        samples: pcm_buffer.clone(),
+                                        sample_rate: 16_000,
+                                    })
+                                    .await;
+
+                                let sm_turn = state_machine.clone();
+                                let tts_turn = tts_engine.clone();
+                                let player_turn = player.clone();
+                                let fillers_turn = fillers_mgr.clone();
+                                let brain_turn = brain_client.clone();
+                                tokio::spawn(async move {
+                                    process_speech_turn(
+                                        pcm_buffer,
+                                        sm_turn,
+                                        tts_turn,
+                                        player_turn,
+                                        fillers_turn,
+                                        brain_turn,
+                                    ).await;
+                                });
+                            }
                         }
                     }
                 }
@@ -262,12 +327,16 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                                 let sm_turn = state_machine.clone();
                                 let tts_turn = tts_engine.clone();
                                 let player_turn = player.clone();
+                                let fillers_turn = fillers_mgr.clone();
+                                let brain_turn = brain_client.clone();
                                 tokio::spawn(async move {
                                     process_speech_turn(
                                         pcm_buffer,
                                         sm_turn,
                                         tts_turn,
                                         player_turn,
+                                        fillers_turn,
+                                        brain_turn,
                                     ).await;
                                 });
                             }
@@ -287,57 +356,135 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Orchestrates an end-to-end voice turn: STT -> Brain reasoning -> Tokenizer -> TTS -> Audio playback.
+/// Orchestrates an end-to-end voice turn: STT -> Instant Filler -> Brain streaming -> Tokenizer -> TTS.
 async fn process_speech_turn(
     pcm: Vec<f32>,
     sm: Arc<StateMachine>,
     tts: Arc<ResilientTtsEngine>,
     player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
+    fillers: Arc<FillerCacheManager>,
+    brain: Arc<tokio::sync::Mutex<Option<AntigravityClient>>>,
 ) {
     let transcriber = LocalWhisperTranscriber::new(WhisperConfig::default());
     let prompt = match transcriber {
         Ok(t) => match t.transcribe(&pcm, 16_000).await {
-            Ok(text) if !text.trim().is_empty() => text,
-            _ => "A la orden, Señor. Viernes escuchando.".to_string(),
+            Ok(text) => text.trim().to_string(),
+            Err(e) => {
+                warn!("STT transcription error: {e}");
+                String::new()
+            }
         },
-        Err(_) => "A la orden, Señor. Viernes escuchando.".to_string(),
+        Err(e) => {
+            warn!("STT transcriber initialization failed: {e}");
+            String::new()
+        }
     };
+
+    if prompt.is_empty() {
+        info!("No speech recognized in audio buffer. Resetting to Idle.");
+        let _ = sm.dispatch(SystemEvent::ResetToIdle).await;
+        return;
+    }
 
     info!("STT Result: '{}'", prompt);
     let _ = sm
         .dispatch(SystemEvent::TranscriptReady(prompt.clone()))
         .await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    // 1. Instantly play conversational filler phrase to eliminate perceived latency (< 150ms)
+    if let Some(filler) = fillers.select_immediate().await {
+        info!("Dispatching instant conversational filler: '{}'", filler);
+        let tts_filler = tts.clone();
+        let player_filler = player.clone();
+        tokio::spawn(async move {
+            if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
+                let mut p = player_filler.lock().await;
+                let _ = p.enqueue_chunk(audio).await;
+            }
+        });
+    }
+
+    // 2. Setup streaming SentenceTokenizer
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let mut tokenizer = SentenceTokenizer::new(tx);
 
-    let response_chunks = vec![format!(
-        "Comprendido, Señor. Procesando comando: {}.",
-        prompt
-    )];
-
-    for chunk in response_chunks {
-        let _ = tokenizer.feed_token(&chunk).await;
-    }
-    let _ = tokenizer.flush().await;
-
-    while let Some(sentence) = rx.recv().await {
-        info!("Synthesizing sentence: '{}'", sentence);
-        let _ = sm
-            .dispatch(SystemEvent::SentenceReady(sentence.clone()))
-            .await;
-        let _ = sm.dispatch(SystemEvent::SpeakingStarted).await;
-
-        match tts.synthesize_resilient(&sentence).await {
-            Ok(audio_bytes) => {
-                let mut p = player.lock().await;
-                let _ = p.enqueue_chunk(audio_bytes).await;
+    let tts_worker = tts.clone();
+    let player_worker = player.clone();
+    let sm_worker = sm.clone();
+    let synthesis_worker = tokio::spawn(async move {
+        while let Some(sentence) = rx.recv().await {
+            let trimmed = sentence.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            Err(e) => {
-                warn!("TTS synthesis failed for sentence: {e}");
+            info!("Synthesizing sentence: '{}'", trimmed);
+            let _ = sm_worker
+                .dispatch(SystemEvent::SentenceReady(trimmed.to_string()))
+                .await;
+            let _ = sm_worker.dispatch(SystemEvent::SpeakingStarted).await;
+
+            match tts_worker.synthesize_resilient(trimmed).await {
+                Ok(audio_bytes) => {
+                    let mut p = player_worker.lock().await;
+                    let _ = p.enqueue_chunk(audio_bytes).await;
+                }
+                Err(e) => {
+                    warn!("TTS synthesis failed for sentence: {e}");
+                }
+            }
+        }
+    });
+
+    // 3. Stream from resident Antigravity Brain
+    let mut brain_guard = brain.lock().await;
+    let mut response_received = false;
+
+    if let Some(ref mut client) = *brain_guard {
+        if let Err(e) = client.send_prompt(&prompt).await {
+            warn!("Failed to send prompt to resident Antigravity client: {e}");
+        } else {
+            while let Ok(Some(event)) = client.next_event().await {
+                match event {
+                    BrainEvent::TextChunk { content } => {
+                        response_received = true;
+                        let _ = tokenizer.feed_token(&content).await;
+                    }
+                    BrainEvent::ToolCall { name, .. } => {
+                        info!("Brain active tool call: '{}'", name);
+                        if let Some(tool_filler) = fillers.select_tool_filler(&name).await {
+                            let tts_tool = tts.clone();
+                            let player_tool = player.clone();
+                            tokio::spawn(async move {
+                                if let Ok(audio) = tts_tool.synthesize_resilient(&tool_filler).await
+                                {
+                                    let mut p = player_tool.lock().await;
+                                    let _ = p.enqueue_chunk(audio).await;
+                                }
+                            });
+                        }
+                    }
+                    BrainEvent::Done => {
+                        break;
+                    }
+                    _ => {}
+                }
             }
         }
     }
+
+    if !response_received {
+        warn!("No tokens received from Antigravity; emitting direct fallback.");
+        let fallback = format!(
+            "A la orden, Señor. Procesando su solicitud sobre {}.",
+            prompt
+        );
+        let _ = tokenizer.feed_token(&fallback).await;
+    }
+
+    let _ = tokenizer.flush().await;
+    drop(tokenizer);
+    let _ = synthesis_worker.await;
+    let _ = sm.dispatch(SystemEvent::PlaybackFinished).await;
 }
 
 /// Executes representative workloads across VAD, DSP resampling, sentence tokenization, and state machine transitions.
@@ -419,8 +566,8 @@ async fn send_ptt_command(command: &str) -> Result<(), Box<dyn std::error::Error
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
-    let socket_path = std::env::var("VIERNES_PTT_SOCKET")
-        .unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
+    let socket_path =
+        std::env::var("VIERNES_PTT_SOCKET").unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
 
     let path = std::path::Path::new(&socket_path);
     if !path.exists() {
