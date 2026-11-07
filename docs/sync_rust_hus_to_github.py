@@ -86,9 +86,9 @@ def main():
             print(f"Error processing {hu_id}: {exc}")
             time.sleep(2)
 
-    print(f"\n=======================================================")
+    print("\n=======================================================")
     print(f"  COMPLETED: {total_created} issues created and synced to Project {PROJECT_NUM}!")
-    print(f"=======================================================\n")
+    print("=======================================================\n")
 
 
 if __name__ == "__main__":
