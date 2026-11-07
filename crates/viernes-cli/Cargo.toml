@@ -17,10 +17,19 @@ viernes-brain.workspace = true
 viernes-tts.workspace = true
 
 tokio.workspace = true
+tokio-stream.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tempfile.workspace = true
+cpal.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,644 @@
+//! Application state, navigation tabs, dashboard rendering, and user input orchestration.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
+use ratatui::Frame;
+use viernes_core::config::ViernesConfig;
+use viernes_core::state::SystemState;
+
+use crate::tui::views::credentials::{CredentialsAction, CredentialsView};
+use crate::tui::views::devices::DevicesView;
+use crate::tui::views::fillers::{FillersAction, FillersView};
+use crate::tui::views::service::ServiceView;
+use crate::tui::widgets::ptt::ptt_socket_path;
+use crate::tui::widgets::{
+    send_ipc_ptt, ConversationTurn, ConversationWidget, PttWidget, Speaker, SpectrumWidget,
+};
+
+/// Minimum required terminal columns according to HU-RUST-29.
+pub const MIN_TERMINAL_WIDTH: u16 = 80;
+/// Minimum required terminal rows according to HU-RUST-29.
+pub const MIN_TERMINAL_HEIGHT: u16 = 24;
+
+/// Active tab index in the dashboard navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActiveTab {
+    /// Tab 1: Central State, Spectrum Soundwave, and Conversation Turn Monitor.
+    #[default]
+    Monitor,
+    /// Tab 2: Voice Provider & Key Pool Configuration.
+    VoiceAndKeys,
+    /// Tab 3: Conversational Filler Phrases Editor.
+    Fillers,
+    /// Tab 4: Audio Hardware Devices & Level Meter.
+    AudioDevices,
+    /// Tab 5: Daemon Service, IPC & Live Logs.
+    ServiceAndLogs,
+}
+
+impl ActiveTab {
+    /// Array containing all tabs in display order.
+    pub const ALL: [ActiveTab; 5] = [
+        Self::Monitor,
+        Self::VoiceAndKeys,
+        Self::Fillers,
+        Self::AudioDevices,
+        Self::ServiceAndLogs,
+    ];
+
+    /// Zero-based numerical index.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        match self {
+            Self::Monitor => 0,
+            Self::VoiceAndKeys => 1,
+            Self::Fillers => 2,
+            Self::AudioDevices => 3,
+            Self::ServiceAndLogs => 4,
+        }
+    }
+
+    /// Resolves tab from numerical index.
+    #[must_use]
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Monitor,
+            1 => Self::VoiceAndKeys,
+            2 => Self::Fillers,
+            3 => Self::AudioDevices,
+            _ => Self::ServiceAndLogs,
+        }
+    }
+
+    /// Next navigation tab.
+    #[must_use]
+    pub fn next(&self) -> Self {
+        Self::from_index((self.index() + 1) % Self::ALL.len())
+    }
+
+    /// Previous navigation tab.
+    #[must_use]
+    pub fn prev(&self) -> Self {
+        Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len())
+    }
+
+    /// Human-readable label for navigation bar.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Monitor => "1: Monitor",
+            Self::VoiceAndKeys => "2: Voz & Claves",
+            Self::Fillers => "3: Frases Relleno",
+            Self::AudioDevices => "4: Audio",
+            Self::ServiceAndLogs => "5: Servicio",
+        }
+    }
+}
+
+/// Unified application state for the Viernes TUI.
+pub struct TuiApp {
+    /// Currently visible tab.
+    pub active_tab: ActiveTab,
+    /// Flag signaling main event loop termination.
+    pub should_quit: bool,
+    /// Number of ticks elapsed for 30 FPS animation.
+    pub tick_count: u64,
+
+    // --- Tab 1: Monitor State ---
+    /// Runtime configuration if available.
+    pub config: Option<ViernesConfig>,
+    /// Observed runtime state of the assistant daemon.
+    pub assistant_state: SystemState,
+    /// Live frequency spectrum amplitudes [0.0, 1.0].
+    pub spectrum_bars: Vec<f32>,
+    /// Scrollable conversation turn history.
+    pub turns: Vec<ConversationTurn>,
+    /// Whether Push-to-Talk emulator is actively recording.
+    pub ptt_active: bool,
+    /// Whether connection to background socket is detected.
+    pub daemon_connected: bool,
+
+    // --- Tab 2-5 Views ---
+    /// Tab 2 view state (Credentials & Voice).
+    pub credentials_view: CredentialsView,
+    /// Tab 3 view state (Fillers).
+    pub fillers_view: FillersView,
+    /// Tab 4 view state (Audio Devices).
+    pub devices_view: DevicesView,
+    /// Tab 5 view state (Service & Live Logs).
+    pub service_view: ServiceView,
+
+    /// Global status notification message.
+    pub status_line: Option<String>,
+}
+
+/// Convenience alias for `TuiApp`.
+pub type App = TuiApp;
+
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl TuiApp {
+    /// Number of frequency bars displayed in the spectrum soundwave.
+    pub const SPECTRUM_BAR_COUNT: usize = 32;
+
+    /// Constructs a new `TuiApp` instance.
+    #[must_use]
+    pub fn new(config: Option<ViernesConfig>) -> Self {
+        let initial_turns = vec![
+            ConversationTurn::new(
+                Speaker::System,
+                "Viernes Terminal Dashboard v0.1.0 inicializado. Listo.",
+            ),
+            ConversationTurn::new(Speaker::User, "¿Qué hora es en Tokio?"),
+            ConversationTurn::new(Speaker::Viernes, "Son las 5 de la mañana en Tokio, señor."),
+        ];
+
+        let daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
+
+        Self {
+            active_tab: ActiveTab::Monitor,
+            should_quit: false,
+            tick_count: 0,
+            credentials_view: CredentialsView::new(config.clone()),
+            config: config.clone(),
+            assistant_state: SystemState::Idle,
+            spectrum_bars: vec![0.05; Self::SPECTRUM_BAR_COUNT],
+            turns: initial_turns,
+            ptt_active: false,
+            daemon_connected,
+            fillers_view: FillersView::new(None, None),
+            devices_view: DevicesView::new(),
+            service_view: ServiceView::new(),
+            status_line: Some("Viernes TUI Dashboard inicializado".into()),
+        }
+    }
+
+    /// Next navigation tab.
+    pub fn next_tab(&mut self) {
+        self.active_tab = self.active_tab.next();
+    }
+
+    /// Previous navigation tab.
+    pub fn prev_tab(&mut self) {
+        self.active_tab = self.active_tab.prev();
+    }
+
+    /// Advances periodic animations at 30 FPS.
+    pub fn on_tick(&mut self) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+
+        // Periodically verify background daemon socket connectivity (~once every second)
+        if self.tick_count.is_multiple_of(30) {
+            self.daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
+        }
+
+        // Update soundwave spectrum based on assistant state
+        if self.assistant_state == SystemState::Speaking {
+            let t = (self.tick_count as f32) * 0.15;
+            for i in 0..Self::SPECTRUM_BAR_COUNT {
+                let fi = i as f32;
+                let wave1 = ((fi * 0.4 + t).sin() * 0.5 + 0.5).powi(2);
+                let wave2 = ((fi * 0.8 - t * 1.5).cos() * 0.5 + 0.5) * 0.6;
+                let wave3 = (((fi + t) * 1.2).sin() * 0.5 + 0.5) * 0.4;
+                let height = (wave1 + wave2 + wave3) / 2.0;
+                self.spectrum_bars[i] =
+                    (self.spectrum_bars[i] * 0.3 + height * 0.7).clamp(0.05, 1.0);
+            }
+        } else {
+            // Quiescent idle baseline wave
+            let t = (self.tick_count as f32) * 0.05;
+            for i in 0..Self::SPECTRUM_BAR_COUNT {
+                let wave = ((i as f32 * 0.2 + t).sin() * 0.5 + 0.5) * 0.08 + 0.02;
+                self.spectrum_bars[i] =
+                    (self.spectrum_bars[i] * 0.8 + wave * 0.2).clamp(0.01, 0.15);
+            }
+        }
+
+        // Background simulation for mic level in Devices view if testing
+        if self.devices_view.is_testing_mic {
+            let level = (((self.tick_count as f32 * 0.2).sin().abs()) * 0.75) + 0.1;
+            self.devices_view.set_mic_level(level);
+        }
+    }
+
+    /// Appends a new conversation turn to the history log.
+    pub fn add_turn(&mut self, speaker: Speaker, text: impl Into<String>) {
+        self.turns.push(ConversationTurn::new(speaker, text));
+        if self.turns.len() > 100 {
+            self.turns.remove(0);
+        }
+    }
+
+    /// Dispatches a key event according to active tab and global shortcuts.
+    pub async fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        // Global quit shortcut: Ctrl+C
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        // 1. Tab-specific delegates when editing text fields
+        let is_editing = (self.active_tab == ActiveTab::VoiceAndKeys
+            && self.credentials_view.focus
+                != crate::tui::views::credentials::CredentialsFocus::KeyList)
+            || (self.active_tab == ActiveTab::Fillers
+                && self.fillers_view.mode
+                    != crate::tui::views::fillers::FillerEditorMode::Browsing);
+
+        if !is_editing {
+            // Global navigation keys
+            match key.code {
+                KeyCode::Char('q') => {
+                    // Close dropdowns in Tab 4 first if open
+                    if self.active_tab == ActiveTab::AudioDevices
+                        && (self.devices_view.input_dropdown_open
+                            || self.devices_view.output_dropdown_open)
+                    {
+                        self.devices_view.input_dropdown_open = false;
+                        self.devices_view.output_dropdown_open = false;
+                        return;
+                    }
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('1') => {
+                    self.active_tab = ActiveTab::Monitor;
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.active_tab = ActiveTab::VoiceAndKeys;
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.active_tab = ActiveTab::Fillers;
+                    return;
+                }
+                KeyCode::Char('4') => {
+                    self.active_tab = ActiveTab::AudioDevices;
+                    return;
+                }
+                KeyCode::Char('5') => {
+                    self.active_tab = ActiveTab::ServiceAndLogs;
+                    return;
+                }
+                KeyCode::Tab => {
+                    if self.active_tab == ActiveTab::AudioDevices {
+                        self.devices_view.next_focus();
+                    } else {
+                        self.next_tab();
+                    }
+                    return;
+                }
+                KeyCode::BackTab => {
+                    if self.active_tab == ActiveTab::AudioDevices {
+                        self.devices_view.prev_focus();
+                    } else {
+                        self.prev_tab();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Active Tab Event Processing
+        match self.active_tab {
+            ActiveTab::Monitor => match key.code {
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    if !self.ptt_active {
+                        // Key down -> Start recording
+                        self.ptt_active = true;
+                        self.assistant_state = SystemState::Listening;
+                        let _ = send_ipc_ptt("press").await;
+                    } else {
+                        // Key released -> Stop recording
+                        self.ptt_active = false;
+                        self.assistant_state = SystemState::Thinking;
+                        let _ = send_ipc_ptt("release").await;
+                    }
+                }
+                KeyCode::Esc => {
+                    if self.ptt_active
+                        || self.assistant_state == SystemState::Speaking
+                        || self.assistant_state == SystemState::Listening
+                        || self.assistant_state == SystemState::Thinking
+                    {
+                        // Barge-in / Cancel speech
+                        self.ptt_active = false;
+                        self.assistant_state = SystemState::Idle;
+                        let _ = send_ipc_ptt("cancel").await;
+                    } else {
+                        self.should_quit = true;
+                    }
+                }
+                _ => {}
+            },
+            ActiveTab::VoiceAndKeys => {
+                let action = self.credentials_view.handle_key(key);
+                match action {
+                    CredentialsAction::SavedToDisk => {
+                        self.status_line = Some("Credenciales guardadas en .env (0600)".into());
+                    }
+                    CredentialsAction::TestVoiceTriggered => {
+                        self.status_line = Some("Iniciando audición de prueba de voz...".into());
+                    }
+                    CredentialsAction::None => {}
+                }
+            }
+            ActiveTab::Fillers => {
+                let action = self.fillers_view.handle_key(key);
+                if action == FillersAction::SavedAndReloaded {
+                    self.status_line = Some("Guardado y recargado vía IPC".into());
+                    let _ = self.fillers_view.dispatch_hot_reload().await;
+                }
+            }
+            ActiveTab::AudioDevices => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.devices_view.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.devices_view.select_next(),
+                KeyCode::Enter | KeyCode::Char(' ') => self.devices_view.toggle_action(),
+                KeyCode::Char('m') => self.devices_view.toggle_action(),
+                KeyCode::Char('r') => self.devices_view.refresh_from_host(),
+                _ => {}
+            },
+            ActiveTab::ServiceAndLogs => match key.code {
+                KeyCode::Char('R') | KeyCode::Char('r') => self.service_view.action_restart(),
+                KeyCode::Char('K') | KeyCode::Char('k') => self.service_view.action_stop(),
+                KeyCode::Char('S') | KeyCode::Char('s') => self.service_view.action_start(),
+                KeyCode::Char('N') | KeyCode::Char('n') => self.service_view.action_new_session(),
+                KeyCode::Char('u') => self.service_view.refresh_health(),
+                KeyCode::Char('f') => self.service_view.logs.cycle_filter(),
+                KeyCode::Char('a') => self.service_view.logs.toggle_auto_scroll(),
+                KeyCode::Char('c') => self.service_view.logs.clear(),
+                KeyCode::Up => self.service_view.logs.scroll_up(),
+                KeyCode::Down => self.service_view.logs.scroll_down(),
+                KeyCode::PageUp => self.service_view.logs.page_up(10),
+                KeyCode::PageDown => self.service_view.logs.page_down(10),
+                _ => {}
+            },
+        }
+    }
+
+    /// Renders the complete dashboard layout inside the terminal frame.
+    pub fn render(&mut self, f: &mut Frame) {
+        let area = f.area();
+
+        // ST-RUST-29.3: Enforce minimum terminal dimensions (80x24)
+        if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+            let too_small = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Dimensiones de Terminal insuficientes",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("Tamaño actual:   {}x{}", area.width, area.height)),
+                Line::from(format!(
+                    "Mínimo requerido: {}x{}",
+                    MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Por favor, amplíe la ventana para continuar.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Advertencia "),
+            );
+
+            let dialog_w = 56.min(area.width);
+            let dialog_h = 8.min(area.height);
+            let dialog_area = Rect::new(
+                (area.width.saturating_sub(dialog_w)) / 2,
+                (area.height.saturating_sub(dialog_h)) / 2,
+                dialog_w,
+                dialog_h,
+            );
+
+            f.render_widget(Clear, dialog_area);
+            f.render_widget(too_small, dialog_area);
+            return;
+        }
+
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Navigation Tabs bar
+                Constraint::Min(18),   // Active tab body
+                Constraint::Length(1), // Global hotkeys status line
+            ])
+            .split(area);
+
+        // 1. Navigation Tabs Header
+        let titles: Vec<Line> = ActiveTab::ALL
+            .iter()
+            .map(|t| {
+                let style = if t.index() == self.active_tab.index() {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Line::from(Span::styled(t.label(), style))
+            })
+            .collect();
+
+        let tabs_widget = Tabs::new(titles)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Viernes Terminal Dashboard v0.1.0 "),
+            )
+            .select(self.active_tab.index())
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::UNDERLINED),
+            );
+        f.render_widget(tabs_widget, main_chunks[0]);
+
+        // 2. Active Tab Body
+        match self.active_tab {
+            ActiveTab::Monitor => {
+                let monitor_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(8), // Soundwave Spectrum
+                        Constraint::Min(6),    // Scrollable Conversation history
+                        Constraint::Length(3), // Interactive PTT Emulator bar
+                    ])
+                    .split(main_chunks[1]);
+
+                let spectrum = SpectrumWidget::new(&self.spectrum_bars, self.assistant_state);
+                f.render_widget(spectrum, monitor_chunks[0]);
+
+                let conversation = ConversationWidget::new(&self.turns);
+                f.render_widget(conversation, monitor_chunks[1]);
+
+                let ptt =
+                    PttWidget::new(self.ptt_active, self.assistant_state, self.daemon_connected);
+                f.render_widget(ptt, monitor_chunks[2]);
+            }
+            ActiveTab::VoiceAndKeys => {
+                self.credentials_view.render(f, main_chunks[1]);
+            }
+            ActiveTab::Fillers => {
+                self.fillers_view.render(f, main_chunks[1]);
+            }
+            ActiveTab::AudioDevices => {
+                self.devices_view.render(f, main_chunks[1]);
+            }
+            ActiveTab::ServiceAndLogs => {
+                self.service_view.render(f, main_chunks[1]);
+            }
+        }
+
+        // 3. Global hotkeys footer
+        let footer_line = Line::from(vec![
+            Span::styled(
+                "[1-5]: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Pestañas │ "),
+            Span::styled(
+                "[Tab]: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Foco │ "),
+            Span::styled(
+                "[Espacio / Enter]: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("PTT │ "),
+            Span::styled(
+                "[Esc]: ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Barge-in │ "),
+            Span::styled(
+                "[q]: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Salir"),
+        ]);
+        let footer = Paragraph::new(footer_line).alignment(Alignment::Center);
+        f.render_widget(footer, main_chunks[2]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn test_tui_app_tab_cycling() {
+        let mut app = TuiApp::new(None);
+        assert_eq!(app.active_tab, ActiveTab::Monitor);
+
+        app.next_tab();
+        assert_eq!(app.active_tab, ActiveTab::VoiceAndKeys);
+
+        app.next_tab();
+        assert_eq!(app.active_tab, ActiveTab::Fillers);
+
+        app.prev_tab();
+        assert_eq!(app.active_tab, ActiveTab::VoiceAndKeys);
+    }
+
+    #[tokio::test]
+    async fn test_tui_app_key_quit() {
+        let mut app = TuiApp::new(None);
+        assert!(!app.should_quit);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn test_ptt_key_toggle_in_monitor() {
+        let mut app = TuiApp::new(None);
+        assert_eq!(app.active_tab, ActiveTab::Monitor);
+        assert!(!app.ptt_active);
+        assert_eq!(app.assistant_state, SystemState::Idle);
+
+        // Press Space -> PTT active / Listening
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await;
+        assert!(app.ptt_active);
+        assert_eq!(app.assistant_state, SystemState::Listening);
+
+        // Press Enter -> PTT inactive / Thinking
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(!app.ptt_active);
+        assert_eq!(app.assistant_state, SystemState::Thinking);
+
+        // Press Esc -> Cancel / Idle
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.assistant_state, SystemState::Idle);
+    }
+
+    #[test]
+    fn test_tui_app_render_headless_normal() {
+        let mut app = TuiApp::new(None);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                app.render(f);
+            })
+            .unwrap();
+
+        let buffer_str = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_str.contains("Viernes Terminal Dashboard"));
+        assert!(buffer_str.contains("Espectro de Voz"));
+        assert!(buffer_str.contains("Transcripción & Historial Conversacional"));
+        assert!(buffer_str.contains("Control Push-to-Talk"));
+    }
+
+    #[test]
+    fn test_tui_app_render_headless_too_small_triggers_warning() {
+        let mut app = TuiApp::new(None);
+        let backend = TestBackend::new(70, 20); // Less than 80x24
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                app.render(f);
+            })
+            .unwrap();
+
+        let buffer_str = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_str.contains("Dimensiones de Terminal insuficientes"));
+        assert!(buffer_str.contains("70x20"));
+        assert!(buffer_str.contains("80x24"));
+    }
+}

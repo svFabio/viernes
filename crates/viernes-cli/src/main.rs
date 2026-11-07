@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod tui;
+
 use std::sync::Arc;
 
 use clap::Parser;
@@ -61,6 +63,10 @@ struct CliArgs {
     /// Send Push-to-Talk IPC trigger to running daemon (e.g. "press", "release", "cancel")
     #[arg(long, value_name = "COMMAND")]
     ptt: Option<String>,
+
+    /// Launch interactive terminal user interface (TUI) dashboard
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
@@ -70,6 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fast-path: Dispatch PTT IPC command directly without initializing heavy subsystems
     if let Some(ref cmd) = args.ptt {
         return send_ptt_command(cmd).await;
+    }
+
+    // Launch interactive TUI
+    if args.tui {
+        let config = ViernesConfig::load_from_env(None).unwrap_or_default();
+        return tui::run_tui(config).await;
     }
 
     // Initialize structured tracing
@@ -693,5 +705,9 @@ mod tests {
         let parsed_ptt = CliArgs::try_parse_from(["viernes", "--ptt", "press"]);
         assert!(parsed_ptt.is_ok());
         assert_eq!(parsed_ptt.unwrap().ptt.as_deref(), Some("press"));
+
+        let parsed_tui = CliArgs::try_parse_from(["viernes", "--tui"]);
+        assert!(parsed_tui.is_ok());
+        assert!(parsed_tui.unwrap().tui);
     }
 }
