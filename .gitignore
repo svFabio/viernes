@@ -20,3 +20,11 @@ wt-*
 /tmp/
 # Local AI runtime state
 .atl/
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+pgo-data/
+*.profdata
+*.profraw
+
