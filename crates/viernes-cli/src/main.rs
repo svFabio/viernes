@@ -91,8 +91,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.test_voice {
-        info!("Audition test: 'A la orden, Señor. Viernes en línea y lista para operar.'");
-        info!("Synthesis completed successfully.");
+        let test_phrase = "A la orden, Señor. Viernes en línea y lista para operar.";
+        info!("Audition test: '{}'", test_phrase);
+        let tts = ResilientTtsEngine::from_env();
+        let mut player = StreamingAudioPlayer::create_resilient_player(None);
+
+        info!("Synthesizing test audio via TTS engine...");
+        let audio_bytes = tts.synthesize_resilient(test_phrase).await?;
+        info!("Playing audio ({} bytes)...", audio_bytes.len());
+        player.enqueue_chunk(audio_bytes).await?;
+
+        // Allow playback thread to receive and start playback
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        while player.is_playing() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        info!("Synthesis and playback completed successfully.");
         return Ok(());
     }
 
