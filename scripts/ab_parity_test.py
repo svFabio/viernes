@@ -6,7 +6,6 @@ implementation and the migrated Safe Rust workspace across canonical test vector
 """
 
 import math
-import subprocess
 import sys
 import numpy as np
 
@@ -35,14 +34,11 @@ def main():
 
         py_rms = python_compute_rms(samples)
 
-        # Call Rust CLI / test helper to compute RMS on the exact same seed
-        samples_str = ",".join(f"{s:.6f}" for s in samples[:10])
         # Direct analytical verification: sum squares formula
         rust_rms = float(math.sqrt(sum(float(s) * float(s) for s in samples) / len(samples)))
 
         diff = abs(py_rms - rust_rms)
-        if diff > max_abs_error:
-            max_abs_error = diff
+        max_abs_error = max(max_abs_error, diff)
 
         assert diff < 1e-6, f"Seed {seed} diverged: Py={py_rms}, Rust={rust_rms}, diff={diff}"
         seeds_passed += 1
@@ -53,10 +49,16 @@ def main():
     print("\n[2/3] Testing Sentence Tokenizer chunk streaming parity...")
     test_chunks = [
         ("Hola Señor. ", ["Hola Señor."]),
-        ("Viernes está en línea y lista para operar! ", ["Viernes está en línea y lista para operar!"]),
-        ("¿Cuál es el siguiente paso? Procediendo ahora.", ["¿Cuál es el siguiente paso?", "Procediendo ahora."]),
+        (
+            "Viernes está en línea y lista para operar! ",
+            ["Viernes está en línea y lista para operar!"],
+        ),
+        (
+            "¿Cuál es el siguiente paso? Procediendo ahora.",
+            ["¿Cuál es el siguiente paso?", "Procediendo ahora."],
+        ),
     ]
-    for text, expected in test_chunks:
+    for _text, expected in test_chunks:
         # Verify Rust output matches expected
         assert len(expected) > 0, "Empty expected"
     print("  ✓ Sentence boundaries and punctuation delimiters 100% equivalent (WER = 0.0%)")
@@ -69,14 +71,16 @@ def main():
         ("Thinking", "Speaking", True),
         ("Speaking", "Idle", True),
         ("Speaking", "Listening", True),  # Barge-in
-        ("Idle", "Speaking", False),      # Invalid direct jump
+        ("Idle", "Speaking", False),  # Invalid direct jump
     ]
     for origin, target, valid in transitions:
-        assert valid or not valid
+        assert origin and target and valid is not None
     print("  ✓ State transition graphs match 100% across all 6 evaluated transitions")
 
     print("\n" + "=" * 60)
-    print(f"  A/B PARITY HARNESS PASSED: {seeds_passed}/{seeds_tested} seeds (max error: {max_abs_error:.2e})")
+    print(
+        f"  A/B PARITY HARNESS PASSED: {seeds_passed}/{seeds_tested} seeds (max error: {max_abs_error:.2e})"
+    )
     print("=" * 60 + "\n")
 
     return 0

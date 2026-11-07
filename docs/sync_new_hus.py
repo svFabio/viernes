@@ -38,21 +38,36 @@ def main():
 
         print(f"\n[{idx}/28] Creating HU Issue: {hu_title}...")
         try:
-            hu_url = run_gh([
-                "gh", "issue", "create",
-                "--repo", REPO,
-                "--title", hu_title,
-                "--body", body,
-                "--label", labels,
-            ])
+            hu_url = run_gh(
+                [
+                    "gh",
+                    "issue",
+                    "create",
+                    "--repo",
+                    REPO,
+                    "--title",
+                    hu_title,
+                    "--body",
+                    body,
+                    "--label",
+                    labels,
+                ]
+            )
             print(f"  ✓ Created: {hu_url}")
             total_created += 1
 
-            run_gh([
-                "gh", "project", "item-add", PROJECT_NUM,
-                "--owner", OWNER,
-                "--url", hu_url,
-            ])
+            run_gh(
+                [
+                    "gh",
+                    "project",
+                    "item-add",
+                    PROJECT_NUM,
+                    "--owner",
+                    OWNER,
+                    "--url",
+                    hu_url,
+                ]
+            )
             print(f"  ✓ Added to Project {PROJECT_NUM}")
             time.sleep(0.3)
 
@@ -65,27 +80,44 @@ def main():
                 )
                 st_labels = f"subtask,rust,{hu['epic']},{hu['risk']}"
 
-                st_url = run_gh([
-                    "gh", "issue", "create",
-                    "--repo", REPO,
-                    "--title", st_title,
-                    "--body", st_body,
-                    "--label", st_labels,
-                ])
+                st_url = run_gh(
+                    [
+                        "gh",
+                        "issue",
+                        "create",
+                        "--repo",
+                        REPO,
+                        "--title",
+                        st_title,
+                        "--body",
+                        st_body,
+                        "--label",
+                        st_labels,
+                    ]
+                )
                 print(f"    - Subtask {st_id}: {st_url}")
                 total_created += 1
 
-                run_gh([
-                    "gh", "project", "item-add", PROJECT_NUM,
-                    "--owner", OWNER,
-                    "--url", st_url,
-                ])
+                run_gh(
+                    [
+                        "gh",
+                        "project",
+                        "item-add",
+                        PROJECT_NUM,
+                        "--owner",
+                        OWNER,
+                        "--url",
+                        st_url,
+                    ]
+                )
                 time.sleep(0.3)
 
         except subprocess.CalledProcessError as exc:
             print(f"Error creating issue for {hu_id}: {exc.stderr}")
 
-    print(f"\nDone! Successfully synchronized {total_created} items into GitHub Project {PROJECT_NUM}.")
+    print(
+        f"\nDone! Successfully synchronized {total_created} items into GitHub Project {PROJECT_NUM}."
+    )
 
 
 if __name__ == "__main__":

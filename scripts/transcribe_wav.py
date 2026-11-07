@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from viernes.stt.whisper_provider import WhisperSTTProvider
 
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(1)
@@ -16,6 +17,7 @@ def main():
     provider = WhisperSTTProvider(model_size="base", language="es")
     transcript = provider.transcribe(wav_path)
     print(transcript)
+
 
 if __name__ == "__main__":
     main()

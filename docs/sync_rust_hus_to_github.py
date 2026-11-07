@@ -36,22 +36,37 @@ def main():
 
         print(f"\n[{idx}/{len(HUS)}] Creating HU Issue: {hu_title}...")
         try:
-            hu_url = run_gh([
-                "gh", "issue", "create",
-                "--repo", REPO,
-                "--title", hu_title,
-                "--body", body,
-                "--label", labels,
-            ])
+            hu_url = run_gh(
+                [
+                    "gh",
+                    "issue",
+                    "create",
+                    "--repo",
+                    REPO,
+                    "--title",
+                    hu_title,
+                    "--body",
+                    body,
+                    "--label",
+                    labels,
+                ]
+            )
             print(f"  ✓ Created: {hu_url}")
             total_created += 1
 
             # Add to Project 12
-            run_gh([
-                "gh", "project", "item-add", PROJECT_NUM,
-                "--owner", OWNER,
-                "--url", hu_url,
-            ])
+            run_gh(
+                [
+                    "gh",
+                    "project",
+                    "item-add",
+                    PROJECT_NUM,
+                    "--owner",
+                    OWNER,
+                    "--url",
+                    hu_url,
+                ]
+            )
             print(f"  ✓ Added to Project {PROJECT_NUM}")
             time.sleep(0.4)
 
@@ -65,21 +80,36 @@ def main():
                 )
                 st_labels = f"subtask,rust,{hu['epic']},{hu['risk']}"
 
-                st_url = run_gh([
-                    "gh", "issue", "create",
-                    "--repo", REPO,
-                    "--title", st_title,
-                    "--body", st_body,
-                    "--label", st_labels,
-                ])
+                st_url = run_gh(
+                    [
+                        "gh",
+                        "issue",
+                        "create",
+                        "--repo",
+                        REPO,
+                        "--title",
+                        st_title,
+                        "--body",
+                        st_body,
+                        "--label",
+                        st_labels,
+                    ]
+                )
                 print(f"    - Subtask {st_id}: {st_url}")
                 total_created += 1
 
-                run_gh([
-                    "gh", "project", "item-add", PROJECT_NUM,
-                    "--owner", OWNER,
-                    "--url", st_url,
-                ])
+                run_gh(
+                    [
+                        "gh",
+                        "project",
+                        "item-add",
+                        PROJECT_NUM,
+                        "--owner",
+                        OWNER,
+                        "--url",
+                        st_url,
+                    ]
+                )
                 time.sleep(0.4)
 
         except Exception as exc:

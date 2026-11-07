@@ -43,9 +43,18 @@ HUS = [
             "7. **Pruebas herméticas:** El módulo cuenta con un `FakeAudioSource` para ejecutar pruebas unitarias y de integración sin depender de hardware físico ni servidores de sonido.",
         ],
         "subtasks": [
-            ("ST-RUST-01.1", "Diseñar abstracción AudioCaptureStream y ring-buffer concurrente con crossbeam"),
-            ("ST-RUST-01.2", "Implementar algoritmo de resampleo defensivo y fallback de sample rate"),
-            ("ST-RUST-01.3", "Pruebas unitarias con FakeAudioDevice y verificación de memoria con Valgrind"),
+            (
+                "ST-RUST-01.1",
+                "Diseñar abstracción AudioCaptureStream y ring-buffer concurrente con crossbeam",
+            ),
+            (
+                "ST-RUST-01.2",
+                "Implementar algoritmo de resampleo defensivo y fallback de sample rate",
+            ),
+            (
+                "ST-RUST-01.3",
+                "Pruebas unitarias con FakeAudioDevice y verificación de memoria con Valgrind",
+            ),
         ],
     },
     {
@@ -78,9 +87,18 @@ HUS = [
             "7. **Pruebas con audio sintético:** Pruebas unitarias verifican la detección precisa de voz y silencio con archivos de onda pregrabados.",
         ],
         "subtasks": [
-            ("ST-RUST-02.1", "Implementar cálculo vectorial RMS con ventana deslizante y máquina de estados VAD"),
-            ("ST-RUST-02.2", "Implementar temporizador de silencio y límite de seguridad de 20 segundos"),
-            ("ST-RUST-02.3", "Pruebas unitarias de segmentación con datasets de audio y casos borde"),
+            (
+                "ST-RUST-02.1",
+                "Implementar cálculo vectorial RMS con ventana deslizante y máquina de estados VAD",
+            ),
+            (
+                "ST-RUST-02.2",
+                "Implementar temporizador de silencio y límite de seguridad de 20 segundos",
+            ),
+            (
+                "ST-RUST-02.3",
+                "Pruebas unitarias de segmentación con datasets de audio y casos borde",
+            ),
         ],
     },
     {
@@ -115,9 +133,18 @@ HUS = [
             "7. **MockProvider para tests:** Existe una implementación `FakeTranscriber` para la suite de CI con 0 tiempo de inicialización.",
         ],
         "subtasks": [
-            ("ST-RUST-03.1", "Configurar crate whisper-rs y build script para compilación de whisper.cpp"),
-            ("ST-RUST-03.2", "Implementar trait SpeechToText con spawn_blocking y normalización de texto"),
-            ("ST-RUST-03.3", "Implementar FakeSpeechToText y tests de integración sin dependencias neuronales"),
+            (
+                "ST-RUST-03.1",
+                "Configurar crate whisper-rs y build script para compilación de whisper.cpp",
+            ),
+            (
+                "ST-RUST-03.2",
+                "Implementar trait SpeechToText con spawn_blocking y normalización de texto",
+            ),
+            (
+                "ST-RUST-03.3",
+                "Implementar FakeSpeechToText y tests de integración sin dependencias neuronales",
+            ),
         ],
     },
     {
@@ -147,7 +174,10 @@ HUS = [
         ],
         "subtasks": [
             ("ST-RUST-04.1", "Implementar listener de eventos de teclado para Wayland/X11"),
-            ("ST-RUST-04.2", "Vincular evento key-up con finish_recording() en el pipeline de captura"),
+            (
+                "ST-RUST-04.2",
+                "Vincular evento key-up con finish_recording() en el pipeline de captura",
+            ),
             ("ST-RUST-04.3", "Tests de carrera y precedencia entre VAD y Push-to-Talk"),
         ],
     },
@@ -185,10 +215,12 @@ HUS = [
         "subtasks": [
             ("ST-RUST-05.1", "Implementar módulo de enumeración de dispositivos con cpal"),
             ("ST-RUST-05.2", "Implementar algoritmo de resolución con fallback a default"),
-            ("ST-RUST-05.3", "Tests unitarios de resolución con fixtures de dispositivos simulados"),
+            (
+                "ST-RUST-05.3",
+                "Tests unitarios de resolución con fixtures de dispositivos simulados",
+            ),
         ],
     },
-
     # -------------------------------------------------------------------------
     # AGENTE 2: Brain & Pipeline Coordinator ("El Cerebro")
     # -------------------------------------------------------------------------
@@ -227,8 +259,14 @@ HUS = [
         ],
         "subtasks": [
             ("ST-RUST-06.1", "Implementar spawn y gestión de subproceso con tokio::process"),
-            ("ST-RUST-06.2", "Modelar esquemas Serde para eventos NDJSON y parser de líneas en stream"),
-            ("ST-RUST-06.3", "Implementar MockAntigravityServer y tests de integración de streaming"),
+            (
+                "ST-RUST-06.2",
+                "Modelar esquemas Serde para eventos NDJSON y parser de líneas en stream",
+            ),
+            (
+                "ST-RUST-06.3",
+                "Implementar MockAntigravityServer y tests de integración de streaming",
+            ),
         ],
     },
     {
@@ -263,8 +301,14 @@ HUS = [
             "6. **Pruebas de concurrencia:** Pruebas unitarias verifican que lecturas y escrituras simultáneas a `session.json` no produzcan archivos corruptos.",
         ],
         "subtasks": [
-            ("ST-RUST-07.1", "Implementar SessionPointerManager con escritura atómica de archivos JSON"),
-            ("ST-RUST-07.2", "Implementar detector de intención de rotación en el analizador léxico"),
+            (
+                "ST-RUST-07.1",
+                "Implementar SessionPointerManager con escritura atómica de archivos JSON",
+            ),
+            (
+                "ST-RUST-07.2",
+                "Implementar detector de intención de rotación en el analizador léxico",
+            ),
             ("ST-RUST-07.3", "Tests de integridad y carreras concurrentes en sesión"),
         ],
     },
@@ -297,7 +341,10 @@ HUS = [
         "subtasks": [
             ("ST-RUST-08.1", "Modelar StateMachine y canal broadcast de eventos del sistema"),
             ("ST-RUST-08.2", "Implementar lógica de transición de estados y despacho concurrente"),
-            ("ST-RUST-08.3", "Suite de pruebas property-based para robustez de la máquina de estados"),
+            (
+                "ST-RUST-08.3",
+                "Suite de pruebas property-based para robustez de la máquina de estados",
+            ),
         ],
     },
     {
@@ -330,9 +377,18 @@ HUS = [
             "6. **Pruebas de latencia:** Pruebas automatizadas miden que el tiempo transcurrido entre `VoiceFinished` y el inicio del audio de filler sea inferior a 150 ms.",
         ],
         "subtasks": [
-            ("ST-RUST-09.1", "Implementar FillerCacheManager y carga desde ~/.config/viernes/fillers.json"),
-            ("ST-RUST-09.2", "Implementar dispatcher de fillers con temporizadores de paciencia concurrentes"),
-            ("ST-RUST-09.3", "Pruebas unitarias de selección aleatoria y verificación de benchmarks de latencia"),
+            (
+                "ST-RUST-09.1",
+                "Implementar FillerCacheManager y carga desde ~/.config/viernes/fillers.json",
+            ),
+            (
+                "ST-RUST-09.2",
+                "Implementar dispatcher de fillers con temporizadores de paciencia concurrentes",
+            ),
+            (
+                "ST-RUST-09.3",
+                "Pruebas unitarias de selección aleatoria y verificación de benchmarks de latencia",
+            ),
         ],
     },
     {
@@ -367,8 +423,14 @@ HUS = [
             "6. **Pruebas con texto complejo:** Pruebas unitarias validan la tokenización correcta en diálogos técnicos, código embebido y listas numeradas.",
         ],
         "subtasks": [
-            ("ST-RUST-10.1", "Implementar SentenceTokenizer con reglas defensivas de puntuación y números"),
-            ("ST-RUST-10.2", "Conectar el stream de tokens al pipeline productor-consumidor hacia TTS"),
+            (
+                "ST-RUST-10.1",
+                "Implementar SentenceTokenizer con reglas defensivas de puntuación y números",
+            ),
+            (
+                "ST-RUST-10.2",
+                "Conectar el stream de tokens al pipeline productor-consumidor hacia TTS",
+            ),
             ("ST-RUST-10.3", "Pruebas de borde de tokenización con signos ortográficos en español"),
         ],
     },
@@ -402,12 +464,14 @@ HUS = [
             "6. **Pruebas de flujo de confirmación:** Pruebas unitarias verifican la denegación por omisión y la confirmación positiva/negativa.",
         ],
         "subtasks": [
-            ("ST-RUST-11.1", "Implementar clasificador de operaciones destructivas y estado de confirmación"),
+            (
+                "ST-RUST-11.1",
+                "Implementar clasificador de operaciones destructivas y estado de confirmación",
+            ),
             ("ST-RUST-11.2", "Implementar temporizador de cancelación y feedback sonoro de fallos"),
             ("ST-RUST-11.3", "Pruebas unitarias de flujos de confirmación y rechazo"),
         ],
     },
-
     # -------------------------------------------------------------------------
     # AGENTE 3: TTS & Audio Output ("La Voz")
     # -------------------------------------------------------------------------
@@ -444,7 +508,10 @@ HUS = [
             "7. **Mock HTTP Server:** Pruebas automatizadas con servidor HTTP simulado (`wiremock`) validan la rotación ante códigos 429.",
         ],
         "subtasks": [
-            ("ST-RUST-12.1", "Implementar cliente HTTP reqwest para síntesis de ElevenLabs con streaming MP3"),
+            (
+                "ST-RUST-12.1",
+                "Implementar cliente HTTP reqwest para síntesis de ElevenLabs con streaming MP3",
+            ),
             ("ST-RUST-12.2", "Implementar lógica de rotación atómica KeyPool con AtomicUsize"),
             ("ST-RUST-12.3", "Tests con wiremock simulando fallos de cuota y rotación de claves"),
         ],
@@ -518,7 +585,10 @@ HUS = [
         ],
         "subtasks": [
             ("ST-RUST-14.1", "Implementar StreamingAudioPlayer basado en rodio Sink y symphonia"),
-            ("ST-RUST-14.2", "Implementar cola FIFO concurrente con notificación de fin de reproducción"),
+            (
+                "ST-RUST-14.2",
+                "Implementar cola FIFO concurrente con notificación de fin de reproducción",
+            ),
             ("ST-RUST-14.3", "Tests unitarios con SilentAudioSink en entornos headless"),
         ],
     },
@@ -558,7 +628,10 @@ HUS = [
         ],
         "subtasks": [
             ("ST-RUST-15.1", "Implementar mecanismo de corte con AtomicBool y CancellationToken"),
-            ("ST-RUST-15.2", "Vincular evento VAD VoiceStarted con cancelación de TTS y vaciado de sink"),
+            (
+                "ST-RUST-15.2",
+                "Vincular evento VAD VoiceStarted con cancelación de TTS y vaciado de sink",
+            ),
             ("ST-RUST-15.3", "Pruebas de latencia de interrupción y descarte de cola de síntesis"),
         ],
     },
@@ -595,7 +668,6 @@ HUS = [
             ("ST-RUST-16.3", "Tests de retención de disco y verificación con Valgrind"),
         ],
     },
-
     # -------------------------------------------------------------------------
     # ORQUESTADOR & INFRAESTRUCTURA (Skill migrate-to-rust)
     # -------------------------------------------------------------------------
@@ -623,7 +695,10 @@ HUS = [
             "6. **CI automatizado:** Workflow de GitHub Actions configurado para compilar, verificar formato (`cargo fmt`) y pasar linter en cada PR.",
         ],
         "subtasks": [
-            ("ST-RUST-17.1", "Crear estructura de workspace Cargo con los 4 crates y dependencias base"),
+            (
+                "ST-RUST-17.1",
+                "Crear estructura de workspace Cargo con los 4 crates y dependencias base",
+            ),
             ("ST-RUST-17.2", "Configurar linter clippy estricto y políticas de unsafe_code"),
             ("ST-RUST-17.3", "Definir traits e interfaces comunes en viernes-core"),
         ],
@@ -661,7 +736,10 @@ HUS = [
             "6. **Ejecución en CI:** El harness se ejecuta en GitHub Actions como paso bloqueante de integración continua.",
         ],
         "subtasks": [
-            ("ST-RUST-18.1", "Crear dataset canónico de audio y prompts para pruebas diferenciales"),
+            (
+                "ST-RUST-18.1",
+                "Crear dataset canónico de audio y prompts para pruebas diferenciales",
+            ),
             ("ST-RUST-18.2", "Implementar script de comparación A/B y cálculo de WER"),
             ("ST-RUST-18.3", "Integrar suite proptest y exportación de telemetría JSON"),
         ],
@@ -687,8 +765,8 @@ HUS = [
                  ▼
 [Recompilar con -Cprofile-use y lto = "fat"] ──► [Binario Optimizado de 35MB]""",
         "criteria": [
-            "1. **Configuración de LTO:** El perfil `release` de Cargo incluye `lto = \"fat\"`, `codegen-units = 1` y `panic = \"abort\"`.",
-            "2. **Fase de instrumentación PGO:** Genera binario instrumentado con `RUSTFLAGS=\"-Cprofile-generate=./pgo-data\"`.",
+            '1. **Configuración de LTO:** El perfil `release` de Cargo incluye `lto = "fat"`, `codegen-units = 1` y `panic = "abort"`.',
+            '2. **Fase de instrumentación PGO:** Genera binario instrumentado con `RUSTFLAGS="-Cprofile-generate=./pgo-data"`.',
             "3. **Fase de entrenamiento:** Ejecuta una sesión simulada de 5 minutos con procesamiento de voz, VAD y streaming.",
             "4. **Fase de optimización:** Genera el binario final utilizando los datos de perfil combinados con `llvm-profdata`.",
             "5. **Medición de ganancias:** Mide y registra en telemetría la reducción de uso de CPU y tiempo de arranque comparado con el build estándar.",
@@ -697,7 +775,10 @@ HUS = [
         "subtasks": [
             ("ST-RUST-19.1", "Configurar perfil de release en Cargo.toml con LTO y codegen-units"),
             ("ST-RUST-19.2", "Automatizar pipeline de entrenamiento PGO y recolección de perfiles"),
-            ("ST-RUST-19.3", "Medir benchmarks y generar reporte interactivo migration_infographic.html"),
+            (
+                "ST-RUST-19.3",
+                "Medir benchmarks y generar reporte interactivo migration_infographic.html",
+            ),
         ],
     },
     {
@@ -728,8 +809,14 @@ $ systemctl --user status viernes-rust
         ],
         "subtasks": [
             ("ST-RUST-20.1", "Implementar CLI con clap y despacho de subcomandos y banderas"),
-            ("ST-RUST-20.2", "Implementar signal handling para SIGINT/SIGTERM con apagado ordenado"),
-            ("ST-RUST-20.3", "Crear unidad systemd viernes-rust.service y validar en entorno local"),
+            (
+                "ST-RUST-20.2",
+                "Implementar signal handling para SIGINT/SIGTERM con apagado ordenado",
+            ),
+            (
+                "ST-RUST-20.3",
+                "Crear unidad systemd viernes-rust.service y validar en entorno local",
+            ),
         ],
     },
     # -------------------------------------------------------------------------
@@ -769,7 +856,10 @@ $ systemctl --user status viernes-rust
         ],
         "subtasks": [
             ("ST-RUST-21.1", "Diseñar trait Tool y estructura ToolRegistry con allowlist dinámico"),
-            ("ST-RUST-21.2", "Implementar ToolDispatcher asíncrono con control de timeouts y Serde"),
+            (
+                "ST-RUST-21.2",
+                "Implementar ToolDispatcher asíncrono con control de timeouts y Serde",
+            ),
             ("ST-RUST-21.3", "Pruebas unitarias exhaustivas y mock tools para validación"),
         ],
     },
@@ -803,8 +893,14 @@ $ systemctl --user status viernes-rust
             "5. **Pruebas con proptest:** Genera cadenas aleatorias arbitrarias para demostrar que ninguna secuencia escapa a la sanitización.",
         ],
         "subtasks": [
-            ("ST-RUST-22.1", "Implementar SecurityValidator con reglas de traversal y sanitización de shell"),
-            ("ST-RUST-22.2", "Integrar clasificador de operaciones destructivas y flags de confirmación"),
+            (
+                "ST-RUST-22.1",
+                "Implementar SecurityValidator con reglas de traversal y sanitización de shell",
+            ),
+            (
+                "ST-RUST-22.2",
+                "Integrar clasificador de operaciones destructivas y flags de confirmación",
+            ),
             ("ST-RUST-22.3", "Suite de tests de penetración sintética y fuzzing con proptest"),
         ],
     },
@@ -896,9 +992,18 @@ $ systemctl --user status viernes-rust
             "5. **Pruebas de integridad:** Pruebas de crash durante escritura validan que la base de datos nunca se corrompe.",
         ],
         "subtasks": [
-            ("ST-RUST-25.1", "Implementar almacenamiento conversacional local y esquema de mensajes"),
-            ("ST-RUST-25.2", "Desarrollar algoritmo de ventana deslizante y compactación de tokens"),
-            ("ST-RUST-25.3", "Pruebas unitarias de persistencia concurrente y recuperación ante fallos"),
+            (
+                "ST-RUST-25.1",
+                "Implementar almacenamiento conversacional local y esquema de mensajes",
+            ),
+            (
+                "ST-RUST-25.2",
+                "Desarrollar algoritmo de ventana deslizante y compactación de tokens",
+            ),
+            (
+                "ST-RUST-25.3",
+                "Pruebas unitarias de persistencia concurrente y recuperación ante fallos",
+            ),
         ],
     },
     {
@@ -929,7 +1034,10 @@ $ systemctl --user status viernes-rust
         "subtasks": [
             ("ST-RUST-26.1", "Crear motor de plantillas de sistema con variables dinámicas"),
             ("ST-RUST-26.2", "Integrar ensamblado de catálogo de herramientas en el prompt"),
-            ("ST-RUST-26.3", "Pruebas de renderizado y validación de restricciones de personalidad"),
+            (
+                "ST-RUST-26.3",
+                "Pruebas de renderizado y validación de restricciones de personalidad",
+            ),
         ],
     },
     {
@@ -966,7 +1074,10 @@ $ systemctl --user status viernes-rust
         ],
         "subtasks": [
             ("ST-RUST-27.1", "Implementar PiperLocalProvider invocando modelo ONNX o CLI de Piper"),
-            ("ST-RUST-27.2", "Incorporar Piper como tercer escalón en la cadena ResilientTtsEngine"),
+            (
+                "ST-RUST-27.2",
+                "Incorporar Piper como tercer escalón en la cadena ResilientTtsEngine",
+            ),
             ("ST-RUST-27.3", "Pruebas unitarias con streams simulados y benchmarks de latencia"),
         ],
     },
@@ -1008,31 +1119,31 @@ for hu in HUS:
     filename = f"{hu['id']}-{hu['title'].lower().replace(' ', '-').replace('/', '-').replace('(', '').replace(')', '').replace(',', '')}.md"
     filepath = BASE_DIR / filename
 
-    content = f"""# {hu['id']}: {hu['title']}
+    content = f"""# {hu["id"]}: {hu["title"]}
 
-**Puntos de Historia:** {hu['points']} | **Prioridad:** {hu['priority']} | **Versión:** {hu['version']} | **Asignado a:** {hu['agent']}
+**Puntos de Historia:** {hu["points"]} | **Prioridad:** {hu["priority"]} | **Versión:** {hu["version"]} | **Asignado a:** {hu["agent"]}
 
 ---
 
 ### Descripción
-{hu['desc']}
+{hu["desc"]}
 
 ---
 
 ### Mockup / Flujo de Interacción
 ```text
-{hu['flow']}
+{hu["flow"]}
 ```
 
 ---
 
 ### Criterios de Aceptación
-{chr(10).join(hu['criteria'])}
+{chr(10).join(hu["criteria"])}
 
 ---
 
 ### Subtareas Técnicas
-{chr(10).join(f"- **{st_id}:** {st_title}" for st_id, st_title in hu['subtasks'])}
+{chr(10).join(f"- **{st_id}:** {st_title}" for st_id, st_title in hu["subtasks"])}
 """
     filepath.write_text(content, encoding="utf-8")
 
