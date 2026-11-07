@@ -76,7 +76,9 @@ impl DeviceEnumerator for CpalDeviceEnumerator {
 
         let mut list = Vec::new();
         for (index, dev) in devices.enumerate() {
-            let name = dev.name().unwrap_or_else(|_| format!("Input Device #{index}"));
+            let name = dev
+                .name()
+                .unwrap_or_else(|_| format!("Input Device #{index}"));
             let is_default = default_name.as_deref() == Some(&name);
 
             let mut max_channels = 0;
@@ -115,7 +117,9 @@ impl DeviceEnumerator for CpalDeviceEnumerator {
 
         let mut list = Vec::new();
         for (index, dev) in devices.enumerate() {
-            let name = dev.name().unwrap_or_else(|_| format!("Output Device #{index}"));
+            let name = dev
+                .name()
+                .unwrap_or_else(|_| format!("Output Device #{index}"));
             let is_default = default_name.as_deref() == Some(&name);
 
             let mut max_channels = 0;
@@ -179,15 +183,24 @@ pub fn resolve_device<'a>(
     // 1. Numeric index match
     if let Ok(idx) = query.parse::<usize>() {
         if let Some(matched) = devices.iter().find(|d| d.index == idx) {
-            info!("Matched device by numeric index {}: '{}'", idx, matched.name);
+            info!(
+                "Matched device by numeric index {}: '{}'",
+                idx, matched.name
+            );
             return Some(matched);
         }
-        warn!("Device index {} was requested but not found in available endpoints", idx);
+        warn!(
+            "Device index {} was requested but not found in available endpoints",
+            idx
+        );
     }
 
     // 2. Exact case-insensitive name match
     let query_lower = query.to_lowercase();
-    if let Some(matched) = devices.iter().find(|d| d.name.to_lowercase() == query_lower) {
+    if let Some(matched) = devices
+        .iter()
+        .find(|d| d.name.to_lowercase() == query_lower)
+    {
         info!("Matched device by exact name: '{}'", matched.name);
         return Some(matched);
     }
@@ -329,11 +342,7 @@ mod tests {
         let devs = sample_devices();
         let default_dev = devs.iter().find(|d| d.is_default);
 
-        let resolved = resolve_device(
-            Some("hyperx solocast usb microphone"),
-            &devs,
-            default_dev,
-        );
+        let resolved = resolve_device(Some("hyperx solocast usb microphone"), &devs, default_dev);
         assert_eq!(resolved.unwrap().name, "HyperX SoloCast USB Microphone");
     }
 

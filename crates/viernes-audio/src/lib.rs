@@ -15,8 +15,8 @@ pub mod vad;
 
 pub use capture::{AudioCaptureConfig, CpalAudioCapture, FakeAudioCapture};
 pub use devices::{
-    resolve_device, resolve_input_device_from_env, resolve_output_device_from_env,
-    AudioDeviceInfo, CpalDeviceEnumerator, DeviceEnumerator, MockDeviceEnumerator,
+    resolve_device, resolve_input_device_from_env, resolve_output_device_from_env, AudioDeviceInfo,
+    CpalDeviceEnumerator, DeviceEnumerator, MockDeviceEnumerator,
 };
 pub use ptt::{CaptureArbitrationMode, MockPttListener, PttArbitrator, PttEvent, PttListener};
 pub use resample::{downmix_to_mono, process_to_16k_mono, resample_linear};
@@ -89,7 +89,10 @@ impl<C: AudioCapture, S: SpeechToText> AudioPipeline<C, S> {
                         }
                         Err(e) => {
                             error!("AudioPipeline: STT transcription error: {e}");
-                            let _ = self.event_tx.send(SystemEvent::SystemError(e.to_string())).await;
+                            let _ = self
+                                .event_tx
+                                .send(SystemEvent::SystemError(e.to_string()))
+                                .await;
                         }
                     }
                 }
@@ -121,7 +124,10 @@ impl<C: AudioCapture, S: SpeechToText> AudioPipeline<C, S> {
                             }
                         }
                         Err(e) => {
-                            let _ = self.event_tx.send(SystemEvent::SystemError(e.to_string())).await;
+                            let _ = self
+                                .event_tx
+                                .send(SystemEvent::SystemError(e.to_string()))
+                                .await;
                         }
                     }
                 }

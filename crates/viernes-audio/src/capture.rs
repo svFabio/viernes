@@ -147,7 +147,9 @@ impl AudioCapture for CpalAudioCapture {
                 let dev_res = if let Some(ref name) = device_name {
                     host.input_devices()
                         .ok()
-                        .and_then(|mut devs| devs.find(|d| d.name().map(|n| &n == name).unwrap_or(false)))
+                        .and_then(|mut devs| {
+                            devs.find(|d| d.name().map(|n| &n == name).unwrap_or(false))
+                        })
                         .or_else(|| host.default_input_device())
                 } else {
                     host.default_input_device()
@@ -168,36 +170,37 @@ impl AudioCapture for CpalAudioCapture {
                     buffer_size: cpal::BufferSize::Default,
                 };
 
-                let (stream_config, sample_format, needs_resample) =
-                    match device.supported_input_configs() {
-                        Ok(mut configs) => {
-                            let direct_match = configs.any(|c| {
-                                c.channels() == 1
-                                    && c.min_sample_rate() <= target_rate
-                                    && c.max_sample_rate() >= target_rate
-                                    && c.sample_format() == SampleFormat::F32
-                            });
+                let (stream_config, sample_format, needs_resample) = match device
+                    .supported_input_configs()
+                {
+                    Ok(mut configs) => {
+                        let direct_match = configs.any(|c| {
+                            c.channels() == 1
+                                && c.min_sample_rate() <= target_rate
+                                && c.max_sample_rate() >= target_rate
+                                && c.sample_format() == SampleFormat::F32
+                        });
 
-                            if direct_match {
-                                (desired_config, SampleFormat::F32, false)
-                            } else {
-                                match device.default_input_config() {
-                                    Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
-                                    Err(e) => {
-                                        let _ = init_tx.send(Err(format!("Default config error: {e}")));
-                                        return;
-                                    }
+                        if direct_match {
+                            (desired_config, SampleFormat::F32, false)
+                        } else {
+                            match device.default_input_config() {
+                                Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
+                                Err(e) => {
+                                    let _ = init_tx.send(Err(format!("Default config error: {e}")));
+                                    return;
                                 }
                             }
                         }
-                        Err(_) => match device.default_input_config() {
-                            Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
-                            Err(e) => {
-                                let _ = init_tx.send(Err(format!("Default config error: {e}")));
-                                return;
-                            }
-                        },
-                    };
+                    }
+                    Err(_) => match device.default_input_config() {
+                        Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
+                        Err(e) => {
+                            let _ = init_tx.send(Err(format!("Default config error: {e}")));
+                            return;
+                        }
+                    },
+                };
 
                 let from_rate = stream_config.sample_rate.0;
                 let channels = stream_config.channels;
@@ -277,11 +280,7 @@ impl AudioCapture for CpalAudioCapture {
                 let _ = init_tx.send(Ok(()));
 
                 // Wait until termination command arrives
-                while let Ok(cmd) = cmd_rx.recv() {
-                    match cmd {
-                        AudioWorkerCommand::Stop => break,
-                    }
-                }
+                let _ = cmd_rx.recv();
 
                 drop(stream);
                 running_flag.store(false, Ordering::SeqCst);

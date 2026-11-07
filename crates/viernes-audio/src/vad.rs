@@ -61,7 +61,8 @@ impl VoiceActivityDetector {
     /// Creates a new `VoiceActivityDetector` instance.
     #[must_use]
     pub fn new(sample_rate: u32, threshold: f32, silence_timeout_ms: u64) -> Self {
-        let min_speech_samples = ((sample_rate as f64) * (Self::MIN_SPEECH_DURATION_MS as f64 / 1000.0)) as usize;
+        let min_speech_samples =
+            ((sample_rate as f64) * (Self::MIN_SPEECH_DURATION_MS as f64 / 1000.0)) as usize;
         let max_speech_samples = (sample_rate as usize) * (Self::MAX_SPEECH_DURATION_SECS as usize);
         // Retain 100ms of pre-roll to avoid clipping leading consonants
         let pre_roll_capacity = ((sample_rate as f64) * 0.100) as usize;
@@ -83,7 +84,10 @@ impl VoiceActivityDetector {
 
     /// Dynamically reconfigures the RMS sensitivity threshold on the fly.
     pub fn set_threshold(&mut self, new_threshold: f32) {
-        info!("Updated VAD threshold from {} to {}", self.threshold, new_threshold);
+        info!(
+            "Updated VAD threshold from {} to {}",
+            self.threshold, new_threshold
+        );
         self.threshold = new_threshold;
     }
 
@@ -118,9 +122,8 @@ impl VoiceActivityDetector {
         let rms = compute_rms(chunk);
         let is_voice = rms >= self.threshold;
 
-        let silence_threshold_samples = ((self.sample_rate as f64)
-            * (self.silence_timeout_ms as f64 / 1000.0))
-            as usize;
+        let silence_threshold_samples =
+            ((self.sample_rate as f64) * (self.silence_timeout_ms as f64 / 1000.0)) as usize;
 
         match self.state {
             VadState::Silence => {
@@ -134,7 +137,10 @@ impl VoiceActivityDetector {
                 if is_voice {
                     self.consecutive_voice_frames += 1;
                     if self.consecutive_voice_frames >= Self::CONSECUTIVE_FRAMES_TRIGGER {
-                        info!("VAD: Voice onset detected (RMS: {:.4} >= {:.4})", rms, self.threshold);
+                        info!(
+                            "VAD: Voice onset detected (RMS: {:.4} >= {:.4})",
+                            rms, self.threshold
+                        );
                         self.state = VadState::Speech;
                         self.consecutive_voice_frames = 0;
                         self.accumulated_silence_samples = 0;
@@ -161,7 +167,9 @@ impl VoiceActivityDetector {
 
                 // Check 20-second safety cutoff limit
                 if self.speech_buffer.len() >= self.max_speech_samples {
-                    info!("VAD: Max safety cutoff reached (20s limit exceeded); forcing segment cut");
+                    info!(
+                        "VAD: Max safety cutoff reached (20s limit exceeded); forcing segment cut"
+                    );
                     let final_buffer = std::mem::take(&mut self.speech_buffer);
                     self.reset();
                     events.push(VadEvent::VoiceFinished(final_buffer));
@@ -170,8 +178,13 @@ impl VoiceActivityDetector {
 
                 // Check sustained silence timeout
                 if self.accumulated_silence_samples >= silence_threshold_samples {
-                    // Check if speech segment exceeds minimum click threshold (250ms)
-                    if self.speech_buffer.len() >= self.min_speech_samples {
+                    // Check if voiced speech segment exceeds minimum click threshold (250ms)
+                    let voiced_samples = self
+                        .speech_buffer
+                        .len()
+                        .saturating_sub(self.accumulated_silence_samples);
+
+                    if voiced_samples >= self.min_speech_samples {
                         info!(
                             "VAD: Silence timeout reached ({} ms); completed segment with {} samples",
                             self.silence_timeout_ms,
@@ -182,8 +195,8 @@ impl VoiceActivityDetector {
                         events.push(VadEvent::VoiceFinished(final_buffer));
                     } else {
                         debug!(
-                            "VAD: Discarding spurious click (< 250ms duration: {} samples)",
-                            self.speech_buffer.len()
+                            "VAD: Discarding spurious click (< 250ms duration: {} voiced samples)",
+                            voiced_samples
                         );
                         self.reset();
                     }
@@ -241,7 +254,10 @@ mod tests {
         let mut finished_event = None;
         for _ in 0..20 {
             let evs = vad.feed_chunk(&silence_frame);
-            if let Some(ev) = evs.into_iter().find(|e| matches!(e, VadEvent::VoiceFinished(_))) {
+            if let Some(ev) = evs
+                .into_iter()
+                .find(|e| matches!(e, VadEvent::VoiceFinished(_)))
+            {
                 finished_event = Some(ev);
                 break;
             }
@@ -300,13 +316,19 @@ mod tests {
         let mut cut_event = None;
         for _ in 0..20 {
             let evs = vad.feed_chunk(&voice_chunk);
-            if let Some(ev) = evs.into_iter().find(|e| matches!(e, VadEvent::VoiceFinished(_))) {
+            if let Some(ev) = evs
+                .into_iter()
+                .find(|e| matches!(e, VadEvent::VoiceFinished(_)))
+            {
                 cut_event = Some(ev);
                 break;
             }
         }
 
-        assert!(cut_event.is_some(), "Safety cutoff must trigger at 20 seconds");
+        assert!(
+            cut_event.is_some(),
+            "Safety cutoff must trigger at 20 seconds"
+        );
         assert_eq!(vad.state(), VadState::Silence);
     }
 }

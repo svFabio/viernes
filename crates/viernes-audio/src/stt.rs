@@ -169,7 +169,10 @@ impl SpeechToText for LocalWhisperTranscriber {
 
             // In production with whisper.cpp binary bindings, compute here.
             // When running without model file or in tests, error is cleanly caught.
-            Ok(format!("Inference executed on {} samples", samples_vec.len()))
+            Ok(format!(
+                "Inference executed on {} samples",
+                samples_vec.len()
+            ))
         })
         .await
         .map_err(|e| ViernesError::Stt(format!("STT compute task panicked or cancelled: {e}")))?;
