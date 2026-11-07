@@ -66,34 +66,53 @@ impl<'a> Widget for SpectrumWidget<'a> {
             inner.bottom() - 1
         };
 
-        let num_bars = (inner.width as usize).min(self.amplitudes.len());
-        let x_offset = inner.x + ((inner.width - num_bars as u16) / 2);
+        let bar_width: u16 = if inner.width > 100 { 2 } else { 1 };
+        let bar_gap: u16 = 1;
+        let step = bar_width + bar_gap;
+        let num_bars = ((inner.width.saturating_sub(1)) / step).max(1) as usize;
+        let total_drawn_width = (num_bars as u16 * step).saturating_sub(bar_gap);
+        let x_offset = inner.x + ((inner.width.saturating_sub(total_drawn_width)) / 2);
         let max_height = bar_height as f32;
 
-        for (i, &amp) in self.amplitudes.iter().take(num_bars).enumerate() {
-            let col_x = x_offset + i as u16;
+        for bar_idx in 0..num_bars {
+            let amp = if !self.amplitudes.is_empty() {
+                let norm = bar_idx as f32 / num_bars as f32;
+                let src_idx = (norm * (self.amplitudes.len() - 1) as f32).round() as usize;
+                self.amplitudes[src_idx.min(self.amplitudes.len() - 1)]
+            } else {
+                0.05
+            };
+
+            let col_x_start = x_offset + (bar_idx as u16 * step);
             let bar_height_units = amp.clamp(0.0, 1.0) * max_height;
             let full_cells = bar_height_units.floor() as u16;
             let remainder = bar_height_units - full_cells as f32;
 
-            // Render from bottom up
-            for cell_y in 0..bar_height {
-                let y = base_y.saturating_sub(cell_y);
+            for w in 0..bar_width {
+                let col_x = col_x_start + w;
+                if col_x >= inner.right() {
+                    continue;
+                }
 
-                if let Some(cell) = buf.cell_mut((col_x, y)) {
-                    if cell_y < full_cells {
-                        // Full block
-                        let style = bar_style(cell_y, bar_height, self.state);
-                        cell.set_char('█').set_style(style);
-                    } else if cell_y == full_cells && remainder > 0.05 {
-                        // Fractional sub-block
-                        let block_idx = ((remainder * 8.0).floor() as usize).min(7);
-                        let char_to_draw = BLOCK_CHARS[block_idx];
-                        let style = bar_style(cell_y, bar_height, self.state);
-                        cell.set_char(char_to_draw).set_style(style);
-                    } else {
-                        // Empty space above bar
-                        cell.set_char(' ');
+                // Render from bottom up
+                for cell_y in 0..bar_height {
+                    let y = base_y.saturating_sub(cell_y);
+
+                    if let Some(cell) = buf.cell_mut((col_x, y)) {
+                        if cell_y < full_cells {
+                            // Full block
+                            let style = bar_style(cell_y, bar_height, self.state);
+                            cell.set_char('█').set_style(style);
+                        } else if cell_y == full_cells && remainder > 0.05 {
+                            // Fractional sub-block
+                            let block_idx = ((remainder * 8.0).floor() as usize).min(7);
+                            let char_to_draw = BLOCK_CHARS[block_idx];
+                            let style = bar_style(cell_y, bar_height, self.state);
+                            cell.set_char(char_to_draw).set_style(style);
+                        } else {
+                            // Empty space above bar
+                            cell.set_char(' ');
+                        }
                     }
                 }
             }

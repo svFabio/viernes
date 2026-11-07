@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
 use ratatui::Frame;
 use viernes_core::config::ViernesConfig;
-use viernes_core::state::SystemState;
+use viernes_core::state::{DaemonLiveStatus, SystemState};
 
 use crate::tui::views::credentials::{CredentialsAction, CredentialsView};
 use crate::tui::views::devices::DevicesView;
@@ -133,6 +133,14 @@ pub struct TuiApp {
 
     /// Global status notification message.
     pub status_line: Option<String>,
+    /// Last synchronized turn counter from daemon status snapshot.
+    pub last_synced_turn: u64,
+    /// Timestamp of last PTT toggle to debounce key repeat events.
+    pub last_ptt_toggle: std::time::Instant,
+    /// Last recorded terminal width for responsive layout and click mapping.
+    pub last_terminal_width: u16,
+    /// Last recorded terminal height for responsive layout and click mapping.
+    pub last_terminal_height: u16,
 }
 
 /// Convenience alias for `TuiApp`.
@@ -146,19 +154,31 @@ impl Default for TuiApp {
 
 impl TuiApp {
     /// Number of frequency bars displayed in the spectrum soundwave.
-    pub const SPECTRUM_BAR_COUNT: usize = 32;
+    pub const SPECTRUM_BAR_COUNT: usize = 64;
 
     /// Constructs a new `TuiApp` instance.
     #[must_use]
     pub fn new(config: Option<ViernesConfig>) -> Self {
-        let initial_turns = vec![
-            ConversationTurn::new(
-                Speaker::System,
-                "Viernes Terminal Dashboard v0.1.0 inicializado. Listo.",
-            ),
-            ConversationTurn::new(Speaker::User, "¿Qué hora es en Tokio?"),
-            ConversationTurn::new(Speaker::Viernes, "Son las 5 de la mañana en Tokio, señor."),
-        ];
+        let mut initial_turns = vec![ConversationTurn::new(
+            Speaker::System,
+            "Viernes Terminal Dashboard v0.1.0 inicializado. Listo.",
+        )];
+
+        let mut assistant_state = SystemState::Idle;
+        let mut last_synced_turn = 0;
+        if let Some(status) = DaemonLiveStatus::read_from_disk() {
+            assistant_state = status.state;
+            last_synced_turn = status.turn_counter;
+            if !status.last_user_prompt.is_empty() {
+                initial_turns.push(ConversationTurn::new(Speaker::User, status.last_user_prompt));
+            }
+            if !status.last_assistant_text.is_empty() {
+                initial_turns.push(ConversationTurn::new(
+                    Speaker::Viernes,
+                    status.last_assistant_text,
+                ));
+            }
+        }
 
         let daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
 
@@ -168,7 +188,7 @@ impl TuiApp {
             tick_count: 0,
             credentials_view: CredentialsView::new(config.clone()),
             config: config.clone(),
-            assistant_state: SystemState::Idle,
+            assistant_state,
             spectrum_bars: vec![0.05; Self::SPECTRUM_BAR_COUNT],
             turns: initial_turns,
             ptt_active: false,
@@ -177,6 +197,10 @@ impl TuiApp {
             devices_view: DevicesView::new(),
             service_view: ServiceView::new(),
             status_line: Some("Viernes TUI Dashboard inicializado".into()),
+            last_synced_turn,
+            last_ptt_toggle: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            last_terminal_width: 80,
+            last_terminal_height: 24,
         }
     }
 
@@ -194,30 +218,84 @@ impl TuiApp {
     pub fn on_tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
 
-        // Periodically verify background daemon socket connectivity (~once every second)
-        if self.tick_count.is_multiple_of(30) {
-            self.daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
+        // Periodically verify background daemon status and socket connectivity
+        if self.tick_count % 3 == 0 {
+            if let Some(status) = DaemonLiveStatus::read_from_disk() {
+                self.daemon_connected = true;
+                if !self.ptt_active {
+                    self.assistant_state = status.state;
+                }
+
+                if status.turn_counter > self.last_synced_turn {
+                    if !status.last_user_prompt.is_empty() {
+                        self.add_turn(Speaker::User, status.last_user_prompt.clone());
+                    }
+                    if !status.last_assistant_text.is_empty() {
+                        self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                    }
+                    self.last_synced_turn = status.turn_counter;
+                } else if self.assistant_state == SystemState::Speaking
+                    && !status.last_assistant_text.is_empty()
+                {
+                    // Update streaming response
+                    if let Some(last) = self.turns.last_mut() {
+                        if last.speaker == Speaker::Viernes {
+                            last.text = status.last_assistant_text.clone();
+                        } else {
+                            self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                        }
+                    }
+                }
+            } else if self.tick_count.is_multiple_of(30) {
+                self.daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
+            }
         }
 
         // Update soundwave spectrum based on assistant state
+        let bar_count = self.spectrum_bars.len();
         if self.assistant_state == SystemState::Speaking {
-            let t = (self.tick_count as f32) * 0.15;
-            for i in 0..Self::SPECTRUM_BAR_COUNT {
-                let fi = i as f32;
-                let wave1 = ((fi * 0.4 + t).sin() * 0.5 + 0.5).powi(2);
-                let wave2 = ((fi * 0.8 - t * 1.5).cos() * 0.5 + 0.5) * 0.6;
-                let wave3 = (((fi + t) * 1.2).sin() * 0.5 + 0.5) * 0.4;
-                let height = (wave1 + wave2 + wave3) / 2.0;
+            let t = (self.tick_count as f32) * 0.22;
+            for i in 0..bar_count {
+                let fi = i as f32 / bar_count as f32;
+                let formant1 = (-(fi - 0.20).powi(2) / 0.03).exp();
+                let formant2 = (-(fi - 0.52).powi(2) / 0.05).exp() * 0.85;
+                let formant3 = (-(fi - 0.76).powi(2) / 0.04).exp() * 0.5;
+                let envelope = (formant1 + formant2 + formant3).clamp(0.1, 1.2);
+
+                let wave1 = (fi * 14.0 + t).sin() * 0.5 + 0.5;
+                let wave2 = (fi * 28.0 - t * 1.8).cos() * 0.5 + 0.5;
+                let wave3 = ((fi * 7.0 + t * 0.8).sin()).abs();
+
+                let dynamic_amp = (wave1 * 0.45 + wave2 * 0.35 + wave3 * 0.20) * envelope;
+                let target_height = (0.2 + dynamic_amp * 0.8).clamp(0.08, 0.98);
                 self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.3 + height * 0.7).clamp(0.05, 1.0);
+                    (self.spectrum_bars[i] * 0.35 + target_height * 0.65).clamp(0.05, 1.0);
+            }
+        } else if self.assistant_state == SystemState::Listening {
+            let t = (self.tick_count as f32) * 0.20;
+            for i in 0..bar_count {
+                let fi = i as f32 / bar_count as f32;
+                let wave = ((fi * 10.0 + t).sin() * 0.5 + 0.5) * 0.5 + 0.1;
+                self.spectrum_bars[i] =
+                    (self.spectrum_bars[i] * 0.4 + wave * 0.6).clamp(0.05, 0.7);
+            }
+        } else if self.assistant_state == SystemState::Thinking {
+            let t = (self.tick_count as f32) * 0.12;
+            let pulse = (t.sin() * 0.5 + 0.5) * 0.4 + 0.08;
+            for i in 0..bar_count {
+                let fi = i as f32 / bar_count as f32;
+                let wave = (fi * 6.0 - t).cos().abs() * 0.25 + pulse * 0.75;
+                self.spectrum_bars[i] =
+                    (self.spectrum_bars[i] * 0.5 + wave * 0.5).clamp(0.05, 0.55);
             }
         } else {
             // Quiescent idle baseline wave
             let t = (self.tick_count as f32) * 0.05;
-            for i in 0..Self::SPECTRUM_BAR_COUNT {
-                let wave = ((i as f32 * 0.2 + t).sin() * 0.5 + 0.5) * 0.08 + 0.02;
+            for i in 0..bar_count {
+                let fi = i as f32 / bar_count as f32;
+                let wave = ((fi * 4.0 + t).sin() * 0.5 + 0.5) * 0.06 + 0.02;
                 self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.8 + wave * 0.2).clamp(0.01, 0.15);
+                    (self.spectrum_bars[i] * 0.8 + wave * 0.2).clamp(0.01, 0.12);
             }
         }
 
@@ -236,8 +314,70 @@ impl TuiApp {
         }
     }
 
+    /// Toggles Push-to-Talk recording state cleanly with debouncing.
+    pub async fn toggle_ptt(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_ptt_toggle) < std::time::Duration::from_millis(250) {
+            return;
+        }
+        self.last_ptt_toggle = now;
+
+        if !self.ptt_active {
+            // Start recording (Habilitar micrófono)
+            self.ptt_active = true;
+            self.assistant_state = SystemState::Listening;
+            self.status_line =
+                Some("Micrófono activado. Habla ahora... (Espacio/Enter o Click para enviar)".into());
+            let _ = send_ipc_ptt("press").await;
+        } else {
+            // Stop recording & send for processing
+            self.ptt_active = false;
+            self.assistant_state = SystemState::Thinking;
+            self.status_line = Some("Audio enviado. Procesando en Antigravity...".into());
+            let _ = send_ipc_ptt("release").await;
+        }
+    }
+
+    /// Handles mouse click events across navigation tabs and interactive controls.
+    pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind {
+            let col = mouse.column;
+            let row = mouse.row;
+
+            // 1. Click on Tab Header (row 0, 1, or 2)
+            if row <= 2 {
+                if col < 16 {
+                    self.active_tab = ActiveTab::Monitor;
+                } else if col < 32 {
+                    self.active_tab = ActiveTab::VoiceAndKeys;
+                } else if col < 51 {
+                    self.active_tab = ActiveTab::Fillers;
+                } else if col < 64 {
+                    self.active_tab = ActiveTab::AudioDevices;
+                } else {
+                    self.active_tab = ActiveTab::ServiceAndLogs;
+                }
+                return;
+            }
+
+            // 2. Click in Tab 1: Monitor -> PTT Bar at bottom
+            if self.active_tab == ActiveTab::Monitor {
+                let ptt_zone_start = self.last_terminal_height.saturating_sub(5);
+                if row >= ptt_zone_start {
+                    self.toggle_ptt().await;
+                }
+            }
+        }
+    }
+
     /// Dispatches a key event according to active tab and global shortcuts.
     pub async fn handle_key(&mut self, key: KeyEvent) {
+        // Drop OS/terminal key repeat to prevent rapid on/off toggling while holding down Space
+        if key.kind == KeyEventKind::Repeat {
+            return;
+        }
         if key.kind != KeyEventKind::Press {
             return;
         }
@@ -316,17 +456,7 @@ impl TuiApp {
         match self.active_tab {
             ActiveTab::Monitor => match key.code {
                 KeyCode::Char(' ') | KeyCode::Enter => {
-                    if !self.ptt_active {
-                        // Key down -> Start recording
-                        self.ptt_active = true;
-                        self.assistant_state = SystemState::Listening;
-                        let _ = send_ipc_ptt("press").await;
-                    } else {
-                        // Key released -> Stop recording
-                        self.ptt_active = false;
-                        self.assistant_state = SystemState::Thinking;
-                        let _ = send_ipc_ptt("release").await;
-                    }
+                    self.toggle_ptt().await;
                 }
                 KeyCode::Esc => {
                     if self.ptt_active
@@ -392,6 +522,8 @@ impl TuiApp {
     /// Renders the complete dashboard layout inside the terminal frame.
     pub fn render(&mut self, f: &mut Frame) {
         let area = f.area();
+        self.last_terminal_width = area.width;
+        self.last_terminal_height = area.height;
 
         // ST-RUST-29.3: Enforce minimum terminal dimensions (80x24)
         if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
@@ -592,6 +724,9 @@ mod tests {
             .await;
         assert!(app.ptt_active);
         assert_eq!(app.assistant_state, SystemState::Listening);
+
+        // Advance beyond debounce window
+        tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
         // Press Enter -> PTT inactive / Thinking
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))

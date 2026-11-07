@@ -35,6 +35,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: TuiApp) ->
                         CrosstermEvent::Key(key) => {
                             app.handle_key(key).await;
                         }
+                        CrosstermEvent::Mouse(mouse) => {
+                            app.handle_mouse(mouse).await;
+                        }
                         CrosstermEvent::Resize(_, _) => {
                             // Automatic re-render on next cycle
                         }

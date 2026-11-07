@@ -18,6 +18,7 @@ use viernes_brain::fillers::FillerCacheManager;
 use viernes_brain::tokenizer::SentenceTokenizer;
 use viernes_core::config::ViernesConfig;
 use viernes_core::events::SystemEvent;
+use viernes_core::state::{DaemonLiveStatus, SystemState};
 use viernes_core::state_machine::StateMachine;
 use viernes_core::traits::{AudioCapture, AudioPlayback, SpeechToText};
 use viernes_tts::player::StreamingAudioPlayer;
@@ -244,23 +245,44 @@ async fn run_daemon_loop(
         warn!("PTT IPC server failed to start: {e}");
     }
 
-    // 6. Signal Handlers
+    // 6. Live Status Tracker for CLI & TUI
+    let live_status = Arc::new(tokio::sync::Mutex::new(DaemonLiveStatus {
+        state: SystemState::Idle,
+        last_user_prompt: String::new(),
+        last_assistant_text: String::new(),
+        turn_counter: 0,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    }));
+    let _ = live_status.lock().await.write_to_disk();
+
+    // 7. Signal Handlers
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     info!("Viernes Reactive Voice Pipeline listening. Press Ctrl+C or send SIGTERM to terminate.");
 
-    // 7. Background transition logger task
+    // 8. Background transition logger and live status sync task
+    let status_tracker = live_status.clone();
     tokio::spawn(async move {
         while let Ok(record) = transition_rx.recv().await {
             info!(
                 "Lifecycle Transition: {} -> {} (trigger: {:?})",
                 record.from_state, record.to_state, record.trigger_event
             );
+            let mut st = status_tracker.lock().await;
+            st.state = record.to_state;
+            st.timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let _ = st.write_to_disk();
         }
     });
 
-    // 8. Main event processing loop with Acoustic Echo Suppression
+    // 9. Main event processing loop with Acoustic Echo Suppression
     let mut chunk_interval = tokio::time::interval(std::time::Duration::from_millis(20));
     let mut ptt_active = false;
     let mut playback_cooldown_until = std::time::Instant::now();
@@ -311,6 +333,7 @@ async fn run_daemon_loop(
                                 let player_turn = player.clone();
                                 let fillers_turn = fillers_mgr.clone();
                                 let brain_turn = brain_client.clone();
+                                let status_turn = live_status.clone();
                                 tokio::spawn(async move {
                                     process_speech_turn(
                                         pcm_buffer,
@@ -319,6 +342,7 @@ async fn run_daemon_loop(
                                         player_turn,
                                         fillers_turn,
                                         brain_turn,
+                                        status_turn,
                                     ).await;
                                 });
                             }
@@ -384,6 +408,7 @@ async fn run_daemon_loop(
                                     let player_turn = player.clone();
                                     let fillers_turn = fillers_mgr.clone();
                                     let brain_turn = brain_client.clone();
+                                    let status_turn = live_status.clone();
                                     tokio::spawn(async move {
                                         process_speech_turn(
                                             pcm_buffer,
@@ -392,6 +417,7 @@ async fn run_daemon_loop(
                                             player_turn,
                                             fillers_turn,
                                             brain_turn,
+                                            status_turn,
                                         ).await;
                                     });
                                 }
@@ -420,6 +446,7 @@ async fn process_speech_turn(
     player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
     fillers: Arc<FillerCacheManager>,
     brain: Arc<tokio::sync::Mutex<Option<AntigravityClient>>>,
+    status: Arc<tokio::sync::Mutex<DaemonLiveStatus>>,
 ) {
     let transcriber = LocalWhisperTranscriber::new(WhisperConfig::default());
     let prompt = match transcriber {
@@ -443,6 +470,17 @@ async fn process_speech_turn(
     }
 
     info!("STT Result: '{}'", prompt);
+    {
+        let mut st = status.lock().await;
+        st.last_user_prompt = prompt.clone();
+        st.last_assistant_text.clear();
+        st.turn_counter += 1;
+        st.timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = st.write_to_disk();
+    }
     let _ = sm
         .dispatch(SystemEvent::TranscriptReady(prompt.clone()))
         .await;
@@ -473,6 +511,7 @@ async fn process_speech_turn(
     let tts_worker = tts.clone();
     let player_worker = player.clone();
     let sm_worker = sm.clone();
+    let status_worker = status.clone();
     let synthesis_worker = tokio::spawn(async move {
         while let Some(sentence) = rx.recv().await {
             let trimmed = sentence.trim();
@@ -480,6 +519,20 @@ async fn process_speech_turn(
                 continue;
             }
             info!("Synthesizing sentence: '{}'", trimmed);
+            {
+                let mut st = status_worker.lock().await;
+                if st.last_assistant_text.is_empty() {
+                    st.last_assistant_text = trimmed.to_string();
+                } else {
+                    st.last_assistant_text.push(' ');
+                    st.last_assistant_text.push_str(trimmed);
+                }
+                st.timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let _ = st.write_to_disk();
+            }
             let _ = sm_worker
                 .dispatch(SystemEvent::SentenceReady(trimmed.to_string()))
                 .await;
@@ -589,6 +642,20 @@ async fn process_speech_turn(
     let _ = tokenizer.flush().await;
     drop(tokenizer);
     let _ = synthesis_worker.await;
+
+    // Drain until player finishes speaking so assistant_state remains Speaking while audio is audible
+    loop {
+        let is_playing = if let Ok(p) = player.try_lock() {
+            p.is_playing()
+        } else {
+            false
+        };
+        if !is_playing {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
     let _ = sm.dispatch(SystemEvent::PlaybackFinished).await;
 }
 

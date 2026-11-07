@@ -67,7 +67,7 @@ impl Widget for PttWidget {
             )
         } else if self.ptt_active || self.state == SystemState::Listening {
             (
-                "[● ESCUCHANDO...] (Suelta Espacio / Enter para enviar)",
+                "[● ESCUCHANDO...] (Presiona Espacio / Enter o Click para enviar)",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
@@ -92,7 +92,7 @@ impl Widget for PttWidget {
             )
         } else {
             (
-                "[ MANTÉN ESPACIO / ENTER PARA HABLAR ] ─── (Simula Super+V)",
+                "[ PRESIONA ESPACIO / ENTER O CLICK PARA HABLAR ] ─── (Simula Super+V)",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -132,7 +132,7 @@ mod tests {
             })
             .unwrap();
         let buffer_str = format!("{:?}", terminal.backend().buffer());
-        assert!(buffer_str.contains("MANTÉN ESPACIO / ENTER PARA HABLAR"));
+        assert!(buffer_str.contains("PRESIONA ESPACIO / ENTER O CLICK PARA HABLAR"));
 
         // 2. Active recording
         terminal

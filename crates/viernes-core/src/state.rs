@@ -72,6 +72,59 @@ impl SystemState {
     }
 }
 
+/// Canonical file path where the daemon writes its live status for CLI and TUI.
+pub const DAEMON_STATUS_FILE: &str = "/tmp/viernes_status.json";
+
+/// Real-time live status snapshot written by the daemon for external tools, CLI, and TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLiveStatus {
+    /// Current state of the daemon.
+    pub state: SystemState,
+    /// Last recognized user speech transcript.
+    pub last_user_prompt: String,
+    /// Last synthesized assistant response text.
+    pub last_assistant_text: String,
+    /// Monotonically increasing counter of conversation turns.
+    pub turn_counter: u64,
+    /// Unix timestamp in milliseconds when this status was emitted.
+    pub timestamp_ms: u64,
+}
+
+impl Default for DaemonLiveStatus {
+    fn default() -> Self {
+        Self {
+            state: SystemState::Idle,
+            last_user_prompt: String::new(),
+            last_assistant_text: String::new(),
+            turn_counter: 0,
+            timestamp_ms: 0,
+        }
+    }
+}
+
+impl DaemonLiveStatus {
+    /// Reads the current live status snapshot from `/tmp/viernes_status.json`.
+    #[must_use]
+    pub fn read_from_disk() -> Option<Self> {
+        let path = std::path::Path::new(DAEMON_STATUS_FILE);
+        if !path.exists() {
+            return None;
+        }
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Atomically writes this status snapshot to disk via temporary file rename.
+    pub fn write_to_disk(&self) -> Result<(), std::io::Error> {
+        let tmp_path = format!("{DAEMON_STATUS_FILE}.tmp.{}", std::process::id());
+        let content = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, DAEMON_STATUS_FILE)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
