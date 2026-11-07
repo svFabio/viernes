@@ -490,16 +490,20 @@ async fn process_speech_turn(
     let mut response_received = false;
 
     if let Some(ref mut client) = *brain_guard {
+        // Drain any residual stale lines from previous turns to prevent pipeline lag/desync
+        client.drain_residual_lines().await;
+
         if let Err(e) = client.send_prompt(&prompt).await {
             warn!("Failed to send prompt to resident Antigravity client: {e}");
         } else {
-            while let Ok(Some(event)) = client.next_event().await {
-                match event {
-                    BrainEvent::TextChunk { content } => {
+            let mut stream_failed = false;
+            loop {
+                match client.next_event().await {
+                    Ok(Some(BrainEvent::TextChunk { content })) => {
                         response_received = true;
                         let _ = tokenizer.feed_token(&content).await;
                     }
-                    BrainEvent::ToolCall { name, .. } => {
+                    Ok(Some(BrainEvent::ToolCall { name, .. })) => {
                         info!("Brain active tool call: '{}'", name);
                         // Strict limit: Maximum 2 fillers TOTAL per turn, spaced at least 3.5s apart
                         if total_fillers_played < 2
@@ -526,11 +530,37 @@ async fn process_speech_turn(
                             }
                         }
                     }
-                    BrainEvent::Done => {
+                    Ok(Some(BrainEvent::Done)) | Ok(None) => {
+                        break;
+                    }
+                    Err(err) => {
+                        warn!("Antigravity stream error/timeout: {err}; restarting resident process to prevent pipeline desync");
+                        stream_failed = true;
                         break;
                     }
                     _ => {}
                 }
+            }
+
+            if stream_failed {
+                let _ = client.terminate().await;
+                let agy_bin =
+                    std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+                let agy_model = std::env::var("VIERNES_AGY_MODEL")
+                    .unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
+                let agy_args = vec![
+                    "--model".to_string(),
+                    agy_model,
+                    "--effort".to_string(),
+                    "low".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                    "--disable-slash-commands".to_string(),
+                    "--input-format".to_string(),
+                    "stream-json".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ];
+                *brain_guard = AntigravityClient::spawn(&agy_bin, &agy_args).ok();
             }
         }
     }

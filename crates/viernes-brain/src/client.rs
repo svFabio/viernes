@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::BrainError;
 
-/// Inactivity timeout threshold for tokens stream (15 seconds).
-pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Inactivity timeout threshold for tokens stream (60 seconds).
+pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Graceful shutdown timeout before sending SIGKILL (3 seconds).
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -233,8 +233,16 @@ impl AntigravityClient {
         }
     }
 
-    /// Perform clean termination: SIGTERM -> wait up to 3 seconds -> SIGKILL if needed.
-    pub async fn shutdown(mut self) -> Result<(), BrainError> {
+    /// Drain any residual unconsumed lines left in the stdout stream buffer.
+    pub async fn drain_residual_lines(&mut self) {
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(10), self.lines_stream.next()).await
+        {
+        }
+    }
+
+    /// Terminate the child process cleanly with SIGTERM -> SIGKILL if needed.
+    pub async fn terminate(&mut self) -> Result<(), BrainError> {
         if let Some(pid_val) = self.child.id() {
             let pid = Pid::from_raw(pid_val as i32);
             info!(pid = %pid_val, "Terminating Antigravity process with SIGTERM");
@@ -252,6 +260,11 @@ impl AntigravityClient {
             }
         }
         Ok(())
+    }
+
+    /// Perform clean termination: SIGTERM -> wait up to 3 seconds -> SIGKILL if needed.
+    pub async fn shutdown(mut self) -> Result<(), BrainError> {
+        self.terminate().await
     }
 }
 
