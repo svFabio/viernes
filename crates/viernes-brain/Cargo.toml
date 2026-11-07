@@ -1,0 +1,30 @@
+[package]
+name = "viernes-brain"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Antigravity NDJSON client, sentence tokenizer, and session lifecycle manager for Viernes"
+
+[dependencies]
+viernes-core.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+regex.workspace = true
+chrono.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+nix.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[Unit]
+Description=Viernes Voice Assistant (Rust Native High-Performance Daemon)
+Documentation=https://github.com/svFabio/viernes
+After=default.target sound.target pipewire.service
+Wants=sound.target pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/09-viernes
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
+ExecStart=%h/Projects/09-viernes/target/release/viernes --daemon
+Restart=on-failure
+RestartSec=3s
+KillMode=process
+TimeoutStopSec=3s
+
+[Install]
+WantedBy=default.target
