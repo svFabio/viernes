@@ -4,6 +4,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tracing::{info, warn};
+
 use crate::error::TtsError;
 
 /// An individual API key entry with an exhausted marker.
@@ -137,10 +139,20 @@ impl KeyPool {
             let idx = (old_idx + 1 + offset) % total;
             if !self.keys[idx].is_exhausted() {
                 self.current_index.store(idx, Ordering::SeqCst);
+                info!(
+                    exhausted_key_idx = old_idx + 1,
+                    new_key_idx = idx + 1,
+                    total_keys = total,
+                    "Rotated ElevenLabs key pool to next non-exhausted key"
+                );
                 return Ok(self.keys[idx].key.clone());
             }
         }
 
+        warn!(
+            total_keys = total,
+            "All ElevenLabs API keys in pool have been exhausted"
+        );
         Err(TtsError::AllKeysExhausted(total))
     }
 
