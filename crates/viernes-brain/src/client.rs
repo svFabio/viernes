@@ -67,6 +67,8 @@ pub struct AntigravityClient {
     stdin: ChildStdin,
     lines_stream: LinesStream<BufReader<ChildStdout>>,
     binary_path: PathBuf,
+    active_conversation_id: Option<String>,
+    turns_sent: usize,
 }
 
 impl AntigravityClient {
@@ -74,6 +76,12 @@ impl AntigravityClient {
     #[must_use]
     pub fn binary_path(&self) -> &Path {
         &self.binary_path
+    }
+
+    /// Return the active conversation ID confirmed by Antigravity, if known.
+    #[must_use]
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.active_conversation_id.as_deref()
     }
 
     /// Spawn a new `antigravity-cli` child process with piped standard I/O streams.
@@ -107,6 +115,8 @@ impl AntigravityClient {
             stdin,
             lines_stream,
             binary_path: path_buf,
+            active_conversation_id: None,
+            turns_sent: 0,
         })
     }
 
@@ -115,21 +125,32 @@ impl AntigravityClient {
         let trimmed = prompt.trim();
         debug!(
             prompt_len = trimmed.len(),
+            turns_sent = self.turns_sent,
             "Writing prompt line to Antigravity stdin"
         );
         let payload = if trimmed.starts_with('{') && trimmed.ends_with('}') {
             format!("{}\n", trimmed)
         } else {
-            let full_prompt = format!("{}\n\n{}", VIERNES_SYSTEM_PROMPT, trimmed);
+            // For turn 1 of a session, provide concise voice persona instructions.
+            // Subsequent turns send only the user speech to preserve context and clean conversation titles.
+            let content = if self.turns_sent == 0 {
+                format!(
+                    "[Instrucciones de Voz: Sos Viernes, la asistente de voz del Señor. Respondé siempre en 1 o 2 oraciones breves para TTS, sin markdown ni viñetas, tratándolo exclusivamente como 'Señor'.]\n\n{}",
+                    trimmed
+                )
+            } else {
+                trimmed.to_string()
+            };
             let msg = serde_json::json!({
                 "event": "user",
                 "message": {
-                    "content": full_prompt
+                    "content": content
                 }
             });
             format!("{}\n", serde_json::to_string(&msg).unwrap_or_default())
         };
 
+        self.turns_sent += 1;
         self.stdin
             .write_all(payload.as_bytes())
             .await
@@ -154,6 +175,10 @@ impl AntigravityClient {
                         if let Some(event_str) = value.get("event").and_then(|v| v.as_str()) {
                             match event_str {
                                 "init" => {
+                                    if let Some(conv_id) = value.get("conversation_id").and_then(|v| v.as_str()) {
+                                        debug!(conversation_id = %conv_id, "Antigravity session confirmed");
+                                        self.active_conversation_id = Some(conv_id.to_string());
+                                    }
                                     continue;
                                 }
                                 "step_update" => {

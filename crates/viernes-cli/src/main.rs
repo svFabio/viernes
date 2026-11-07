@@ -15,6 +15,7 @@ use viernes_audio::stt::{LocalWhisperTranscriber, WhisperConfig};
 use viernes_audio::vad::{VadEvent, VoiceActivityDetector};
 use viernes_brain::client::{AntigravityClient, BrainEvent};
 use viernes_brain::fillers::FillerCacheManager;
+use viernes_brain::session::SessionPointerManager;
 use viernes_brain::tokenizer::SentenceTokenizer;
 use viernes_core::config::ViernesConfig;
 use viernes_core::events::SystemEvent;
@@ -157,8 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.new_conversation {
-        let new_id = uuid::Uuid::new_v4();
+        let mgr = SessionPointerManager::new(None::<&str>)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        let new_id = mgr.rotate_session().await?;
         info!("Dynamic session rotated successfully. New ID: {}", new_id);
+        println!("Viernes conversation session rotated to: {}", new_id);
+        return Ok(());
     }
 
     if args.benchmark {
@@ -227,11 +232,18 @@ async fn run_daemon_loop(
     }));
     info!("Conversational Fillers engine active (loaded from config).");
 
-    // 4. Resident Antigravity Brain Client
+    // 4. Session Pointer Manager & Resident Antigravity Brain Client
+    let session_mgr = Arc::new(
+        SessionPointerManager::new(None::<&str>)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+    );
+    let active_session_id = session_mgr.current_session_id().await;
+    info!("Active conversation session ID: {}", active_session_id);
+
     let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
     let agy_model =
         std::env::var("VIERNES_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
-    let agy_args = vec![
+    let mut agy_args = vec![
         "--model".to_string(),
         agy_model,
         "--effort".to_string(),
@@ -243,6 +255,10 @@ async fn run_daemon_loop(
         "--output-format".to_string(),
         "stream-json".to_string(),
     ];
+    if !active_session_id.is_empty() {
+        agy_args.push("--conversation".to_string());
+        agy_args.push(active_session_id);
+    }
     let brain_client: Arc<tokio::sync::Mutex<Option<AntigravityClient>>> =
         match AntigravityClient::spawn(&agy_bin, &agy_args) {
             Ok(client) => {
@@ -351,6 +367,7 @@ async fn run_daemon_loop(
                                 let fillers_turn = fillers_mgr.clone();
                                 let brain_turn = brain_client.clone();
                                 let status_turn = live_status.clone();
+                                let session_turn = session_mgr.clone();
                                 tokio::spawn(async move {
                                     process_speech_turn(
                                         pcm_buffer,
@@ -360,6 +377,7 @@ async fn run_daemon_loop(
                                         fillers_turn,
                                         brain_turn,
                                         status_turn,
+                                        session_turn,
                                     ).await;
                                 });
                             }
@@ -426,6 +444,7 @@ async fn run_daemon_loop(
                                     let fillers_turn = fillers_mgr.clone();
                                     let brain_turn = brain_client.clone();
                                     let status_turn = live_status.clone();
+                                    let session_turn = session_mgr.clone();
                                     tokio::spawn(async move {
                                         process_speech_turn(
                                             pcm_buffer,
@@ -435,6 +454,7 @@ async fn run_daemon_loop(
                                             fillers_turn,
                                             brain_turn,
                                             status_turn,
+                                            session_turn,
                                         ).await;
                                     });
                                 }
@@ -464,6 +484,7 @@ async fn process_speech_turn(
     fillers: Arc<FillerCacheManager>,
     brain: Arc<tokio::sync::Mutex<Option<AntigravityClient>>>,
     status: Arc<tokio::sync::Mutex<DaemonLiveStatus>>,
+    session_mgr: Arc<SessionPointerManager>,
 ) {
     let transcriber = LocalWhisperTranscriber::new(WhisperConfig::default());
     let prompt = match transcriber {
@@ -487,6 +508,77 @@ async fn process_speech_turn(
     }
 
     info!("STT Result: '{}'", prompt);
+
+    // 1. Explicit Session Rotation Intent Detection
+    if session_mgr.detects_rotation_intent(&prompt) {
+        info!("Explicit conversation rotation intent detected: '{}'", prompt);
+        let new_session_id = match session_mgr.rotate_session().await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Failed to rotate session: {e}");
+                uuid::Uuid::new_v4().to_string()
+            }
+        };
+
+        // Terminate active Antigravity process and spawn fresh session
+        let mut brain_guard = brain.lock().await;
+        if let Some(ref mut client) = *brain_guard {
+            let _ = client.terminate().await;
+        }
+        let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+        let agy_model = std::env::var("VIERNES_AGY_MODEL")
+            .unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
+        let new_args = vec![
+            "--model".to_string(),
+            agy_model,
+            "--effort".to_string(),
+            "low".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--disable-slash-commands".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--conversation".to_string(),
+            new_session_id,
+        ];
+        *brain_guard = AntigravityClient::spawn(&agy_bin, &new_args).ok();
+
+        let ack = "A la orden, Señor. Archivo la sesión actual e inicio una nueva conversación limpia.";
+        {
+            let mut st = status.lock().await;
+            st.last_user_prompt = prompt;
+            st.last_assistant_text = ack.to_string();
+            st.turn_counter += 1;
+            st.timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let _ = st.write_to_disk();
+        }
+        let _ = sm.dispatch(SystemEvent::SentenceReady(ack.to_string())).await;
+        let _ = sm.dispatch(SystemEvent::SpeakingStarted).await;
+        if let Ok(audio) = tts.synthesize_resilient(ack).await {
+            let mut p = player.lock().await;
+            let _ = p.enqueue_chunk(audio).await;
+        }
+        loop {
+            let is_playing = if let Ok(p) = player.try_lock() {
+                p.is_playing()
+            } else {
+                false
+            };
+            if !is_playing {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        let _ = sm.dispatch(SystemEvent::PlaybackFinished).await;
+        return;
+    }
+
+    let _ = session_mgr.increment_turn_count().await;
+
     {
         let mut st = status.lock().await;
         st.last_user_prompt = prompt.clone();
@@ -637,6 +729,9 @@ async fn process_speech_turn(
                         }
                     }
                     Ok(Some(BrainEvent::Done)) | Ok(None) => {
+                        if let Some(real_id) = client.conversation_id() {
+                            let _ = session_mgr.update_conversation_id(real_id).await;
+                        }
                         break;
                     }
                     Err(err) => {
@@ -654,7 +749,8 @@ async fn process_speech_turn(
                     std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
                 let agy_model = std::env::var("VIERNES_AGY_MODEL")
                     .unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
-                let agy_args = vec![
+                let current_id = session_mgr.current_session_id().await;
+                let mut agy_args = vec![
                     "--model".to_string(),
                     agy_model,
                     "--effort".to_string(),
@@ -666,6 +762,10 @@ async fn process_speech_turn(
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                 ];
+                if !current_id.is_empty() {
+                    agy_args.push("--conversation".to_string());
+                    agy_args.push(current_id);
+                }
                 *brain_guard = AntigravityClient::spawn(&agy_bin, &agy_args).ok();
             }
         }
@@ -683,6 +783,17 @@ async fn process_speech_turn(
     let _ = tokenizer.flush().await;
     drop(tokenizer);
     let _ = synthesis_worker.await;
+
+    // Proactive Context Warning: If turn count reaches threshold, suggest rotating cleanly
+    if session_mgr.should_suggest_rotation().await {
+        let suggestion = "Por cierto, Señor, esta conversación acumula bastante contexto. Si desea que iniciemos una nueva sesión limpia, solo pídamelo cuando guste.";
+        info!("Proactively suggesting session rotation due to high turn count");
+        let _ = sm.dispatch(SystemEvent::SentenceReady(suggestion.to_string())).await;
+        if let Ok(audio) = tts.synthesize_resilient(suggestion).await {
+            let mut p = player.lock().await;
+            let _ = p.enqueue_chunk(audio).await;
+        }
+    }
 
     // Drain until player finishes speaking so assistant_state remains Speaking while audio is audible
     loop {

@@ -17,11 +17,17 @@ use crate::error::BrainError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     /// Active session UUID.
+    #[serde(alias = "active_conversation_id")]
     pub current_session_id: String,
     /// Timestamp when current session was created.
+    #[serde(alias = "updated_at", default = "chrono::Utc::now")]
     pub created_at: DateTime<Utc>,
     /// History of past session UUIDs rotated out.
+    #[serde(alias = "history", default)]
     pub archived_sessions: Vec<String>,
+    /// Total voice turns conducted in current session.
+    #[serde(default)]
+    pub turn_count: u32,
 }
 
 impl Default for SessionState {
@@ -30,6 +36,7 @@ impl Default for SessionState {
             current_session_id: Uuid::new_v4().to_string(),
             created_at: Utc::now(),
             archived_sessions: Vec::new(),
+            turn_count: 0,
         }
     }
 }
@@ -53,7 +60,7 @@ impl SessionPointerManager {
         };
 
         // Regex pattern detecting rotation commands in Spanish
-        let pattern = r"(?i)\b(abre|inicia|comienza|empezar|abrir|iniciar)\s+(otra|una\s+nueva)\s+(conversaci[oó]n|charla|sesi[oó]n)\b|\b(nueva\s+conversaci[oó]n|resetear\s+sesi[oó]n)\b";
+        let pattern = r"(?i)\b(abre|inicia|comienza|empezar|abrir|iniciar|abrí|empezá)\s+(otra|una\s+nueva|de\s+cero)\s*(conversaci[oó]n|charla|sesi[oó]n)?\b|\b(nueva\s+conversaci[oó]n|nueva\s+sesi[oó]n|resetear\s+sesi[oó]n|limpiar\s+contexto|empezar\s+de\s+cero)\b";
         let rotation_regex = Regex::new(pattern)
             .map_err(|e| BrainError::Internal(format!("invalid regex pattern: {e}")))?;
 
@@ -87,7 +94,37 @@ impl SessionPointerManager {
         self.state.read().await.current_session_id.clone()
     }
 
-    /// Rotate session: generate new UUIDv4, archive old ID, and atomically persist.
+    /// Retrieve active turn count for this session.
+    pub async fn turn_count(&self) -> u32 {
+        self.state.read().await.turn_count
+    }
+
+    /// Increment turn count and atomically save.
+    pub async fn increment_turn_count(&self) -> Result<u32, BrainError> {
+        let mut guard = self.state.write().await;
+        guard.turn_count += 1;
+        let count = guard.turn_count;
+        self.save_atomic(&guard)?;
+        Ok(count)
+    }
+
+    /// Check if conversation context is getting long and we should proactively suggest rotating.
+    pub async fn should_suggest_rotation(&self) -> bool {
+        let guard = self.state.read().await;
+        guard.turn_count == 25 || guard.turn_count == 35 || guard.turn_count == 50
+    }
+
+    /// Atomically update active conversation ID if agy assigned a real ID on init.
+    pub async fn update_conversation_id(&self, new_id: &str) -> Result<(), BrainError> {
+        let mut guard = self.state.write().await;
+        if guard.current_session_id != new_id {
+            guard.current_session_id = new_id.to_string();
+            self.save_atomic(&guard)?;
+        }
+        Ok(())
+    }
+
+    /// Rotate session: generate new UUIDv4, archive old ID, reset turn count, and atomically persist.
     pub async fn rotate_session(&self) -> Result<String, BrainError> {
         let mut guard = self.state.write().await;
         let old_id = guard.current_session_id.clone();
@@ -102,6 +139,7 @@ impl SessionPointerManager {
         guard.archived_sessions.push(old_id);
         guard.current_session_id = new_id.clone();
         guard.created_at = Utc::now();
+        guard.turn_count = 0;
 
         self.save_atomic(&guard)?;
         Ok(new_id)
