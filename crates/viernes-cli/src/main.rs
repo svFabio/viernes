@@ -34,6 +34,10 @@ struct CliArgs {
     #[arg(short, long)]
     daemon: bool,
 
+    /// Continuously listen on microphone with VAD (default: Push-to-Talk only)
+    #[arg(short, long)]
+    continuous: bool,
+
     /// Force rotation to a clean new Antigravity conversation session
     #[arg(long)]
     new_conversation: bool,
@@ -135,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.daemon {
         info!("Starting Viernes Voice Assistant User Daemon...");
-        run_daemon_loop(&config).await?;
+        run_daemon_loop(&config, args.continuous).await?;
     } else {
         info!("Viernes initialized in single-execution mode. Use --daemon for background service.");
     }
@@ -144,12 +148,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Main non-blocking event loop listening for OS signals and driving the voice pipeline.
-async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon_loop(
+    config: &ViernesConfig,
+    continuous: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state_machine = Arc::new(StateMachine::new(256));
     let mut transition_rx = state_machine.subscribe_transitions();
     info!(
-        "Daemon initialized in state: {}",
-        state_machine.state().await
+        "Daemon initialized in state: {} (mode: {})",
+        state_machine.state().await,
+        if continuous {
+            "Continuous VAD"
+        } else {
+            "Push-to-Talk"
+        }
     );
 
     // 1. Audio Capture & VAD setup
@@ -236,8 +248,10 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
         }
     });
 
-    // 8. Main event processing loop
+    // 8. Main event processing loop with Acoustic Echo Suppression
     let mut chunk_interval = tokio::time::interval(std::time::Duration::from_millis(20));
+    let mut ptt_active = false;
+    let mut playback_cooldown_until = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -254,6 +268,7 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                     match ptt_event {
                         PttEvent::Pressed => {
                             info!("Push-to-Talk IPC event: Pressed");
+                            ptt_active = true;
                             let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
                             if let Ok(mut p) = player.try_lock() {
                                 if p.is_playing() {
@@ -265,6 +280,7 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                         }
                         PttEvent::Released => {
                             info!("Push-to-Talk IPC event: Released");
+                            ptt_active = false;
                             let _ = state_machine.dispatch(SystemEvent::PttReleased).await;
                             if let Some(pcm_buffer) = vad.force_finish() {
                                 info!(
@@ -299,6 +315,32 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                 }
 
                 while let Ok(chunk) = audio_rx.try_recv() {
+                    // Acoustic Echo Suppression: Check if speaker playback is active
+                    let is_playing = if let Ok(p) = player.try_lock() {
+                        p.is_playing()
+                    } else {
+                        true
+                    };
+
+                    if is_playing {
+                        // Speaker active: suppress microphone and extend reverberation cooldown
+                        playback_cooldown_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                        vad.reset();
+                        continue;
+                    }
+
+                    if std::time::Instant::now() < playback_cooldown_until {
+                        // Reverberation grace window: discard room echo
+                        vad.reset();
+                        continue;
+                    }
+
+                    // In PTT mode, only accumulate audio into VAD while user is holding PTT
+                    if !continuous && !ptt_active {
+                        vad.reset();
+                        continue;
+                    }
+
                     let vad_events = vad.feed_chunk(&chunk);
                     for event in vad_events {
                         match event {
@@ -313,32 +355,34 @@ async fn run_daemon_loop(config: &ViernesConfig) -> Result<(), Box<dyn std::erro
                                 }
                             }
                             VadEvent::VoiceFinished(pcm_buffer) => {
-                                info!(
-                                    "VAD detected speech completion (VoiceFinished, {} samples)",
-                                    pcm_buffer.len()
-                                );
-                                let _ = state_machine
-                                    .dispatch(SystemEvent::VoiceFinished {
-                                        samples: pcm_buffer.clone(),
-                                        sample_rate: 16_000,
-                                    })
-                                    .await;
+                                if continuous {
+                                    info!(
+                                        "VAD detected speech completion (VoiceFinished, {} samples)",
+                                        pcm_buffer.len()
+                                    );
+                                    let _ = state_machine
+                                        .dispatch(SystemEvent::VoiceFinished {
+                                            samples: pcm_buffer.clone(),
+                                            sample_rate: 16_000,
+                                        })
+                                        .await;
 
-                                let sm_turn = state_machine.clone();
-                                let tts_turn = tts_engine.clone();
-                                let player_turn = player.clone();
-                                let fillers_turn = fillers_mgr.clone();
-                                let brain_turn = brain_client.clone();
-                                tokio::spawn(async move {
-                                    process_speech_turn(
-                                        pcm_buffer,
-                                        sm_turn,
-                                        tts_turn,
-                                        player_turn,
-                                        fillers_turn,
-                                        brain_turn,
-                                    ).await;
-                                });
+                                    let sm_turn = state_machine.clone();
+                                    let tts_turn = tts_engine.clone();
+                                    let player_turn = player.clone();
+                                    let fillers_turn = fillers_mgr.clone();
+                                    let brain_turn = brain_client.clone();
+                                    tokio::spawn(async move {
+                                        process_speech_turn(
+                                            pcm_buffer,
+                                            sm_turn,
+                                            tts_turn,
+                                            player_turn,
+                                            fillers_turn,
+                                            brain_turn,
+                                        ).await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -391,9 +435,15 @@ async fn process_speech_turn(
         .dispatch(SystemEvent::TranscriptReady(prompt.clone()))
         .await;
 
+    // Strict Filler policy: At most 2 fillers per turn (1 immediate acknowledgment + at most 1 tool filler if delayed)
+    let mut total_fillers_played = 0;
+    let mut last_filler_time = std::time::Instant::now();
+
     // 1. Instantly play conversational filler phrase to eliminate perceived latency (< 150ms)
     if let Some(filler) = fillers.select_immediate().await {
         info!("Dispatching instant conversational filler: '{}'", filler);
+        total_fillers_played += 1;
+        last_filler_time = std::time::Instant::now();
         let tts_filler = tts.clone();
         let player_filler = player.clone();
         tokio::spawn(async move {
@@ -451,16 +501,29 @@ async fn process_speech_turn(
                     }
                     BrainEvent::ToolCall { name, .. } => {
                         info!("Brain active tool call: '{}'", name);
-                        if let Some(tool_filler) = fillers.select_tool_filler(&name).await {
-                            let tts_tool = tts.clone();
-                            let player_tool = player.clone();
-                            tokio::spawn(async move {
-                                if let Ok(audio) = tts_tool.synthesize_resilient(&tool_filler).await
-                                {
-                                    let mut p = player_tool.lock().await;
-                                    let _ = p.enqueue_chunk(audio).await;
-                                }
-                            });
+                        // Strict limit: Maximum 2 fillers TOTAL per turn, spaced at least 3.5s apart
+                        if total_fillers_played < 2
+                            && last_filler_time.elapsed() >= std::time::Duration::from_millis(3500)
+                        {
+                            if let Some(tool_filler) = fillers.select_tool_filler(&name).await {
+                                info!(
+                                    "Dispatching tool conversational filler ({}/2): '{}'",
+                                    total_fillers_played + 1,
+                                    tool_filler
+                                );
+                                total_fillers_played += 1;
+                                last_filler_time = std::time::Instant::now();
+                                let tts_tool = tts.clone();
+                                let player_tool = player.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(audio) =
+                                        tts_tool.synthesize_resilient(&tool_filler).await
+                                    {
+                                        let mut p = player_tool.lock().await;
+                                        let _ = p.enqueue_chunk(audio).await;
+                                    }
+                                });
+                            }
                         }
                     }
                     BrainEvent::Done => {
