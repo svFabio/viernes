@@ -46,6 +46,9 @@ pub enum SystemEvent {
     /// Audio output sink completed playing all queued buffers.
     PlaybackFinished,
 
+    /// Conversational filler finished playing (system should remain in Thinking state).
+    FillerPlaybackFinished,
+
     /// User interrupted active playback by starting to speak.
     BargeIn,
 
@@ -113,6 +116,7 @@ impl std::fmt::Display for SystemEvent {
             Self::SentenceReady(s) => write!(f, "SentenceReady({s})"),
             Self::SpeakingStarted => write!(f, "SpeakingStarted"),
             Self::PlaybackFinished => write!(f, "PlaybackFinished"),
+            Self::FillerPlaybackFinished => write!(f, "FillerPlaybackFinished"),
             Self::BargeIn => write!(f, "BargeIn"),
             Self::StateChanged { from, to } => write!(f, "StateChanged({from} -> {to})"),
             Self::ToolExecutionRequested { tool_name } => {

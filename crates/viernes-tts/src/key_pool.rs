@@ -1,17 +1,22 @@
 //! Multi-account API key pool with atomic lock-free rotation for ElevenLabs.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tracing::{info, warn};
 
 use crate::error::TtsError;
 
-/// An individual API key entry with an exhausted marker.
+/// Default cooldown duration (60 seconds) before an exhausted key is automatically rehabilitated.
+pub const KEY_COOLDOWN_SECS: u64 = 60;
+
+/// An individual API key entry with an exhausted marker and cooldown timestamp.
 struct KeyEntry {
     key: String,
     exhausted: AtomicBool,
+    exhausted_at: AtomicU64,
 }
 
 impl KeyEntry {
@@ -19,19 +24,50 @@ impl KeyEntry {
         Self {
             key,
             exhausted: AtomicBool::new(false),
+            exhausted_at: AtomicU64::new(0),
         }
     }
 
     fn is_exhausted(&self) -> bool {
-        self.exhausted.load(Ordering::Relaxed)
+        if !self.exhausted.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let ts = self.exhausted_at.load(Ordering::Relaxed);
+        if ts > 0 {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            if now.saturating_sub(ts) >= KEY_COOLDOWN_SECS {
+                // Cooldown period elapsed: rehabilitate key automatically
+                self.exhausted.store(false, Ordering::SeqCst);
+                self.exhausted_at.store(0, Ordering::SeqCst);
+                info!(
+                    key = %redact_key(&self.key),
+                    "ElevenLabs API key cooldown period expired ({}s); key automatically rehabilitated",
+                    KEY_COOLDOWN_SECS
+                );
+                return false;
+            }
+        }
+
+        true
     }
 
     fn mark_exhausted(&self) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.exhausted_at.store(now, Ordering::SeqCst);
         self.exhausted.store(true, Ordering::SeqCst);
     }
 
     fn reset(&self) {
         self.exhausted.store(false, Ordering::SeqCst);
+        self.exhausted_at.store(0, Ordering::SeqCst);
     }
 }
 
@@ -237,6 +273,31 @@ mod tests {
         // Reset restores availability
         pool.reset_all();
         assert_eq!(pool.get_active_key().unwrap(), "key_alpha");
+    }
+
+    #[test]
+    fn test_key_cooldown_rehabilitation() {
+        let pool = KeyPool::new(vec!["key_temp_limited".into()]);
+        assert_eq!(pool.get_active_key().unwrap(), "key_temp_limited");
+
+        // Exhaust the key
+        let _ = pool.mark_current_exhausted_and_rotate();
+        assert!(matches!(
+            pool.get_active_key(),
+            Err(TtsError::AllKeysExhausted(1))
+        ));
+
+        // Simulate cooldown elapsed by setting exhausted_at to 65 seconds in the past
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        pool.keys[0]
+            .exhausted_at
+            .store(now.saturating_sub(65), Ordering::SeqCst);
+
+        // Cooldown has expired: key should automatically rehabilitate!
+        assert_eq!(pool.get_active_key().unwrap(), "key_temp_limited");
     }
 
     #[test]

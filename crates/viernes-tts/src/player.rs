@@ -77,6 +77,22 @@ impl AudioPlayback for SilentAudioSink {
         Ok(())
     }
 
+    async fn enqueue_filler(&mut self, audio_bytes: Vec<u8>) -> Result<(), ViernesError> {
+        if audio_bytes.is_empty() {
+            return Err(ViernesError::Audio("Cannot play empty audio chunk".into()));
+        }
+
+        self.playing.store(true, Ordering::SeqCst);
+        self.chunks_enqueued.fetch_add(1, Ordering::SeqCst);
+
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(SystemEvent::FillerPlaybackFinished);
+        }
+        self.playing.store(false, Ordering::SeqCst);
+
+        Ok(())
+    }
+
     fn stop_immediately(&mut self) -> Result<(), ViernesError> {
         self.playing.store(false, Ordering::SeqCst);
         Ok(())
@@ -90,6 +106,7 @@ impl AudioPlayback for SilentAudioSink {
 /// Commands sent to the dedicated audio thread.
 enum PlayerCommand {
     PlayChunk(Vec<u8>),
+    PlayFiller(Vec<u8>),
     Stop,
 }
 
@@ -133,7 +150,7 @@ impl StreamingAudioPlayer {
                     }
                 };
 
-                let sink = match Sink::try_new(&stream_handle) {
+                let mut sink = match Sink::try_new(&stream_handle) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = init_tx.send(Err(format!("Failed to create rodio Sink: {e}")));
@@ -143,6 +160,7 @@ impl StreamingAudioPlayer {
 
                 // Notify parent thread that audio hardware is ready
                 let _ = init_tx.send(Ok(()));
+                let mut current_is_filler = false;
 
                 loop {
                     match command_rx.recv_timeout(Duration::from_millis(50)) {
@@ -151,6 +169,7 @@ impl StreamingAudioPlayer {
                             match Decoder::new(cursor) {
                                 Ok(source) => {
                                     sink.append(source);
+                                    current_is_filler = false;
                                     playing_clone.store(true, Ordering::SeqCst);
                                 }
                                 Err(err) => {
@@ -158,17 +177,48 @@ impl StreamingAudioPlayer {
                                 }
                             }
                         }
+                        Ok(PlayerCommand::PlayFiller(bytes)) => {
+                            let cursor = Cursor::new(bytes);
+                            match Decoder::new(cursor) {
+                                Ok(source) => {
+                                    sink.append(source);
+                                    current_is_filler = true;
+                                    playing_clone.store(true, Ordering::SeqCst);
+                                }
+                                Err(err) => {
+                                    warn!(error = %err, "Failed decoding filler MP3 audio stream");
+                                }
+                            }
+                        }
                         Ok(PlayerCommand::Stop) => {
-                            debug!("Immediate stop received; clearing sink");
-                            sink.stop();
+                            debug!("Immediate stop received; recreating sink to prevent rodio freeze");
+                            match Sink::try_new(&stream_handle) {
+                                Ok(new_sink) => {
+                                    sink.stop();
+                                    sink = new_sink;
+                                }
+                                Err(err) => {
+                                    warn!("Failed to recreate rodio Sink after stop: {err}");
+                                    sink.stop();
+                                }
+                            }
+                            current_is_filler = false;
                             playing_clone.store(false, Ordering::SeqCst);
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             if playing_clone.load(Ordering::SeqCst) && sink.empty() {
                                 playing_clone.store(false, Ordering::SeqCst);
-                                debug!("Audio playback queue drained; emitting PlaybackFinished");
-                                if let Some(ref tx) = event_tx_clone {
-                                    let _ = tx.send(SystemEvent::PlaybackFinished);
+                                if current_is_filler {
+                                    current_is_filler = false;
+                                    debug!("Filler audio playback queue drained; emitting FillerPlaybackFinished");
+                                    if let Some(ref tx) = event_tx_clone {
+                                        let _ = tx.send(SystemEvent::FillerPlaybackFinished);
+                                    }
+                                } else {
+                                    debug!("Audio playback queue drained; emitting PlaybackFinished");
+                                    if let Some(ref tx) = event_tx_clone {
+                                        let _ = tx.send(SystemEvent::PlaybackFinished);
+                                    }
                                 }
                             }
                         }
@@ -232,6 +282,20 @@ impl AudioPlayback for StreamingAudioPlayer {
         Ok(())
     }
 
+    async fn enqueue_filler(&mut self, audio_bytes: Vec<u8>) -> Result<(), ViernesError> {
+        if audio_bytes.is_empty() {
+            return Err(ViernesError::Audio("Cannot play empty audio chunk".into()));
+        }
+
+        self.command_tx
+            .send(PlayerCommand::PlayFiller(audio_bytes))
+            .map_err(|e| {
+                ViernesError::Audio(format!("Failed to enqueue filler audio chunk: {e}"))
+            })?;
+
+        Ok(())
+    }
+
     fn stop_immediately(&mut self) -> Result<(), ViernesError> {
         let _ = self.command_tx.send(PlayerCommand::Stop);
         self.playing_flag.store(false, Ordering::SeqCst);
@@ -259,6 +323,20 @@ mod tests {
         assert_eq!(sink.chunks_enqueued(), 1);
         let event = rx.recv().await.unwrap();
         assert_eq!(event, SystemEvent::PlaybackFinished);
+    }
+
+    #[tokio::test]
+    async fn test_silent_sink_enqueue_filler_emits_filler_event() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut sink = SilentAudioSink::with_event_sender(tx);
+
+        assert!(!sink.is_playing());
+        let dummy = vec![0xFF, 0xFB, 0x90, 0x64];
+        sink.enqueue_filler(dummy).await.unwrap();
+
+        assert_eq!(sink.chunks_enqueued(), 1);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event, SystemEvent::FillerPlaybackFinished);
     }
 
     #[tokio::test]

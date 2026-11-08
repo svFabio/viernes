@@ -159,7 +159,7 @@ impl AntigravityClient {
         Ok(())
     }
 
-    /// Read the next event from the stream, bounded by the 15-second inactivity timeout.
+    /// Read the next event from the stream, bounded by the 60-second inactivity timeout.
     pub async fn next_event(&mut self) -> Result<Option<BrainEvent>, BrainError> {
         loop {
             match tokio::time::timeout(INACTIVITY_TIMEOUT, self.lines_stream.next()).await {
@@ -168,6 +168,13 @@ impl AntigravityClient {
                     if trimmed.is_empty() {
                         continue;
                     }
+
+                    // Silently ignore non-JSON lines (e.g. CLI banners, environment notices, or raw logs)
+                    if !trimmed.starts_with('{') {
+                        debug!(raw_line = %trimmed, "Ignoring non-JSON output line from child process");
+                        continue;
+                    }
+
                     debug!(raw_line = %trimmed, "Received NDJSON line from child process");
 
                     // 1. Try parsing agy stream-json protocol
@@ -175,7 +182,9 @@ impl AntigravityClient {
                         if let Some(event_str) = value.get("event").and_then(|v| v.as_str()) {
                             match event_str {
                                 "init" => {
-                                    if let Some(conv_id) = value.get("conversation_id").and_then(|v| v.as_str()) {
+                                    if let Some(conv_id) =
+                                        value.get("conversation_id").and_then(|v| v.as_str())
+                                    {
                                         debug!(conversation_id = %conv_id, "Antigravity session confirmed");
                                         self.active_conversation_id = Some(conv_id.to_string());
                                     }
@@ -218,9 +227,13 @@ impl AntigravityClient {
                     }
 
                     // 2. Direct BrainEvent deserialization fallback (e.g. tests & mock servers)
-                    let event: BrainEvent =
-                        serde_json::from_str(trimmed).map_err(BrainError::SerdeError)?;
-                    return Ok(Some(event));
+                    match serde_json::from_str::<BrainEvent>(trimmed) {
+                        Ok(event) => return Ok(Some(event)),
+                        Err(e) => {
+                            debug!(error = %e, raw_line = %trimmed, "Ignoring unhandled or malformed JSON line from child process");
+                            continue;
+                        }
+                    }
                 }
                 Ok(Some(Err(io_err))) => return Err(BrainError::ProcessSpawn(io_err)),
                 Ok(None) => {
@@ -237,9 +250,13 @@ impl AntigravityClient {
                     return Ok(None);
                 }
                 Err(_) => {
-                    error!("Antigravity process inactive for >15s; raising inactivity timeout");
+                    let secs = INACTIVITY_TIMEOUT.as_secs();
+                    error!(
+                        timeout_secs = secs,
+                        "Antigravity process inactive for >{secs}s; raising inactivity timeout"
+                    );
                     return Err(BrainError::InactivityTimeout {
-                        duration_secs: INACTIVITY_TIMEOUT.as_secs(),
+                        duration_secs: secs,
                     });
                 }
             }

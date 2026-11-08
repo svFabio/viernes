@@ -103,10 +103,12 @@ impl Default for DaemonLiveStatus {
 }
 
 impl DaemonLiveStatus {
-    /// Reads the current live status snapshot from `/tmp/viernes_status.json`.
+    /// Reads the current live status snapshot from `/tmp/viernes_status.json` or `$VIERNES_STATUS_FILE`.
     #[must_use]
     pub fn read_from_disk() -> Option<Self> {
-        let path = std::path::Path::new(DAEMON_STATUS_FILE);
+        let path_str =
+            std::env::var("VIERNES_STATUS_FILE").unwrap_or_else(|_| DAEMON_STATUS_FILE.to_string());
+        let path = std::path::Path::new(&path_str);
         if !path.exists() {
             return None;
         }
@@ -116,11 +118,13 @@ impl DaemonLiveStatus {
 
     /// Atomically writes this status snapshot to disk via temporary file rename.
     pub fn write_to_disk(&self) -> Result<(), std::io::Error> {
-        let tmp_path = format!("{DAEMON_STATUS_FILE}.tmp.{}", std::process::id());
+        let target_path =
+            std::env::var("VIERNES_STATUS_FILE").unwrap_or_else(|_| DAEMON_STATUS_FILE.to_string());
+        let tmp_path = format!("{target_path}.tmp.{}", std::process::id());
         let content = serde_json::to_string(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, DAEMON_STATUS_FILE)?;
+        std::fs::rename(&tmp_path, target_path)?;
         Ok(())
     }
 }

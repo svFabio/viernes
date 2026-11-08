@@ -48,6 +48,7 @@ pub struct VoiceActivityDetector {
     pre_roll_capacity: usize,
     min_speech_samples: usize,
     max_speech_samples: usize,
+    silence_timeout_enabled: bool,
 }
 
 impl VoiceActivityDetector {
@@ -79,7 +80,22 @@ impl VoiceActivityDetector {
             pre_roll_capacity,
             min_speech_samples,
             max_speech_samples,
+            silence_timeout_enabled: true,
         }
+    }
+
+    /// Enables or disables the silence timeout cutoff.
+    ///
+    /// When disabled (e.g. during Push-to-Talk holding), audio continues accumulating
+    /// across silence intervals without purging the speech buffer.
+    pub fn set_silence_timeout_enabled(&mut self, enabled: bool) {
+        self.silence_timeout_enabled = enabled;
+    }
+
+    /// Indicates whether the silence timeout cutoff is currently active.
+    #[must_use]
+    pub fn is_silence_timeout_enabled(&self) -> bool {
+        self.silence_timeout_enabled
     }
 
     /// Dynamically reconfigures the RMS sensitivity threshold on the fly.
@@ -197,8 +213,10 @@ impl VoiceActivityDetector {
                     return events;
                 }
 
-                // Check sustained silence timeout
-                if self.accumulated_silence_samples >= silence_threshold_samples {
+                // Check sustained silence timeout if enabled
+                if self.silence_timeout_enabled
+                    && self.accumulated_silence_samples >= silence_threshold_samples
+                {
                     // Check if voiced speech segment exceeds minimum click threshold (250ms)
                     let voiced_samples = self
                         .speech_buffer
@@ -350,6 +368,48 @@ mod tests {
             cut_event.is_some(),
             "Safety cutoff must trigger at 20 seconds"
         );
+        assert_eq!(vad.state(), VadState::Silence);
+    }
+
+    #[test]
+    fn test_vad_ptt_mode_preserves_audio_across_pauses() {
+        let sample_rate = 16000;
+        let mut vad = VoiceActivityDetector::new(sample_rate, 0.05, 800);
+        vad.set_silence_timeout_enabled(false);
+        vad.start_speech_capture();
+
+        let voice_frame = vec![0.2; 320]; // 20ms of speech
+        let silence_frame = vec![0.001; 320]; // 20ms of silence
+
+        // Feed speech (500ms)
+        for _ in 0..25 {
+            vad.feed_chunk(&voice_frame);
+        }
+        assert_eq!(vad.state(), VadState::Speech);
+
+        // Feed long silence pause (1.2 seconds > 800ms silence timeout)
+        for _ in 0..60 {
+            let evs = vad.feed_chunk(&silence_frame);
+            assert!(
+                evs.is_empty(),
+                "PTT mode must not emit VoiceFinished on pause"
+            );
+        }
+        assert_eq!(
+            vad.state(),
+            VadState::Speech,
+            "PTT mode must stay in Speech state"
+        );
+
+        // Feed speech again (500ms)
+        for _ in 0..25 {
+            vad.feed_chunk(&voice_frame);
+        }
+
+        // Release PTT
+        let finished = vad.force_finish().expect("Must retain full speech buffer");
+        // 25 + 60 + 25 = 110 frames * 320 samples = 35200 samples
+        assert_eq!(finished.len(), 35_200);
         assert_eq!(vad.state(), VadState::Silence);
     }
 }

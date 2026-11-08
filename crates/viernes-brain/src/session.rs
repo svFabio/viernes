@@ -151,20 +151,33 @@ impl SessionPointerManager {
             create_dir_all(parent).map_err(|e| BrainError::SessionError(e.to_string()))?;
         }
 
-        let temp_path = self.file_path.with_extension("tmp");
+        let temp_filename = format!("session.{}.tmp", Uuid::new_v4());
+        let temp_path = match self.file_path.parent() {
+            Some(parent) => parent.join(temp_filename),
+            None => PathBuf::from(temp_filename),
+        };
+
         let serialized = serde_json::to_string_pretty(state)?;
 
-        {
+        let write_res = (|| -> Result<(), BrainError> {
             let mut file =
                 File::create(&temp_path).map_err(|e| BrainError::SessionError(e.to_string()))?;
             file.write_all(serialized.as_bytes())
                 .map_err(|e| BrainError::SessionError(e.to_string()))?;
             file.sync_all()
                 .map_err(|e| BrainError::SessionError(e.to_string()))?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
         }
 
-        std::fs::rename(&temp_path, &self.file_path)
-            .map_err(|e| BrainError::SessionError(e.to_string()))?;
+        if let Err(e) = std::fs::rename(&temp_path, &self.file_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(BrainError::SessionError(e.to_string()));
+        }
 
         Ok(())
     }

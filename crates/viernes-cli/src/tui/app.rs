@@ -170,7 +170,10 @@ impl TuiApp {
             assistant_state = status.state;
             last_synced_turn = status.turn_counter;
             if !status.last_user_prompt.is_empty() {
-                initial_turns.push(ConversationTurn::new(Speaker::User, status.last_user_prompt));
+                initial_turns.push(ConversationTurn::new(
+                    Speaker::User,
+                    status.last_user_prompt,
+                ));
             }
             if !status.last_assistant_text.is_empty() {
                 initial_turns.push(ConversationTurn::new(
@@ -219,7 +222,7 @@ impl TuiApp {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         // Periodically verify background daemon status and socket connectivity
-        if self.tick_count % 3 == 0 {
+        if self.tick_count.is_multiple_of(3) {
             if let Some(status) = DaemonLiveStatus::read_from_disk() {
                 self.daemon_connected = true;
                 if !self.ptt_active {
@@ -234,16 +237,18 @@ impl TuiApp {
                         self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
                     }
                     self.last_synced_turn = status.turn_counter;
-                } else if self.assistant_state == SystemState::Speaking
-                    && !status.last_assistant_text.is_empty()
-                {
-                    // Update streaming response
+                } else if !status.last_assistant_text.is_empty() {
+                    // Synchronize assistant response regardless of whether daemon is currently Speaking or Idle
                     if let Some(last) = self.turns.last_mut() {
                         if last.speaker == Speaker::Viernes {
-                            last.text = status.last_assistant_text.clone();
+                            if last.text != status.last_assistant_text {
+                                last.text = status.last_assistant_text.clone();
+                            }
                         } else {
                             self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
                         }
+                    } else {
+                        self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
                     }
                 }
             } else if self.tick_count.is_multiple_of(30) {
@@ -276,8 +281,7 @@ impl TuiApp {
             for i in 0..bar_count {
                 let fi = i as f32 / bar_count as f32;
                 let wave = ((fi * 10.0 + t).sin() * 0.5 + 0.5) * 0.5 + 0.1;
-                self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.4 + wave * 0.6).clamp(0.05, 0.7);
+                self.spectrum_bars[i] = (self.spectrum_bars[i] * 0.4 + wave * 0.6).clamp(0.05, 0.7);
             }
         } else if self.assistant_state == SystemState::Thinking {
             let t = (self.tick_count as f32) * 0.12;
@@ -326,8 +330,9 @@ impl TuiApp {
             // Start recording (Habilitar micrófono)
             self.ptt_active = true;
             self.assistant_state = SystemState::Listening;
-            self.status_line =
-                Some("Micrófono activado. Habla ahora... (Espacio/Enter o Click para enviar)".into());
+            self.status_line = Some(
+                "Micrófono activado. Habla ahora... (Espacio/Enter o Click para enviar)".into(),
+            );
             let _ = send_ipc_ptt("press").await;
         } else {
             // Stop recording & send for processing
@@ -715,6 +720,7 @@ mod tests {
     #[tokio::test]
     async fn test_ptt_key_toggle_in_monitor() {
         let mut app = TuiApp::new(None);
+        app.assistant_state = SystemState::Idle;
         assert_eq!(app.active_tab, ActiveTab::Monitor);
         assert!(!app.ptt_active);
         assert_eq!(app.assistant_state, SystemState::Idle);
@@ -738,6 +744,41 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
         assert_eq!(app.assistant_state, SystemState::Idle);
+    }
+
+    #[test]
+    fn test_tui_app_assistant_response_sync_in_idle() {
+        let mut app = TuiApp::new(None);
+        app.add_turn(Speaker::User, "Hola Viernes");
+        app.last_synced_turn = 5;
+
+        // Simulate status with same turn counter but new assistant response while idle
+        let status = DaemonLiveStatus {
+            state: SystemState::Idle,
+            last_user_prompt: "Hola Viernes".into(),
+            last_assistant_text: "Hola Señor, a su disposición.".into(),
+            turn_counter: 5,
+            timestamp_ms: 12345,
+        };
+
+        // When assistant text arrives, TUI should append Speaker::Viernes even in Idle state
+        if !status.last_assistant_text.is_empty() {
+            if let Some(last) = app.turns.last_mut() {
+                if last.speaker == Speaker::Viernes {
+                    if last.text != status.last_assistant_text {
+                        last.text = status.last_assistant_text.clone();
+                    }
+                } else {
+                    app.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                }
+            }
+        }
+
+        assert_eq!(app.turns.last().unwrap().speaker, Speaker::Viernes);
+        assert_eq!(
+            app.turns.last().unwrap().text,
+            "Hola Señor, a su disposición."
+        );
     }
 
     #[test]

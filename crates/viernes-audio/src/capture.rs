@@ -41,6 +41,9 @@ impl Default for AudioCaptureConfig {
     }
 }
 
+/// Maximum accumulated samples retained in recording buffer to prevent unbounded leaks (~30s @ 16kHz).
+pub const MAX_ACCUMULATED_SAMPLES: usize = 16_000 * 30;
+
 enum AudioWorkerCommand {
     Stop,
 }
@@ -55,6 +58,7 @@ pub struct CpalAudioCapture {
     sender: Sender<Vec<f32>>,
     receiver: Receiver<Vec<f32>>,
     accumulated_buffer: Arc<Mutex<Vec<f32>>>,
+    recording_active: Arc<AtomicBool>,
     worker_tx: Option<Sender<AudioWorkerCommand>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
     negotiated_rate: Arc<Mutex<u32>>,
@@ -86,11 +90,25 @@ impl CpalAudioCapture {
             sender,
             receiver,
             accumulated_buffer: Arc::new(Mutex::new(Vec::new())),
+            recording_active: Arc::new(AtomicBool::new(true)),
             worker_tx: None,
             worker_handle: None,
             negotiated_rate: Arc::new(Mutex::new(16_000)),
             negotiated_channels: Arc::new(Mutex::new(1)),
         }
+    }
+
+    /// Enables or disables accumulation into the internal recording buffer.
+    ///
+    /// When disabled, streaming continues over the channel without allocating memory in the capture buffer.
+    pub fn set_recording_active(&self, active: bool) {
+        self.recording_active.store(active, Ordering::SeqCst);
+    }
+
+    /// Indicates whether accumulation into the internal recording buffer is enabled.
+    #[must_use]
+    pub fn is_recording_active(&self) -> bool {
+        self.recording_active.load(Ordering::SeqCst)
     }
 
     /// Returns a clone of the lock-free receiver channel for streaming raw PCM chunks to VAD.
@@ -134,6 +152,7 @@ impl AudioCapture for CpalAudioCapture {
         let tx = self.sender.clone();
         let running_flag = self.is_running.clone();
         let accumulated = self.accumulated_buffer.clone();
+        let recording_flag = self.recording_active.clone();
         let rate_holder = self.negotiated_rate.clone();
         let chan_holder = self.negotiated_channels.clone();
 
@@ -211,6 +230,7 @@ impl AudioCapture for CpalAudioCapture {
                 let stream_running = running_flag.clone();
                 let stream_acc = accumulated.clone();
                 let stream_tx = tx.clone();
+                let stream_rec = recording_flag.clone();
 
                 let err_fn = move |err: cpal::StreamError| {
                     error!("cpal stream error: {err}");
@@ -228,7 +248,17 @@ impl AudioCapture for CpalAudioCapture {
                             };
 
                             if !processed.is_empty() {
-                                stream_acc.lock().unwrap().extend_from_slice(&processed);
+                                if stream_rec.load(Ordering::Relaxed) {
+                                    if let Ok(mut acc) = stream_acc.try_lock() {
+                                        if acc.len() + processed.len() > MAX_ACCUMULATED_SAMPLES {
+                                            let overflow = (acc.len() + processed.len())
+                                                - MAX_ACCUMULATED_SAMPLES;
+                                            let drain_count = overflow.min(acc.len());
+                                            acc.drain(0..drain_count);
+                                        }
+                                        acc.extend_from_slice(&processed);
+                                    }
+                                }
                                 let _ = stream_tx.try_send(processed);
                             }
                         },
@@ -248,7 +278,17 @@ impl AudioCapture for CpalAudioCapture {
                             };
 
                             if !processed.is_empty() {
-                                stream_acc.lock().unwrap().extend_from_slice(&processed);
+                                if stream_rec.load(Ordering::Relaxed) {
+                                    if let Ok(mut acc) = stream_acc.try_lock() {
+                                        if acc.len() + processed.len() > MAX_ACCUMULATED_SAMPLES {
+                                            let overflow = (acc.len() + processed.len())
+                                                - MAX_ACCUMULATED_SAMPLES;
+                                            let drain_count = overflow.min(acc.len());
+                                            acc.drain(0..drain_count);
+                                        }
+                                        acc.extend_from_slice(&processed);
+                                    }
+                                }
                                 let _ = stream_tx.try_send(processed);
                             }
                         },
@@ -325,7 +365,7 @@ impl AudioCapture for CpalAudioCapture {
     }
 
     fn finish_recording(&mut self) -> Option<Vec<f32>> {
-        let mut guard = self.accumulated_buffer.lock().unwrap();
+        let mut guard = self.accumulated_buffer.lock().ok()?;
         if guard.is_empty() {
             None
         } else {
@@ -439,5 +479,15 @@ mod tests {
         assert_eq!(cfg.preferred_sample_rate, 16_000);
         assert_eq!(cfg.chunk_ms, 20);
         assert_eq!(cfg.channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_cpal_capture_recording_active_toggle() {
+        let capture = CpalAudioCapture::new(AudioCaptureConfig::default());
+        assert!(capture.is_recording_active());
+        capture.set_recording_active(false);
+        assert!(!capture.is_recording_active());
+        capture.set_recording_active(true);
+        assert!(capture.is_recording_active());
     }
 }
