@@ -17,7 +17,7 @@ pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
     if let Ok(path_str) = std::env::var("VIERNES_TRANSCRIBE_SCRIPT") {
         let p = PathBuf::from(path_str);
         if p.exists() {
-            return Some(p);
+            return p.canonicalize().ok().or(Some(p));
         }
     }
 
@@ -26,14 +26,11 @@ pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
         if let Some(parent) = exe.parent() {
             let candidate = parent.join("scripts/transcribe_wav.py");
             if candidate.exists() {
-                return Some(candidate);
+                return candidate.canonicalize().ok().or(Some(candidate));
             }
             let candidate_root = parent.join("../../scripts/transcribe_wav.py");
             if candidate_root.exists() {
-                if let Ok(canonical) = candidate_root.canonicalize() {
-                    return Some(canonical);
-                }
-                return Some(candidate_root);
+                return candidate_root.canonicalize().ok().or(Some(candidate_root));
             }
         }
     }
@@ -41,18 +38,36 @@ pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
     // 3. Current working directory
     let cwd_path = PathBuf::from("scripts/transcribe_wav.py");
     if cwd_path.exists() {
-        return Some(cwd_path);
+        return cwd_path.canonicalize().ok().or(Some(cwd_path));
     }
 
     // 4. Default user project path
     if let Ok(home) = std::env::var("HOME") {
         let candidate = PathBuf::from(home).join("Projects/09-viernes/scripts/transcribe_wav.py");
         if candidate.exists() {
-            return Some(candidate);
+            return candidate.canonicalize().ok().or(Some(candidate));
         }
     }
 
     None
+}
+
+/// Resolves path to the `uv` executable, checking environment and user binaries.
+#[must_use]
+pub fn resolve_uv_binary() -> PathBuf {
+    if let Ok(bin_str) = std::env::var("VIERNES_UV_BIN") {
+        let p = PathBuf::from(bin_str);
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = PathBuf::from(home).join(".local/bin/uv");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("uv")
 }
 
 /// List of recognized hallucination tokens, noise tags, and spurious endings.
@@ -232,15 +247,18 @@ impl SpeechToText for LocalWhisperTranscriber {
 
             let script_path = resolve_transcribe_script_path();
             let output = if let Some(ref script) = script_path {
-                let project_dir = script
+                let script_abs = script.canonicalize().unwrap_or_else(|_| script.clone());
+                let project_dir = script_abs
                     .parent()
                     .and_then(|p| p.parent())
+                    .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
 
-                std::process::Command::new("uv")
+                let uv_bin = resolve_uv_binary();
+                std::process::Command::new(uv_bin)
                     .current_dir(project_dir)
                     .args(["run", "python"])
-                    .arg(script)
+                    .arg(&script_abs)
                     .arg(&temp_wav)
                     .output()
             } else if model_path.exists() {
