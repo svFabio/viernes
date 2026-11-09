@@ -1,19 +1,20 @@
 [Unit]
-Description=Viernes Voice Assistant User Daemon
-Documentation=https://github.com/svFabio/09-viernes
+Description=Viernes Voice Assistant User Daemon (Rust Native)
+Documentation=https://github.com/svFabio/viernes
 After=default.target sound.target pipewire.service
 Wants=sound.target pipewire.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Projects/09-viernes
-Environment=PYTHONUNBUFFERED=1
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
 PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
-ExecStart=%h/.local/bin/uv run python -m viernes.main
+ExecStart=%h/.local/bin/viernes --daemon
 Restart=on-failure
 RestartSec=5s
 KillMode=process
-TimeoutStopSec=10s
+TimeoutStopSec=3s
 
 [Install]
 WantedBy=default.target

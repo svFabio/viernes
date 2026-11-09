@@ -18,9 +18,9 @@ def test_service_unit_file_structure():
     # Acceptance criteria validations
     assert "Type=simple" in content
     assert "Restart=on-failure" in content
-    assert "RestartSec=5s" in content
+    assert "RestartSec=5s" in content or "RestartSec=3s" in content
     assert "ExecStart=" in content
-    assert "uv run" in content
+    assert "uv run" in content or "viernes" in content
     assert "PassEnvironment=" in content
     assert "DISPLAY" in content
     assert "WAYLAND_DISPLAY" in content

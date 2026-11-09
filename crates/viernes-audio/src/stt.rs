@@ -3,13 +3,72 @@
 //! Enforces 16kHz Float32 mono validation, non-blocking execution via `tokio::task::spawn_blocking`,
 //! hallucination filtering for noise/music/repetition tokens, and Spanish ("es") language configuration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
 use viernes_core::error::ViernesError;
 use viernes_core::traits::SpeechToText;
+
+/// Resolves the filesystem path to `scripts/transcribe_wav.py` robustly across working directories.
+pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
+    // 1. Explicit environment variable override
+    if let Ok(path_str) = std::env::var("VIERNES_TRANSCRIBE_SCRIPT") {
+        let p = PathBuf::from(path_str);
+        if p.exists() {
+            return p.canonicalize().ok().or(Some(p));
+        }
+    }
+
+    // 2. Relative to current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("scripts/transcribe_wav.py");
+            if candidate.exists() {
+                return candidate.canonicalize().ok().or(Some(candidate));
+            }
+            let candidate_root = parent.join("../../scripts/transcribe_wav.py");
+            if candidate_root.exists() {
+                return candidate_root.canonicalize().ok().or(Some(candidate_root));
+            }
+        }
+    }
+
+    // 3. Current working directory
+    let cwd_path = PathBuf::from("scripts/transcribe_wav.py");
+    if cwd_path.exists() {
+        return cwd_path.canonicalize().ok().or(Some(cwd_path));
+    }
+
+    // 4. Default user project path
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = PathBuf::from(home).join("Projects/09-viernes/scripts/transcribe_wav.py");
+        if candidate.exists() {
+            return candidate.canonicalize().ok().or(Some(candidate));
+        }
+    }
+
+    None
+}
+
+/// Resolves path to the `uv` executable, checking environment and user binaries.
+#[must_use]
+pub fn resolve_uv_binary() -> PathBuf {
+    if let Ok(bin_str) = std::env::var("VIERNES_UV_BIN") {
+        let p = PathBuf::from(bin_str);
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = PathBuf::from(home).join(".local/bin/uv");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("uv")
+}
 
 /// List of recognized hallucination tokens, noise tags, and spurious endings.
 const HALLUCINATION_PATTERNS: &[&str] = &[
@@ -149,7 +208,12 @@ impl SpeechToText for LocalWhisperTranscriber {
             )));
         }
 
-        if samples.is_empty() {
+        // Discard empty or micro-click buffers (< 2400 samples / 150ms @ 16kHz) to avoid CPU waste and hallucinations
+        if samples.len() < 2400 {
+            debug!(
+                samples = samples.len(),
+                "Discarding micro-click audio buffer (< 2400 samples / 150ms)"
+            );
             return Ok(String::new());
         }
 
@@ -181,10 +245,20 @@ impl SpeechToText for LocalWhisperTranscriber {
                 .finalize()
                 .map_err(|e| ViernesError::Stt(format!("Failed to finalize WAV file: {e}")))?;
 
-            let script_path = PathBuf::from("scripts/transcribe_wav.py");
-            let output = if script_path.exists() {
-                std::process::Command::new("uv")
-                    .args(["run", "python", "scripts/transcribe_wav.py"])
+            let script_path = resolve_transcribe_script_path();
+            let output = if let Some(ref script) = script_path {
+                let script_abs = script.canonicalize().unwrap_or_else(|_| script.clone());
+                let project_dir = script_abs
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+
+                let uv_bin = resolve_uv_binary();
+                std::process::Command::new(uv_bin)
+                    .current_dir(project_dir)
+                    .args(["run", "python"])
+                    .arg(&script_abs)
                     .arg(&temp_wav)
                     .output()
             } else if model_path.exists() {
@@ -347,5 +421,22 @@ mod tests {
         let err = transcriber.transcribe(&samples, 48000).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("16000 Hz"));
+    }
+
+    #[tokio::test]
+    async fn test_discard_micro_clicks_under_2400_samples() {
+        let config = WhisperConfig {
+            model_path: PathBuf::from("nonexistent.bin"),
+            language: "es".into(),
+            cpu_threads: 2,
+        };
+        let transcriber = LocalWhisperTranscriber::new(config).unwrap();
+        // 1600 samples is 100ms (< 2400 samples / 150ms)
+        let micro_click = vec![0.1f32; 1600];
+        let result = transcriber.transcribe(&micro_click, 16000).await.unwrap();
+        assert_eq!(
+            result, "",
+            "Micro-clicks under 2400 samples must return empty without executing inference"
+        );
     }
 }

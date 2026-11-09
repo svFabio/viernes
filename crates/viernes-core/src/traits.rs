@@ -61,6 +61,11 @@ pub trait AudioPlayback: Send + Sync + std::fmt::Debug {
     /// Enqueues audio bytes for immediate streaming playback.
     async fn enqueue_chunk(&mut self, audio_bytes: Vec<u8>) -> Result<(), ViernesError>;
 
+    /// Enqueues audio bytes specifically for a conversational filler.
+    async fn enqueue_filler(&mut self, audio_bytes: Vec<u8>) -> Result<(), ViernesError> {
+        self.enqueue_chunk(audio_bytes).await
+    }
+
     /// Instantly halts playback and clears pending queued buffers (Barge-in).
     fn stop_immediately(&mut self) -> Result<(), ViernesError>;
 

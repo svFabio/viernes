@@ -43,11 +43,13 @@ proptest = "1.4"
 tempfile = "3.10"
 async-trait = "0.1"
 futures = "0.3"
-nix = { version = "0.29", features = ["signal", "process"] }
+nix = { version = "0.29", features = ["signal", "process", "fs"] }
 dotenvy = "0.15"
 crossbeam-channel = "0.5"
 cpal = "0.15"
 hound = "3.5"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 clap = { version = "4.5", features = ["derive"] }
 

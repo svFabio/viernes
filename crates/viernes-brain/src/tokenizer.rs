@@ -8,10 +8,14 @@ use crate::error::BrainError;
 /// Minimum character length required before emitting a sentence chunk.
 pub const MIN_EMISSION_LENGTH: usize = 10;
 
+/// Minimum character length required before emitting an early first clause chunk.
+pub const MIN_FIRST_CLAUSE_LENGTH: usize = 12;
+
 /// Smart sentence tokenizer that buffers incoming streaming tokens and segments by natural clauses.
 pub struct SentenceTokenizer {
     buffer: String,
     output_tx: mpsc::Sender<String>,
+    first_clause_emitted: bool,
 }
 
 impl SentenceTokenizer {
@@ -21,6 +25,7 @@ impl SentenceTokenizer {
         Self {
             buffer: String::new(),
             output_tx,
+            first_clause_emitted: false,
         }
     }
 
@@ -33,6 +38,7 @@ impl SentenceTokenizer {
             self.buffer = self.buffer[index + 1..].to_string();
 
             if !sentence.is_empty() {
+                self.first_clause_emitted = true;
                 debug!(sentence = %sentence, "SentenceTokenizer emitted sentence");
                 self.output_tx
                     .send(sentence)
@@ -48,6 +54,7 @@ impl SentenceTokenizer {
     pub async fn flush(&mut self) -> Result<(), BrainError> {
         let remainder = self.buffer.trim().to_string();
         self.buffer.clear();
+        self.first_clause_emitted = false;
 
         if !remainder.is_empty() {
             debug!(remainder = %remainder, "SentenceTokenizer flushed remainder buffer");
@@ -67,33 +74,45 @@ impl SentenceTokenizer {
 
         for i in 0..len {
             let b = bytes[i];
-            let is_delimiter = matches!(b, b'.' | b'?' | b'!' | b'\n');
+            let is_sentence_delimiter = matches!(b, b'.' | b'?' | b'!' | b'\n');
+            let is_early_clause = !self.first_clause_emitted && matches!(b, b',' | b';' | b':');
 
-            if is_delimiter {
+            if is_sentence_delimiter || is_early_clause {
+                let min_len = if is_early_clause {
+                    MIN_FIRST_CLAUSE_LENGTH
+                } else {
+                    MIN_EMISSION_LENGTH
+                };
+
                 // Defensive check 1: Minimum character threshold
-                if i + 1 < MIN_EMISSION_LENGTH {
+                if i + 1 < min_len {
                     continue;
                 }
 
-                // Defensive check 2: Decimal number protection (e.g. 3.14)
-                if b == b'.' {
-                    if i > 0 && i + 1 < len {
-                        let prev = bytes[i - 1];
-                        let next = bytes[i + 1];
-                        if prev.is_ascii_digit() && next.is_ascii_digit() {
-                            continue;
-                        }
+                // Defensive check 2: Decimal number protection (e.g. 3.14 or 3,14)
+                if (b == b'.' || b == b',') && i > 0 && i + 1 < len {
+                    let prev = bytes[i - 1];
+                    let next = bytes[i + 1];
+                    if prev.is_ascii_digit() && next.is_ascii_digit() {
+                        continue;
                     }
+                }
 
-                    // Defensive check 3: Common Spanish and English abbreviations
+                // Defensive check 3: Common Spanish and English abbreviations for '.'
+                if b == b'.' {
                     let slice = &self.buffer[..=i];
                     if is_common_abbreviation(slice) {
                         continue;
                     }
                 }
 
-                // Check 4: If delimiter is followed immediately by another delimiter (e.g. "...", "?!"), wait
-                if i + 1 < len && matches!(bytes[i + 1], b'.' | b'?' | b'!' | b')' | b'"') {
+                // Defensive check 4: If delimiter is followed immediately by another delimiter (e.g. "...", "?!"), wait
+                if i + 1 < len && matches!(bytes[i + 1], b'.' | b'?' | b'!' | b')' | b'"' | b',') {
+                    continue;
+                }
+
+                // Defensive check 5: For early clause delimiters, ensure it is followed by whitespace or at end of buffer
+                if is_early_clause && i + 1 < len && !bytes[i + 1].is_ascii_whitespace() {
                     continue;
                 }
 
@@ -209,5 +228,47 @@ mod tests {
 
         let s = rx.recv().await.unwrap();
         assert!(s.contains("Ok. Procederemos con la actualización inmediata."));
+    }
+
+    #[tokio::test]
+    async fn test_early_first_clause_emission() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut tokenizer = SentenceTokenizer::new(tx);
+
+        let tokens = vec![
+            "Buenas tardes, ",
+            "Señor, ",
+            "estoy a su entera disposición para lo que necesite.",
+        ];
+
+        for t in tokens {
+            tokenizer.feed_token(t).await.unwrap();
+        }
+        tokenizer.flush().await.unwrap();
+
+        // 1st emission happens early on the first comma (14 chars >= 12)
+        let s1 = rx.recv().await.unwrap();
+        assert_eq!(s1, "Buenas tardes,");
+
+        // 2nd emission does NOT split on subsequent commas; waits for full sentence delimiter or flush
+        let s2 = rx.recv().await.unwrap();
+        assert_eq!(
+            s2,
+            "Señor, estoy a su entera disposición para lo que necesite."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comma_decimal_protection() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut tokenizer = SentenceTokenizer::new(tx);
+
+        // Should not split on comma in Spanish decimal "3,1416"
+        let input = "El valor es 3,1416 en la prueba.";
+        tokenizer.feed_token(input).await.unwrap();
+        tokenizer.flush().await.unwrap();
+
+        let s1 = rx.recv().await.unwrap();
+        assert_eq!(s1, "El valor es 3,1416 en la prueba.");
     }
 }

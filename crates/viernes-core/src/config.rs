@@ -58,6 +58,20 @@ impl ViernesConfig {
             }
         } else {
             let _ = dotenvy::dotenv();
+            if std::env::var("ELEVENLABS_API_KEYS").is_err()
+                && std::env::var("ELEVENLABS_API_KEY").is_err()
+            {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                let config_env = PathBuf::from(&home).join(".config/viernes/.env");
+                if config_env.is_file() {
+                    let _ = dotenvy::from_path(&config_env);
+                } else {
+                    let project_env = PathBuf::from(&home).join("Projects/09-viernes/.env");
+                    if project_env.is_file() {
+                        let _ = dotenvy::from_path(&project_env);
+                    }
+                }
+            }
         }
 
         let mut config = Self::default();

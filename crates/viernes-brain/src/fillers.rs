@@ -21,10 +21,13 @@ pub const PATIENCE_TIMEOUT: Duration = Duration::from_millis(6500);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FillerCollection {
     /// Immediate phrases fired upon speech termination.
+    #[serde(alias = "generic", default)]
     pub immediate: Vec<String>,
-    /// Tool category mapped phrases (e.g. "terminal", "filesystem", "web").
+    /// Tool category mapped phrases (e.g. "terminal", "filesystem", "web", "files", "search").
+    #[serde(default)]
     pub tools: HashMap<String, Vec<String>>,
     /// Patience phrases fired when reasoning exceeds 6.5s.
+    #[serde(default)]
     pub patience: Vec<String>,
 }
 
@@ -34,31 +37,46 @@ impl Default for FillerCollection {
         tools.insert(
             "terminal".to_string(),
             vec![
-                "Ejecutando en terminal, Señor...".into(),
-                "Consultando la consola del sistema...".into(),
+                "Usaré la terminal para verificar, Señor, un momento...".into(),
+                "Consultando la consola del sistema, un segundo...".into(),
+            ],
+        );
+        tools.insert(
+            "files".to_string(),
+            vec![
+                "Permítame revisar los archivos, Señor, un momento...".into(),
+                "Revisando los ficheros locales del proyecto...".into(),
             ],
         );
         tools.insert(
             "filesystem".to_string(),
             vec![
-                "Accediendo al sistema de archivos...".into(),
-                "Revisando los ficheros locales...".into(),
+                "Permítame revisar los archivos, Señor, un momento...".into(),
+                "Revisando los ficheros locales del proyecto...".into(),
+            ],
+        );
+        tools.insert(
+            "search".to_string(),
+            vec![
+                "Buscando información actualizada en la red, un instante...".into(),
+                "Consultando fuentes web, un momento...".into(),
             ],
         );
         tools.insert(
             "web".to_string(),
             vec![
-                "Buscando información actualizada en la red...".into(),
+                "Buscando información actualizada en la red, un instante...".into(),
                 "Consultando fuentes web, un momento...".into(),
             ],
         );
 
         Self {
             immediate: vec![
-                "A la orden, Señor.".into(),
-                "Comprendido, un segundo.".into(),
-                "Procesando su solicitud...".into(),
-                "Enseguida, Señor.".into(),
+                "Deme un segundo, Señor, ya lo reviso.".into(),
+                "Enseguida, Señor, estoy consultando información.".into(),
+                "Un momento, Señor.".into(),
+                "Revisando sus registros, deme un segundo.".into(),
+                "Lo escucho, Señor, un segundo.".into(),
             ],
             tools,
             patience: vec![
@@ -119,11 +137,24 @@ impl FillerCacheManager {
         guard.immediate.choose(&mut rng).cloned()
     }
 
-    /// Select a tool-specific filler phrase for the given category.
-    pub async fn select_tool_filler(&self, category: &str) -> Option<String> {
+    /// Select a tool-specific filler phrase for the given category or tool name.
+    pub async fn select_tool_filler(&self, tool_or_category: &str) -> Option<String> {
         let guard = self.fillers.read().await;
         let mut rng = rand::thread_rng();
-        if let Some(list) = guard.tools.get(category) {
+
+        let category = match tool_or_category {
+            "read_file" | "view_file" | "grep_search" | "find_by_name" | "list_dir"
+            | "filesystem" | "files" => "files",
+            "run_command" | "send_command_input" | "command_status" | "terminal" => "terminal",
+            "search_web" | "search_marketplace" | "web" | "search" => "search",
+            other => other,
+        };
+
+        if let Some(list) = guard
+            .tools
+            .get(category)
+            .or_else(|| guard.tools.get(tool_or_category))
+        {
             list.choose(&mut rng).cloned()
         } else {
             guard.immediate.choose(&mut rng).cloned()

@@ -91,6 +91,10 @@ impl StateMachine {
             (SystemState::Idle, SystemEvent::VoiceStarted | SystemEvent::PttPressed) => {
                 Some(SystemState::Listening)
             }
+            // Resilient recovery: if synthesis starts while in Idle, transition to Speaking
+            (SystemState::Idle, SystemEvent::SpeakingStarted | SystemEvent::SentenceReady(_)) => {
+                Some(SystemState::Speaking)
+            }
 
             // Listening transitions
             (
@@ -105,9 +109,17 @@ impl StateMachine {
                 SystemState::Thinking,
                 SystemEvent::SpeakingStarted | SystemEvent::SentenceReady(_),
             ) => Some(SystemState::Speaking),
+            // Filler playback finishes while thinking: remain in Thinking
+            (SystemState::Thinking, SystemEvent::FillerPlaybackFinished) => {
+                Some(SystemState::Thinking)
+            }
 
-            // Speaking transitions: playback completed -> return to Idle
+            // Speaking transitions: full assistant response completed -> return to Idle
             (SystemState::Speaking, SystemEvent::PlaybackFinished) => Some(SystemState::Idle),
+            // Filler playback finishes while speaking: return to Thinking awaiting real response
+            (SystemState::Speaking, SystemEvent::FillerPlaybackFinished) => {
+                Some(SystemState::Thinking)
+            }
 
             // Speaking interruption (Barge-in): human speaks while assistant talks
             (
@@ -180,6 +192,32 @@ impl StateMachine {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[tokio::test]
+    async fn test_filler_playback_retains_thinking_state() {
+        let sm = StateMachine::new(16);
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Thinking);
+
+        // Filler starts speaking: Thinking -> Speaking
+        sm.dispatch(SystemEvent::SpeakingStarted).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Speaking);
+
+        // Filler finishes: Speaking -> Thinking (NOT Idle!)
+        sm.dispatch(SystemEvent::FillerPlaybackFinished)
+            .await
+            .unwrap();
+        assert_eq!(sm.state().await, SystemState::Thinking);
+
+        // Real AI response arrives: Thinking -> Speaking
+        sm.dispatch(SystemEvent::SpeakingStarted).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Speaking);
+
+        // Real response finishes: Speaking -> Idle
+        sm.dispatch(SystemEvent::PlaybackFinished).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Idle);
+    }
 
     #[tokio::test]
     async fn test_happy_path_lifecycle() {
