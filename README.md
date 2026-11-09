@@ -2,11 +2,11 @@
   <h1 align="center">Viernes</h1>
   <p align="center"><strong>Low-latency, intelligent voice assistant for deterministic Linux workflows.</strong></p>
   <p align="center">
-    <img src="https://img.shields.io/badge/RUST-NATIVE-f5a0c7?style=for-the-badge&labelColor=181820" alt="Rust Native" />
-    <img src="https://img.shields.io/badge/VERSION-v0.1.0-f5a0c7?style=for-the-badge&labelColor=181820" alt="Version" />
-    <img src="https://img.shields.io/badge/SAFETY-FORBID(UNSAFE)-f5a0c7?style=for-the-badge&labelColor=181820" alt="Safety" />
-    <img src="https://img.shields.io/badge/LATENCY-%3C150ms-f5a0c7?style=for-the-badge&labelColor=181820" alt="Latency" />
-    <img src="https://img.shields.io/badge/LICENSE-MIT-f5a0c7?style=for-the-badge&labelColor=181820" alt="License" />
+    <img src="https://img.shields.io/badge/RUST-NATIVE-f59e0b?style=for-the-badge&labelColor=181515" alt="Rust Native" />
+    <img src="https://img.shields.io/badge/VERSION-v0.1.0-dc2626?style=for-the-badge&labelColor=181515" alt="Version" />
+    <img src="https://img.shields.io/badge/SAFETY-FORBID(UNSAFE)-f59e0b?style=for-the-badge&labelColor=181515" alt="Safety" />
+    <img src="https://img.shields.io/badge/LATENCY-%3C150ms-00f0ff?style=for-the-badge&labelColor=181515" alt="Latency" />
+    <img src="https://img.shields.io/badge/LICENSE-MIT-dc2626?style=for-the-badge&labelColor=181515" alt="License" />
   </p>
   <p align="center">
     <a href="#quickstart">Quickstart</a> ·
