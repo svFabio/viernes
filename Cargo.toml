@@ -48,6 +48,7 @@ dotenvy = "0.15"
 crossbeam-channel = "0.5"
 cpal = "0.15"
 hound = "3.5"
+whisper-rs = "0.16.0"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
