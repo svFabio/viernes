@@ -12,7 +12,7 @@ Environment=RUST_BACKTRACE=1
 PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
 ExecStart=%h/.local/bin/viernes --daemon
 Restart=on-failure
-RestartSec=3s
+RestartSec=5s
 KillMode=process
 TimeoutStopSec=3s
 
