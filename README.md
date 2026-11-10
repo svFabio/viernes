@@ -2,10 +2,10 @@
   <h1 align="center">Viernes</h1>
   <p align="center"><strong>Low-latency, intelligent voice assistant for deterministic Linux workflows.</strong></p>
   <p align="center">
-    <img src="https://img.shields.io/badge/RUST-NATIVE-f59e0b?style=for-the-badge&labelColor=181515" alt="Rust Native" />
+    <img src="https://img.shields.io/badge/RUST-NATIVE-dc2626?style=for-the-badge&labelColor=181515" alt="Rust Native" />
     <img src="https://img.shields.io/badge/VERSION-v0.1.0-dc2626?style=for-the-badge&labelColor=181515" alt="Version" />
-    <img src="https://img.shields.io/badge/SAFETY-FORBID(UNSAFE)-f59e0b?style=for-the-badge&labelColor=181515" alt="Safety" />
-    <img src="https://img.shields.io/badge/LATENCY-%3C150ms-00f0ff?style=for-the-badge&labelColor=181515" alt="Latency" />
+    <img src="https://img.shields.io/badge/SAFETY-FORBID(UNSAFE)-dc2626?style=for-the-badge&labelColor=181515" alt="Safety" />
+    <img src="https://img.shields.io/badge/LATENCY-%3C150ms-dc2626?style=for-the-badge&labelColor=181515" alt="Latency" />
     <img src="https://img.shields.io/badge/LICENSE-MIT-dc2626?style=for-the-badge&labelColor=181515" alt="License" />
   </p>
   <p align="center">
@@ -79,8 +79,8 @@ The project is structured as a decoupled, modular Rust workspace:
 
 - **Linux x86_64** (Wayland / PipeWire recommended)
 - **Rust toolchain** >= 1.85 (`cargo`, `rustc`)
-- **Python** >= 3.12 (managed via `uv`)
-- Dependencies: `libasound2-dev` / `alsa-lib`, `pipewire`
+- **System build tools**: `cmake`, `build-essential`, `pkg-config`, `libasound2-dev`, `libssl-dev`
+- **Whisper GGML Model**: `ggml-tiny.bin` (placed in `~/.config/viernes/models/` or `models/`)
 
 ### 2. Build & Install
 
@@ -164,17 +164,12 @@ viernes --tui
 Every commit is verified against deterministic automated test suites:
 
 ```bash
-# Run 100% of Rust unit, integration, and property tests (121 tests)
+# Run 100% of native Rust unit, integration, and property tests (104+ tests)
 cargo test --workspace
 
 # Run Rust linter and format validation
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
-
-# Run Python regression and contract test suite (212 tests)
-uv run pytest tests -v
-uv run ruff check .
-uv run ruff format --check .
 ```
 
 ---

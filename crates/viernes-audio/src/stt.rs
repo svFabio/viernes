@@ -50,66 +50,6 @@ pub fn resolve_whisper_model_path(configured: &Path) -> PathBuf {
     configured.to_path_buf()
 }
 
-/// Resolves optional legacy python transcription script path if present for testing.
-#[must_use]
-pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
-    // 1. Explicit environment variable override
-    if let Ok(path_str) = std::env::var("VIERNES_TRANSCRIBE_SCRIPT") {
-        let p = PathBuf::from(path_str);
-        if p.exists() {
-            return p.canonicalize().ok().or(Some(p));
-        }
-    }
-
-    // 2. Relative to current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("scripts/transcribe_wav.py");
-            if candidate.exists() {
-                return candidate.canonicalize().ok().or(Some(candidate));
-            }
-            let candidate_root = parent.join("../../scripts/transcribe_wav.py");
-            if candidate_root.exists() {
-                return candidate_root.canonicalize().ok().or(Some(candidate_root));
-            }
-        }
-    }
-
-    // 3. Current working directory
-    let cwd_path = PathBuf::from("scripts/transcribe_wav.py");
-    if cwd_path.exists() {
-        return cwd_path.canonicalize().ok().or(Some(cwd_path));
-    }
-
-    // 4. Default user project path
-    if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(home).join("Projects/09-viernes/scripts/transcribe_wav.py");
-        if candidate.exists() {
-            return candidate.canonicalize().ok().or(Some(candidate));
-        }
-    }
-
-    None
-}
-
-/// Resolves path to the `uv` executable, checking environment and user binaries.
-#[must_use]
-pub fn resolve_uv_binary() -> PathBuf {
-    if let Ok(bin_str) = std::env::var("VIERNES_UV_BIN") {
-        let p = PathBuf::from(bin_str);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(home).join(".local/bin/uv");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from("uv")
-}
-
 /// List of recognized hallucination tokens, noise tags, and spurious endings.
 const HALLUCINATION_PATTERNS: &[&str] = &[
     "[música]",
@@ -316,69 +256,10 @@ impl SpeechToText for LocalWhisperTranscriber {
                 return Ok(text.trim().to_string());
             }
 
-            // Fallback to python script if model file is not present locally
-            let script_path = resolve_transcribe_script_path();
-            if let Some(ref script) = script_path {
-                let temp_wav =
-                    std::env::temp_dir().join(format!("viernes_stt_{}.wav", uuid::Uuid::new_v4()));
-                let spec = hound::WavSpec {
-                    channels: 1,
-                    sample_rate: 16_000,
-                    bits_per_sample: 16,
-                    sample_format: hound::SampleFormat::Int,
-                };
-
-                let mut writer = hound::WavWriter::create(&temp_wav, spec)
-                    .map_err(|e| ViernesError::Stt(format!("Failed to create WAV file: {e}")))?;
-                for &sample in &samples_vec {
-                    let clamped = sample.clamp(-1.0, 1.0);
-                    let sample_i16 = (clamped * 32767.0) as i16;
-                    writer.write_sample(sample_i16).map_err(|e| {
-                        ViernesError::Stt(format!("Failed to write WAV sample: {e}"))
-                    })?;
-                }
-                writer
-                    .finalize()
-                    .map_err(|e| ViernesError::Stt(format!("Failed to finalize WAV file: {e}")))?;
-
-                let script_abs = script.canonicalize().unwrap_or_else(|_| script.clone());
-                let project_dir = script_abs
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-
-                let uv_bin = resolve_uv_binary();
-                let output = std::process::Command::new(uv_bin)
-                    .current_dir(project_dir)
-                    .args(["run", "python"])
-                    .arg(&script_abs)
-                    .arg(&temp_wav)
-                    .output();
-
-                let _ = std::fs::remove_file(&temp_wav);
-
-                match output {
-                    Ok(out) if out.status.success() => {
-                        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        Ok(text)
-                    }
-                    Ok(out) => {
-                        let err = String::from_utf8_lossy(&out.stderr);
-                        Err(ViernesError::Stt(format!(
-                            "Whisper inference failed: {err}"
-                        )))
-                    }
-                    Err(e) => Err(ViernesError::Stt(format!(
-                        "Failed to spawn Whisper process: {e}"
-                    ))),
-                }
-            } else {
-                Err(ViernesError::Stt(format!(
-                    "Whisper inference engine not found at: {}",
-                    model_path.display()
-                )))
-            }
+            Err(ViernesError::Stt(format!(
+                "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
+                model_path.display()
+            )))
         })
         .await
         .map_err(|e| ViernesError::Stt(format!("STT compute task panicked or cancelled: {e}")))?;

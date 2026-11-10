@@ -17,8 +17,6 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
-uuid.workspace = true
-hound.workspace = true
 whisper-rs.workspace = true
 
 [dev-dependencies]
