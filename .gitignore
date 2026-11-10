@@ -27,4 +27,6 @@ target/
 pgo-data/
 *.profdata
 *.profraw
+models/*.bin
+models/
 

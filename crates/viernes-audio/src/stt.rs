@@ -12,62 +12,42 @@ use viernes_core::error::ViernesError;
 use viernes_core::traits::SpeechToText;
 
 /// Resolves the filesystem path to `scripts/transcribe_wav.py` robustly across working directories.
-pub fn resolve_transcribe_script_path() -> Option<PathBuf> {
-    // 1. Explicit environment variable override
-    if let Ok(path_str) = std::env::var("VIERNES_TRANSCRIBE_SCRIPT") {
-        let p = PathBuf::from(path_str);
-        if p.exists() {
-            return p.canonicalize().ok().or(Some(p));
-        }
-    }
-
-    // 2. Relative to current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("scripts/transcribe_wav.py");
-            if candidate.exists() {
-                return candidate.canonicalize().ok().or(Some(candidate));
-            }
-            let candidate_root = parent.join("../../scripts/transcribe_wav.py");
-            if candidate_root.exists() {
-                return candidate_root.canonicalize().ok().or(Some(candidate_root));
-            }
-        }
-    }
-
-    // 3. Current working directory
-    let cwd_path = PathBuf::from("scripts/transcribe_wav.py");
-    if cwd_path.exists() {
-        return cwd_path.canonicalize().ok().or(Some(cwd_path));
-    }
-
-    // 4. Default user project path
-    if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(home).join("Projects/09-viernes/scripts/transcribe_wav.py");
-        if candidate.exists() {
-            return candidate.canonicalize().ok().or(Some(candidate));
-        }
-    }
-
-    None
-}
-
-/// Resolves path to the `uv` executable, checking environment and user binaries.
+/// Resolves the absolute path to the local GGML model file.
 #[must_use]
-pub fn resolve_uv_binary() -> PathBuf {
-    if let Ok(bin_str) = std::env::var("VIERNES_UV_BIN") {
-        let p = PathBuf::from(bin_str);
+pub fn resolve_whisper_model_path(configured: &Path) -> PathBuf {
+    if configured.exists() {
+        return configured.to_path_buf();
+    }
+
+    if let Ok(path_str) = std::env::var("VIERNES_WHISPER_MODEL") {
+        let p = PathBuf::from(path_str);
         if p.exists() {
             return p;
         }
     }
+
     if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(home).join(".local/bin/uv");
-        if candidate.exists() {
-            return candidate;
+        let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
+        if user_tiny.exists() {
+            return user_tiny;
+        }
+        let user_base = PathBuf::from(&home).join(".config/viernes/models/ggml-base.bin");
+        if user_base.exists() {
+            return user_base;
         }
     }
-    PathBuf::from("uv")
+
+    let repo_tiny = PathBuf::from("models/ggml-tiny.bin");
+    if repo_tiny.exists() {
+        return repo_tiny;
+    }
+
+    let repo_base = PathBuf::from("models/ggml-base.bin");
+    if repo_base.exists() {
+        return repo_base;
+    }
+
+    configured.to_path_buf()
 }
 
 /// List of recognized hallucination tokens, noise tags, and spurious endings.
@@ -163,8 +143,19 @@ pub struct WhisperConfig {
 
 impl Default for WhisperConfig {
     fn default() -> Self {
+        let default_model = if let Ok(home) = std::env::var("HOME") {
+            let user_tiny = PathBuf::from(home).join(".config/viernes/models/ggml-tiny.bin");
+            if user_tiny.exists() {
+                user_tiny
+            } else {
+                PathBuf::from("models/ggml-tiny.bin")
+            }
+        } else {
+            PathBuf::from("models/ggml-tiny.bin")
+        };
+
         Self {
-            model_path: PathBuf::from("models/ggml-base.bin"),
+            model_path: default_model,
             language: "es".into(),
             cpu_threads: 4,
         }
@@ -218,79 +209,57 @@ impl SpeechToText for LocalWhisperTranscriber {
         }
 
         let model_path = self.config.model_path.clone();
-        let _language = self.config.language.clone();
+        let language = self.config.language.clone();
+        let cpu_threads = self.config.cpu_threads;
         let samples_vec = samples.to_vec();
 
-        // Acceptance Criterion 5: Inferencia no bloqueante con spawn_blocking
+        // Acceptance Criterion 5: Inferencia no bloqueante con spawn_blocking directa en memoria RAM
         let raw_result = tokio::task::spawn_blocking(move || -> Result<String, ViernesError> {
-            let temp_wav =
-                std::env::temp_dir().join(format!("viernes_stt_{}.wav", uuid::Uuid::new_v4()));
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
+            let resolved_model = resolve_whisper_model_path(&model_path);
+            if resolved_model.exists() {
+                let ctx = whisper_rs::WhisperContext::new_with_params(
+                    &resolved_model,
+                    whisper_rs::WhisperContextParameters::default(),
+                )
+                .map_err(|e| ViernesError::Stt(format!("Failed to load Whisper context: {e}")))?;
 
-            let mut writer = hound::WavWriter::create(&temp_wav, spec)
-                .map_err(|e| ViernesError::Stt(format!("Failed to create WAV file: {e}")))?;
-            for &sample in &samples_vec {
-                let clamped = sample.clamp(-1.0, 1.0);
-                let sample_i16 = (clamped * 32767.0) as i16;
-                writer
-                    .write_sample(sample_i16)
-                    .map_err(|e| ViernesError::Stt(format!("Failed to write WAV sample: {e}")))?;
-            }
-            writer
-                .finalize()
-                .map_err(|e| ViernesError::Stt(format!("Failed to finalize WAV file: {e}")))?;
+                let mut state = ctx.create_state().map_err(|e| {
+                    ViernesError::Stt(format!("Failed to create Whisper state: {e}"))
+                })?;
 
-            let script_path = resolve_transcribe_script_path();
-            let output = if let Some(ref script) = script_path {
-                let script_abs = script.canonicalize().unwrap_or_else(|_| script.clone());
-                let project_dir = script_abs
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
+                let mut params =
+                    whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
+                        best_of: 1,
+                    });
+                params.set_language(Some(&language));
+                params.set_n_threads(cpu_threads as i32);
+                params.set_print_special(false);
+                params.set_print_progress(false);
+                params.set_print_realtime(false);
+                params.set_print_timestamps(false);
+                params.set_translate(false);
 
-                let uv_bin = resolve_uv_binary();
-                std::process::Command::new(uv_bin)
-                    .current_dir(project_dir)
-                    .args(["run", "python"])
-                    .arg(&script_abs)
-                    .arg(&temp_wav)
-                    .output()
-            } else if model_path.exists() {
-                return Ok(format!(
-                    "Inference executed on {} samples",
-                    samples_vec.len()
-                ));
-            } else {
-                let _ = std::fs::remove_file(&temp_wav);
-                return Err(ViernesError::Stt(format!(
-                    "Whisper inference engine not found at: {}",
-                    model_path.display()
-                )));
-            };
+                state
+                    .full(params, &samples_vec)
+                    .map_err(|e| ViernesError::Stt(format!("Whisper inference error: {e}")))?;
 
-            let _ = std::fs::remove_file(&temp_wav);
-
-            match output {
-                Ok(out) if out.status.success() => {
-                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    Ok(text)
+                let num_segments = state.full_n_segments();
+                let mut text = String::new();
+                for i in 0..num_segments {
+                    if let Some(segment) = state.get_segment(i) {
+                        if let Ok(segment_str) = segment.to_str() {
+                            text.push_str(segment_str);
+                        }
+                    }
                 }
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    Err(ViernesError::Stt(format!(
-                        "Whisper inference failed: {err}"
-                    )))
-                }
-                Err(e) => Err(ViernesError::Stt(format!(
-                    "Failed to spawn Whisper process: {e}"
-                ))),
+
+                return Ok(text.trim().to_string());
             }
+
+            Err(ViernesError::Stt(format!(
+                "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
+                model_path.display()
+            )))
         })
         .await
         .map_err(|e| ViernesError::Stt(format!("STT compute task panicked or cancelled: {e}")))?;
@@ -437,6 +406,27 @@ mod tests {
         assert_eq!(
             result, "",
             "Micro-clicks under 2400 samples must return empty without executing inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_native_whisper_rs_inference_with_model() {
+        let model_path = resolve_whisper_model_path(Path::new("models/ggml-tiny.bin"));
+        if !model_path.exists() {
+            return;
+        }
+        let config = WhisperConfig {
+            model_path,
+            language: "es".into(),
+            cpu_threads: 2,
+        };
+        let transcriber = LocalWhisperTranscriber::new(config).unwrap();
+        // 1 second of silence samples @ 16kHz
+        let samples = vec![0.0f32; 16000];
+        let result = transcriber.transcribe(&samples, 16000).await;
+        assert!(
+            result.is_ok(),
+            "Native Whisper inference with ggml-tiny must succeed"
         );
     }
 }
