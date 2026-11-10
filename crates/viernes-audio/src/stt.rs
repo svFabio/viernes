@@ -27,24 +27,24 @@ pub fn resolve_whisper_model_path(configured: &Path) -> PathBuf {
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
-        if user_tiny.exists() {
-            return user_tiny;
-        }
         let user_base = PathBuf::from(&home).join(".config/viernes/models/ggml-base.bin");
         if user_base.exists() {
             return user_base;
         }
-    }
-
-    let repo_tiny = PathBuf::from("models/ggml-tiny.bin");
-    if repo_tiny.exists() {
-        return repo_tiny;
+        let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
+        if user_tiny.exists() {
+            return user_tiny;
+        }
     }
 
     let repo_base = PathBuf::from("models/ggml-base.bin");
     if repo_base.exists() {
         return repo_base;
+    }
+
+    let repo_tiny = PathBuf::from("models/ggml-tiny.bin");
+    if repo_tiny.exists() {
+        return repo_tiny;
     }
 
     configured.to_path_buf()
@@ -144,14 +144,19 @@ pub struct WhisperConfig {
 impl Default for WhisperConfig {
     fn default() -> Self {
         let default_model = if let Ok(home) = std::env::var("HOME") {
-            let user_tiny = PathBuf::from(home).join(".config/viernes/models/ggml-tiny.bin");
-            if user_tiny.exists() {
-                user_tiny
+            let user_base = PathBuf::from(&home).join(".config/viernes/models/ggml-base.bin");
+            if user_base.exists() {
+                user_base
             } else {
-                PathBuf::from("models/ggml-tiny.bin")
+                let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
+                if user_tiny.exists() {
+                    user_tiny
+                } else {
+                    PathBuf::from("models/ggml-base.bin")
+                }
             }
         } else {
-            PathBuf::from("models/ggml-tiny.bin")
+            PathBuf::from("models/ggml-base.bin")
         };
 
         let cpu_threads = std::thread::available_parallelism()
@@ -293,6 +298,7 @@ impl SpeechToText for LocalWhisperTranscriber {
                     best_of: 1,
                 });
             params.set_language(Some(&language));
+            params.set_initial_prompt("Hola Viernes, soy el Señor. Asistente de voz en español.");
             params.set_n_threads(cpu_threads as i32);
             params.set_print_special(false);
             params.set_print_progress(false);
