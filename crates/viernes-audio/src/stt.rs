@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use viernes_core::error::ViernesError;
 use viernes_core::traits::SpeechToText;
 
@@ -27,24 +27,24 @@ pub fn resolve_whisper_model_path(configured: &Path) -> PathBuf {
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
-        if user_tiny.exists() {
-            return user_tiny;
-        }
         let user_base = PathBuf::from(&home).join(".config/viernes/models/ggml-base.bin");
         if user_base.exists() {
             return user_base;
         }
-    }
-
-    let repo_tiny = PathBuf::from("models/ggml-tiny.bin");
-    if repo_tiny.exists() {
-        return repo_tiny;
+        let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
+        if user_tiny.exists() {
+            return user_tiny;
+        }
     }
 
     let repo_base = PathBuf::from("models/ggml-base.bin");
     if repo_base.exists() {
         return repo_base;
+    }
+
+    let repo_tiny = PathBuf::from("models/ggml-tiny.bin");
+    if repo_tiny.exists() {
+        return repo_tiny;
     }
 
     configured.to_path_buf()
@@ -144,20 +144,30 @@ pub struct WhisperConfig {
 impl Default for WhisperConfig {
     fn default() -> Self {
         let default_model = if let Ok(home) = std::env::var("HOME") {
-            let user_tiny = PathBuf::from(home).join(".config/viernes/models/ggml-tiny.bin");
-            if user_tiny.exists() {
-                user_tiny
+            let user_base = PathBuf::from(&home).join(".config/viernes/models/ggml-base.bin");
+            if user_base.exists() {
+                user_base
             } else {
-                PathBuf::from("models/ggml-tiny.bin")
+                let user_tiny = PathBuf::from(&home).join(".config/viernes/models/ggml-tiny.bin");
+                if user_tiny.exists() {
+                    user_tiny
+                } else {
+                    PathBuf::from("models/ggml-base.bin")
+                }
             }
         } else {
-            PathBuf::from("models/ggml-tiny.bin")
+            PathBuf::from("models/ggml-base.bin")
         };
+
+        let cpu_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(8);
 
         Self {
             model_path: default_model,
             language: "es".into(),
-            cpu_threads: 4,
+            cpu_threads,
         }
     }
 }
@@ -166,26 +176,70 @@ impl Default for WhisperConfig {
 ///
 /// Validates 16kHz mono Float32 audio format, executes inference inside
 /// `tokio::task::spawn_blocking` to preserve async runtime throughput,
+/// retains a resident `WhisperContext` in RAM to eliminate per-turn model reloading overhead,
 /// and applies deterministic hallucination filtering.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct LocalWhisperTranscriber {
     config: WhisperConfig,
+    context: Option<Arc<whisper_rs::WhisperContext>>,
+}
+
+impl std::fmt::Debug for LocalWhisperTranscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalWhisperTranscriber")
+            .field("config", &self.config)
+            .field("has_context", &self.context.is_some())
+            .finish()
+    }
 }
 
 impl LocalWhisperTranscriber {
-    /// Instantiates a new local transcriber.
+    /// Instantiates a new local transcriber and pre-loads `WhisperContext` into RAM when the model exists.
     pub fn new(config: WhisperConfig) -> Result<Self, ViernesError> {
+        let resolved_model = resolve_whisper_model_path(&config.model_path);
+        let context = if resolved_model.exists() {
+            match whisper_rs::WhisperContext::new_with_params(
+                &resolved_model,
+                whisper_rs::WhisperContextParameters::default(),
+            ) {
+                Ok(ctx) => {
+                    info!(
+                        model = %resolved_model.display(),
+                        threads = config.cpu_threads,
+                        "Pre-loaded resident WhisperContext into RAM successfully"
+                    );
+                    Some(Arc::new(ctx))
+                }
+                Err(e) => {
+                    warn!(
+                        model = %resolved_model.display(),
+                        error = %e,
+                        "Failed to pre-load WhisperContext at startup; will attempt on demand"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         info!(
-            "Initialized LocalWhisperTranscriber with model: {:?}, lang: '{}'",
-            config.model_path, config.language
+            "Initialized LocalWhisperTranscriber with model: {:?}, lang: '{}', threads: {}",
+            config.model_path, config.language, config.cpu_threads
         );
-        Ok(Self { config })
+        Ok(Self { config, context })
     }
 
     /// Returns reference to config.
     #[must_use]
     pub fn config(&self) -> &WhisperConfig {
         &self.config
+    }
+
+    /// Returns true if resident WhisperContext is pre-loaded in memory.
+    #[must_use]
+    pub fn is_context_loaded(&self) -> bool {
+        self.context.is_some()
     }
 }
 
@@ -212,54 +266,61 @@ impl SpeechToText for LocalWhisperTranscriber {
         let language = self.config.language.clone();
         let cpu_threads = self.config.cpu_threads;
         let samples_vec = samples.to_vec();
+        let cached_ctx = self.context.clone();
 
         // Acceptance Criterion 5: Inferencia no bloqueante con spawn_blocking directa en memoria RAM
         let raw_result = tokio::task::spawn_blocking(move || -> Result<String, ViernesError> {
-            let resolved_model = resolve_whisper_model_path(&model_path);
-            if resolved_model.exists() {
-                let ctx = whisper_rs::WhisperContext::new_with_params(
-                    &resolved_model,
-                    whisper_rs::WhisperContextParameters::default(),
-                )
-                .map_err(|e| ViernesError::Stt(format!("Failed to load Whisper context: {e}")))?;
+            let ctx_arc = if let Some(ctx) = cached_ctx {
+                ctx
+            } else {
+                let resolved_model = resolve_whisper_model_path(&model_path);
+                if resolved_model.exists() {
+                    let ctx = whisper_rs::WhisperContext::new_with_params(
+                        &resolved_model,
+                        whisper_rs::WhisperContextParameters::default(),
+                    )
+                    .map_err(|e| ViernesError::Stt(format!("Failed to load Whisper context: {e}")))?;
+                    Arc::new(ctx)
+                } else {
+                    return Err(ViernesError::Stt(format!(
+                        "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
+                        model_path.display()
+                    )));
+                }
+            };
 
-                let mut state = ctx.create_state().map_err(|e| {
-                    ViernesError::Stt(format!("Failed to create Whisper state: {e}"))
-                })?;
+            let mut state = ctx_arc.create_state().map_err(|e| {
+                ViernesError::Stt(format!("Failed to create Whisper state: {e}"))
+            })?;
 
-                let mut params =
-                    whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
-                        best_of: 1,
-                    });
-                params.set_language(Some(&language));
-                params.set_n_threads(cpu_threads as i32);
-                params.set_print_special(false);
-                params.set_print_progress(false);
-                params.set_print_realtime(false);
-                params.set_print_timestamps(false);
-                params.set_translate(false);
+            let mut params =
+                whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
+                    best_of: 1,
+                });
+            params.set_language(Some(&language));
+            params.set_initial_prompt("Hola Viernes, soy el Señor. Asistente de voz en español.");
+            params.set_n_threads(cpu_threads as i32);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_translate(false);
 
-                state
-                    .full(params, &samples_vec)
-                    .map_err(|e| ViernesError::Stt(format!("Whisper inference error: {e}")))?;
+            state
+                .full(params, &samples_vec)
+                .map_err(|e| ViernesError::Stt(format!("Whisper inference error: {e}")))?;
 
-                let num_segments = state.full_n_segments();
-                let mut text = String::new();
-                for i in 0..num_segments {
-                    if let Some(segment) = state.get_segment(i) {
-                        if let Ok(segment_str) = segment.to_str() {
-                            text.push_str(segment_str);
-                        }
+            let num_segments = state.full_n_segments();
+            let mut text = String::new();
+            for i in 0..num_segments {
+                if let Some(segment) = state.get_segment(i) {
+                    if let Ok(segment_str) = segment.to_str() {
+                        text.push_str(segment_str);
                     }
                 }
-
-                return Ok(text.trim().to_string());
             }
 
-            Err(ViernesError::Stt(format!(
-                "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
-                model_path.display()
-            )))
+            Ok(text.trim().to_string())
         })
         .await
         .map_err(|e| ViernesError::Stt(format!("STT compute task panicked or cancelled: {e}")))?;
