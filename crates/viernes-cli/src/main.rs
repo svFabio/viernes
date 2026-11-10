@@ -746,7 +746,10 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         last_filler_time = std::time::Instant::now();
 
         if let Some(audio) = ctx.fillers.get_cached_audio(&filler).await {
-            info!("Enqueuing instant filler directly from RAM (< 1ms): '{}'", filler);
+            info!(
+                "Enqueuing instant filler directly from RAM (< 1ms): '{}'",
+                filler
+            );
             let mut p = ctx.player.lock().await;
             if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
                 let _ = p.enqueue_filler(audio).await;
