@@ -744,41 +744,30 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         info!("Dispatching instant conversational filler: '{}'", filler);
         total_fillers_played += 1;
         last_filler_time = std::time::Instant::now();
-        let tts_filler = ctx.tts.clone();
-        let player_filler = ctx.player.clone();
-        let fillers_ref = ctx.fillers.clone();
-        let resp_started = response_started.clone();
-        let epoch = ctx.turn_epoch.clone();
-        let turn_id = ctx.turn_id;
-        tokio::spawn(async move {
-            if epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
-                return;
-            }
-            let audio_opt = if let Some(cached) = fillers_ref.get_cached_audio(&filler).await {
-                debug!("Dispatching pre-warmed instant filler audio directly from RAM");
-                Some(cached)
-            } else {
-                tts_filler.synthesize_resilient(&filler).await.ok()
-            };
 
-            if let Some(audio) = audio_opt {
-                // If the real response already started or turn was cancelled, discard filler immediately
-                if resp_started.load(std::sync::atomic::Ordering::SeqCst)
-                    || epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id
-                {
-                    tracing::debug!("Discarding instant filler because assistant response already arrived or turn cancelled");
-                    return;
-                }
-                let mut p = player_filler.lock().await;
-                if resp_started.load(std::sync::atomic::Ordering::SeqCst)
-                    || epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id
-                {
-                    tracing::debug!("Discarding instant filler because assistant response already enqueued or turn cancelled");
-                    return;
-                }
+        if let Some(audio) = ctx.fillers.get_cached_audio(&filler).await {
+            info!("Enqueuing instant filler directly from RAM (< 1ms): '{}'", filler);
+            let mut p = ctx.player.lock().await;
+            if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
                 let _ = p.enqueue_filler(audio).await;
             }
-        });
+        } else {
+            let tts_filler = ctx.tts.clone();
+            let player_filler = ctx.player.clone();
+            let epoch = ctx.turn_epoch.clone();
+            let turn_id = ctx.turn_id;
+            tokio::spawn(async move {
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
+                    return;
+                }
+                if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
+                    let mut p = player_filler.lock().await;
+                    if epoch.load(std::sync::atomic::Ordering::SeqCst) == turn_id {
+                        let _ = p.enqueue_filler(audio).await;
+                    }
+                }
+            });
+        }
     }
 
     // 2. Setup streaming SentenceTokenizer
