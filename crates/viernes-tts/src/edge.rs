@@ -13,7 +13,7 @@ use viernes_core::traits::TextToSpeech;
 use crate::error::TtsError;
 
 const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-const DEFAULT_EDGE_VOICE: &str = "es-ES-ElviraNeural";
+const DEFAULT_EDGE_VOICE: &str = "es-CO-SalomeNeural";
 const DEFAULT_AUDIO_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 
 /// Native asynchronous Edge-TTS fallback provider communicating directly over WebSockets.
@@ -25,8 +25,12 @@ pub struct EdgeTtsClient {
 
 impl Default for EdgeTtsClient {
     fn default() -> Self {
+        let voice = std::env::var("EDGE_TTS_VOICE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_EDGE_VOICE.to_string());
         Self {
-            voice: DEFAULT_EDGE_VOICE.to_string(),
+            voice,
             audio_format: DEFAULT_AUDIO_FORMAT.to_string(),
         }
     }
@@ -144,9 +148,16 @@ impl EdgeTtsClient {
         );
 
         debug!("Connecting to Edge-TTS WebSocket endpoint");
-        let (ws_stream, _) = connect_async(request)
-            .await
-            .map_err(|e| TtsError::WebSocket(format!("WebSocket handshake failed: {e}")))?;
+        let (ws_stream, _) = match connect_async(request).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "Edge-TTS WebSocket handshake failed; falling back to local edge-tts engine"
+                );
+                return self.synthesize_via_cli(trimmed).await;
+            }
+        };
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -200,6 +211,65 @@ impl EdgeTtsClient {
         } else {
             Ok(audio_accumulator)
         }
+    }
+
+    /// Synthesizes speech using the local `edge-tts` tool with automatic DRM v2 negotiation.
+    pub async fn synthesize_via_cli(&self, text: &str) -> Result<Vec<u8>, TtsError> {
+        let temp_file = std::env::temp_dir().join(format!("viernes_edge_{}.mp3", Uuid::new_v4()));
+
+        let edge_bin = if let Ok(home) = std::env::var("HOME") {
+            let p = std::path::PathBuf::from(home).join(".local/bin/edge-tts");
+            if p.exists() {
+                p
+            } else {
+                std::path::PathBuf::from("edge-tts")
+            }
+        } else {
+            std::path::PathBuf::from("edge-tts")
+        };
+
+        let mut cmd = if edge_bin.exists() {
+            tokio::process::Command::new(edge_bin)
+        } else {
+            let uv_bin = if let Ok(home) = std::env::var("HOME") {
+                let p = std::path::PathBuf::from(home).join(".local/bin/uv");
+                if p.exists() {
+                    p
+                } else {
+                    std::path::PathBuf::from("uv")
+                }
+            } else {
+                std::path::PathBuf::from("uv")
+            };
+            let mut c = tokio::process::Command::new(uv_bin);
+            c.args(["run", "--with", "edge-tts", "edge-tts"]);
+            c
+        };
+
+        cmd.arg("--text")
+            .arg(text)
+            .arg("--voice")
+            .arg(&self.voice)
+            .arg("--write-media")
+            .arg(&temp_file);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| TtsError::Protocol(format!("Failed to spawn edge-tts: {e}")))?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let _ = tokio::fs::remove_file(&temp_file).await;
+            return Err(TtsError::Protocol(format!("edge-tts failed: {err}")));
+        }
+
+        let bytes = tokio::fs::read(&temp_file)
+            .await
+            .map_err(|e| TtsError::Protocol(format!("Failed to read edge-tts audio: {e}")))?;
+
+        let _ = tokio::fs::remove_file(&temp_file).await;
+        Ok(bytes)
     }
 }
 

@@ -108,6 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return tui::run_tui(config).await;
     }
 
+    // Silence verbose C-level stderr (ALSA channel map diagnostics) preserving Rust tracing logs
+    silence_c_stderr();
+
     // Initialize structured tracing to stdout
     tracing_subscriber::fmt()
         .with_writer(std::io::stdout)

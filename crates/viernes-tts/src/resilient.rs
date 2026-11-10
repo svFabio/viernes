@@ -62,11 +62,23 @@ impl ResilientTtsEngine {
                 let fallback_result = self.fallback.synthesize(text).await;
                 let failover_duration = failover_start.elapsed();
 
-                info!(
-                    failover_ms = failover_duration.as_millis(),
-                    total_ms = start.elapsed().as_millis(),
-                    "Fallback synthesis completed"
-                );
+                match &fallback_result {
+                    Ok(bytes) => {
+                        info!(
+                            bytes = bytes.len(),
+                            failover_ms = failover_duration.as_millis(),
+                            total_ms = start.elapsed().as_millis(),
+                            "Fallback synthesis completed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            failover_ms = failover_duration.as_millis(),
+                            "Fallback synthesis failed"
+                        );
+                    }
+                }
 
                 fallback_result
             }
