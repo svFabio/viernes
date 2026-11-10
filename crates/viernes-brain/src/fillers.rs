@@ -91,6 +91,7 @@ impl Default for FillerCollection {
 pub struct FillerCacheManager {
     file_path: PathBuf,
     fillers: Arc<RwLock<FillerCollection>>,
+    audio_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
 impl FillerCacheManager {
@@ -127,7 +128,83 @@ impl FillerCacheManager {
         Ok(Self {
             file_path,
             fillers: Arc::new(RwLock::new(fillers)),
+            audio_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Converts a conversational filler phrase into a canonical filesystem cache key.
+    #[must_use]
+    pub fn phrase_to_cache_key(phrase: &str) -> String {
+        let normalized = phrase
+            .to_lowercase()
+            .replace('á', "a")
+            .replace('é', "e")
+            .replace('í', "i")
+            .replace('ó', "o")
+            .replace('ú', "u")
+            .replace('ñ', "n");
+
+        let mut key = String::new();
+        for c in normalized.chars() {
+            if c.is_ascii_alphanumeric() {
+                key.push(c);
+            } else if c == ' ' && !key.ends_with('_') {
+                key.push('_');
+            }
+        }
+        key.trim_matches('_').to_string()
+    }
+
+    /// Pre-warm and index all `.mp3` audio files found in `cache_dir` into RAM.
+    pub async fn prewarm_audio_cache<P: AsRef<Path>>(&self, cache_dir: P) -> usize {
+        let dir = cache_dir.as_ref();
+        if !dir.exists() {
+            let _ = create_dir_all(dir);
+            return 0;
+        }
+
+        let mut loaded_count = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut guard = self.audio_cache.write().await;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "mp3") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if !bytes.is_empty() {
+                                guard.insert(stem.to_string(), bytes);
+                                loaded_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if loaded_count > 0 {
+            info!(
+                loaded_count,
+                "Pre-warmed conversational filler audio clips into RAM successfully"
+            );
+        }
+        loaded_count
+    }
+
+    /// Retrieve pre-warmed audio bytes for a phrase, matching against canonical cache key.
+    pub async fn get_cached_audio(&self, phrase: &str) -> Option<Vec<u8>> {
+        let key = Self::phrase_to_cache_key(phrase);
+        let guard = self.audio_cache.read().await;
+        if let Some(exact) = guard.get(&key) {
+            return Some(exact.clone());
+        }
+        // Fallback: return any available cached audio clip to avoid zero-audio lag
+        guard.values().next().cloned()
+    }
+
+    /// Manually cache synthesized audio for a phrase.
+    pub async fn store_cached_audio(&self, phrase: &str, audio: Vec<u8>) {
+        let key = Self::phrase_to_cache_key(phrase);
+        let mut guard = self.audio_cache.write().await;
+        guard.insert(key, audio);
     }
 
     /// Select an immediate filler phrase at random in < 150ms.

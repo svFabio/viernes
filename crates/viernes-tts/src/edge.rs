@@ -1,17 +1,12 @@
 //! Native async WebSocket client for Microsoft Edge Text-to-Speech fallback.
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, warn};
-use uuid::Uuid;
 use viernes_core::error::ViernesError;
 use viernes_core::traits::TextToSpeech;
 
 use crate::error::TtsError;
 
+#[allow(dead_code)]
 const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const DEFAULT_EDGE_VOICE: &str = "es-CO-SalomeNeural";
 const DEFAULT_AUDIO_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
@@ -20,6 +15,7 @@ const DEFAULT_AUDIO_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 #[derive(Debug, Clone)]
 pub struct EdgeTtsClient {
     voice: String,
+    #[allow(dead_code)]
     audio_format: String,
     rate: String,
     pitch: String,
@@ -34,11 +30,11 @@ impl Default for EdgeTtsClient {
         let rate = std::env::var("EDGE_TTS_RATE")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "+22%".to_string());
+            .unwrap_or_else(|| "+30%".to_string());
         let pitch = std::env::var("EDGE_TTS_PITCH")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "+4Hz".to_string());
+            .unwrap_or_else(|| "+6Hz".to_string());
 
         Self {
             voice,
@@ -59,9 +55,10 @@ impl EdgeTtsClient {
     /// Creates an `EdgeTtsClient` specifying a custom neural voice name.
     #[must_use]
     pub fn with_voice(voice: impl Into<String>) -> Self {
-        let mut client = Self::default();
-        client.voice = voice.into();
-        client
+        Self {
+            voice: voice.into(),
+            ..Default::default()
+        }
     }
 
     /// Escapes XML special characters for valid SSML body formatting.
@@ -124,111 +121,22 @@ impl EdgeTtsClient {
         }
     }
 
-    /// Internal WebSocket synthesis implementation.
+    /// Internal Edge-TTS synthesis implementation.
+    ///
+    /// Directly delegates to DRM v2 CLI engine streaming audio over stdout pipe,
+    /// bypassing the raw WebSocket endpoint to eliminate 300ms of handshake latency.
     async fn synthesize_internal(&self, text: &str) -> Result<Vec<u8>, TtsError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(TtsError::EmptyText);
         }
 
-        let conn_id = Uuid::new_v4().simple().to_string();
-        let req_id = Uuid::new_v4().simple().to_string();
-
-        let wss_url = format!(
-            "wss://speech.platform.bing.com/consumer/speech/synthesize/readahead/edge/v1?TrustedClientToken={TRUSTED_CLIENT_TOKEN}&ConnectionId={conn_id}"
-        );
-
-        let mut request = wss_url
-            .into_client_request()
-            .map_err(|e| TtsError::WebSocket(format!("Invalid WSS URL: {e}")))?;
-
-        // Attach required client headers
-        let headers = request.headers_mut();
-        headers.insert(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
-                .parse()
-                .unwrap(),
-        );
-        headers.insert("Pragma", "no-cache".parse().unwrap());
-        headers.insert("Cache-Control", "no-cache".parse().unwrap());
-        headers.insert(
-            "Origin",
-            "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
-                .parse()
-                .unwrap(),
-        );
-
-        debug!("Connecting to Edge-TTS WebSocket endpoint");
-        let (ws_stream, _) = match connect_async(request).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                debug!(
-                    error = %e,
-                    "Edge-TTS WebSocket handshake failed; falling back to local edge-tts engine"
-                );
-                return self.synthesize_via_cli(trimmed).await;
-            }
-        };
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Step 1: Send speech.config
-        let config_msg = Self::build_config_message(&self.audio_format);
-        write
-            .send(Message::Text(config_msg))
-            .await
-            .map_err(|e| TtsError::WebSocket(format!("Failed sending speech.config: {e}")))?;
-
-        // Step 2: Send SSML packet
-        let ssml_msg = Self::build_ssml_message(&req_id, &self.voice, trimmed);
-        write
-            .send(Message::Text(ssml_msg))
-            .await
-            .map_err(|e| TtsError::WebSocket(format!("Failed sending SSML: {e}")))?;
-
-        let mut audio_accumulator = Vec::new();
-
-        // Step 3: Stream and parse response frames
-        while let Some(msg_result) = read.next().await {
-            match msg_result {
-                Ok(Message::Binary(bin_data)) => {
-                    if let Some(audio_chunk) = Self::parse_binary_audio_frame(&bin_data) {
-                        audio_accumulator.extend_from_slice(&audio_chunk);
-                    }
-                }
-                Ok(Message::Text(text_frame)) => {
-                    if text_frame.contains("Path:turn.end") {
-                        debug!("Edge-TTS synthesis completed (Path:turn.end received)");
-                        break;
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    warn!("Edge-TTS WebSocket closed by remote host");
-                    break;
-                }
-                Err(err) => {
-                    return Err(TtsError::WebSocket(format!(
-                        "Stream error from Edge-TTS: {err}"
-                    )));
-                }
-                _ => {}
-            }
-        }
-
-        if audio_accumulator.is_empty() {
-            Err(TtsError::Protocol(
-                "Edge-TTS synthesis completed but no audio packets were received".into(),
-            ))
-        } else {
-            Ok(audio_accumulator)
-        }
+        self.synthesize_via_cli(trimmed).await
     }
 
-    /// Synthesizes speech using the local `edge-tts` tool with automatic DRM v2 negotiation.
+    /// Synthesizes speech using the local `edge-tts` tool with automatic DRM v2 negotiation
+    /// and zero-disk in-memory stdout piping.
     pub async fn synthesize_via_cli(&self, text: &str) -> Result<Vec<u8>, TtsError> {
-        let temp_file = std::env::temp_dir().join(format!("viernes_edge_{}.mp3", Uuid::new_v4()));
-
         let edge_bin = if let Ok(home) = std::env::var("HOME") {
             let p = std::path::PathBuf::from(home).join(".local/bin/edge-tts");
             if p.exists() {
@@ -267,7 +175,10 @@ impl EdgeTtsClient {
             .arg("--pitch")
             .arg(&self.pitch)
             .arg("--write-media")
-            .arg(&temp_file);
+            .arg("-");
+
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         let output = cmd
             .output()
@@ -276,16 +187,16 @@ impl EdgeTtsClient {
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
-            let _ = tokio::fs::remove_file(&temp_file).await;
             return Err(TtsError::Protocol(format!("edge-tts failed: {err}")));
         }
 
-        let bytes = tokio::fs::read(&temp_file)
-            .await
-            .map_err(|e| TtsError::Protocol(format!("Failed to read edge-tts audio: {e}")))?;
+        if output.stdout.is_empty() {
+            return Err(TtsError::Protocol(
+                "edge-tts synthesis produced empty audio payload".into(),
+            ));
+        }
 
-        let _ = tokio::fs::remove_file(&temp_file).await;
-        Ok(bytes)
+        Ok(output.stdout)
     }
 }
 

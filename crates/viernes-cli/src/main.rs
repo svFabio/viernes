@@ -258,15 +258,19 @@ async fn run_daemon_loop(
     let mut vad =
         VoiceActivityDetector::new(16_000, config.vad_threshold, config.silence_timeout_ms);
 
-    // 2. Audio Playback & TTS setup
+    // 2. Audio Playback, Resident STT & TTS setup
     let event_tx = state_machine.event_sender();
     let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> =
         Arc::new(tokio::sync::Mutex::new(
             StreamingAudioPlayer::create_resilient_player(Some(event_tx)),
         ));
     let tts_engine = Arc::new(ResilientTtsEngine::from_env());
+    let transcriber = Arc::new(
+        LocalWhisperTranscriber::new(WhisperConfig::default())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
+    );
 
-    // 3. Fillers Manager & Pre-warming
+    // 3. Fillers Manager & Pre-warming (in-memory audio cache)
     let fillers_mgr = Arc::new(FillerCacheManager::new(None::<&str>).unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dynamic_path = std::path::PathBuf::from(home).join(".config/viernes/fillers.json");
@@ -274,7 +278,14 @@ async fn run_daemon_loop(
             FillerCacheManager::new(Some("fillers.json")).expect("valid filler fallback")
         })
     }));
-    info!("Conversational Fillers engine active (loaded from config).");
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let fillers_cache_dir =
+        std::path::PathBuf::from(home_dir).join(".config/viernes/fillers_cache");
+    let loaded_fillers = fillers_mgr.prewarm_audio_cache(&fillers_cache_dir).await;
+    info!(
+        loaded_fillers,
+        "Conversational Fillers engine active with in-memory RAM audio cache"
+    );
 
     // 4. Session Pointer Manager & Resident Antigravity Brain Client
     let session_mgr = Arc::new(
@@ -439,6 +450,7 @@ async fn run_daemon_loop(
                             let turn_id = turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                             let ctx = SpeechTurnContext {
                                 sm: state_machine.clone(),
+                                stt: transcriber.clone(),
                                 tts: tts_engine.clone(),
                                 player: player.clone(),
                                 fillers: fillers_mgr.clone(),
@@ -551,6 +563,7 @@ async fn run_daemon_loop(
                                     let turn_id = turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                                     let ctx = SpeechTurnContext {
                                         sm: state_machine.clone(),
+                                        stt: transcriber.clone(),
                                         tts: tts_engine.clone(),
                                         player: player.clone(),
                                         fillers: fillers_mgr.clone(),
@@ -585,6 +598,7 @@ async fn run_daemon_loop(
 /// Context and shared handles bundled for an asynchronous speech turn execution.
 struct SpeechTurnContext {
     sm: Arc<StateMachine>,
+    stt: Arc<LocalWhisperTranscriber>,
     tts: Arc<ResilientTtsEngine>,
     player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
     fillers: Arc<FillerCacheManager>,
@@ -610,17 +624,10 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         return;
     }
 
-    let transcriber = LocalWhisperTranscriber::new(WhisperConfig::default());
-    let prompt = match transcriber {
-        Ok(t) => match t.transcribe(&pcm, 16_000).await {
-            Ok(text) => text.trim().to_string(),
-            Err(e) => {
-                warn!("STT transcription error: {e}");
-                String::new()
-            }
-        },
+    let prompt = match ctx.stt.transcribe(&pcm, 16_000).await {
+        Ok(text) => text.trim().to_string(),
         Err(e) => {
-            warn!("STT transcriber initialization failed: {e}");
+            warn!("STT transcription error: {e}");
             String::new()
         }
     };
@@ -739,6 +746,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         last_filler_time = std::time::Instant::now();
         let tts_filler = ctx.tts.clone();
         let player_filler = ctx.player.clone();
+        let fillers_ref = ctx.fillers.clone();
         let resp_started = response_started.clone();
         let epoch = ctx.turn_epoch.clone();
         let turn_id = ctx.turn_id;
@@ -746,7 +754,14 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             if epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
                 return;
             }
-            if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
+            let audio_opt = if let Some(cached) = fillers_ref.get_cached_audio(&filler).await {
+                debug!("Dispatching pre-warmed instant filler audio directly from RAM");
+                Some(cached)
+            } else {
+                tts_filler.synthesize_resilient(&filler).await.ok()
+            };
+
+            if let Some(audio) = audio_opt {
                 // If the real response already started or turn was cancelled, discard filler immediately
                 if resp_started.load(std::sync::atomic::Ordering::SeqCst)
                     || epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id
@@ -919,6 +934,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                                 last_filler_time = std::time::Instant::now();
                                 let tts_tool = ctx.tts.clone();
                                 let player_tool = ctx.player.clone();
+                                let fillers_ref = ctx.fillers.clone();
                                 let resp_started_tool = response_started.clone();
                                 let epoch_tool = ctx.turn_epoch.clone();
                                 let turn_id = ctx.turn_id;
@@ -928,9 +944,16 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                                     {
                                         return;
                                     }
-                                    if let Ok(audio) =
-                                        tts_tool.synthesize_resilient(&tool_filler).await
+                                    let audio_opt = if let Some(cached) =
+                                        fillers_ref.get_cached_audio(&tool_filler).await
                                     {
+                                        debug!("Dispatching pre-warmed tool filler audio directly from RAM");
+                                        Some(cached)
+                                    } else {
+                                        tts_tool.synthesize_resilient(&tool_filler).await.ok()
+                                    };
+
+                                    if let Some(audio) = audio_opt {
                                         if resp_started_tool
                                             .load(std::sync::atomic::Ordering::SeqCst)
                                             || epoch_tool.load(std::sync::atomic::Ordering::SeqCst)
