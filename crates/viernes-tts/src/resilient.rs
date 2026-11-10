@@ -31,6 +31,16 @@ impl ResilientTtsEngine {
     /// `EdgeTtsClient` acts as the reliable zero-cost fallback.
     #[must_use]
     pub fn from_env() -> Self {
+        let provider_override = std::env::var("TTS_PROVIDER")
+            .unwrap_or_default()
+            .to_lowercase();
+
+        if provider_override == "edge" {
+            info!("TTS_PROVIDER=edge configured; prioritizing Edge-TTS with zero failover latency");
+            let edge = Arc::new(EdgeTtsClient::new());
+            return Self::new(edge.clone(), edge);
+        }
+
         let pool = KeyPool::from_env();
         let primary: Arc<dyn TextToSpeech> = if pool.is_empty() {
             warn!("No ElevenLabs API keys configured; defaulting primary directly to Edge-TTS");

@@ -21,6 +21,8 @@ const DEFAULT_AUDIO_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 pub struct EdgeTtsClient {
     voice: String,
     audio_format: String,
+    rate: String,
+    pitch: String,
 }
 
 impl Default for EdgeTtsClient {
@@ -29,15 +31,26 @@ impl Default for EdgeTtsClient {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_EDGE_VOICE.to_string());
+        let rate = std::env::var("EDGE_TTS_RATE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "+22%".to_string());
+        let pitch = std::env::var("EDGE_TTS_PITCH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "+4Hz".to_string());
+
         Self {
             voice,
             audio_format: DEFAULT_AUDIO_FORMAT.to_string(),
+            rate,
+            pitch,
         }
     }
 }
 
 impl EdgeTtsClient {
-    /// Creates a new `EdgeTtsClient` with the default Spanish voice (`es-ES-ElviraNeural`).
+    /// Creates a new `EdgeTtsClient` with default voice and configuration.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -46,10 +59,9 @@ impl EdgeTtsClient {
     /// Creates an `EdgeTtsClient` specifying a custom neural voice name.
     #[must_use]
     pub fn with_voice(voice: impl Into<String>) -> Self {
-        Self {
-            voice: voice.into(),
-            audio_format: DEFAULT_AUDIO_FORMAT.to_string(),
-        }
+        let mut client = Self::default();
+        client.voice = voice.into();
+        client
     }
 
     /// Escapes XML special characters for valid SSML body formatting.
@@ -250,6 +262,10 @@ impl EdgeTtsClient {
             .arg(text)
             .arg("--voice")
             .arg(&self.voice)
+            .arg("--rate")
+            .arg(&self.rate)
+            .arg("--pitch")
+            .arg(&self.pitch)
             .arg("--write-media")
             .arg(&temp_file);
 
