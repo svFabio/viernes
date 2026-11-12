@@ -275,11 +275,21 @@ impl AntigravityClient {
         }
     }
 
-    /// Drain any residual unconsumed lines left in the stdout stream buffer.
+    /// Drain any residual unconsumed lines left in the stdout stream buffer,
+    /// while preserving any init event to capture the active conversation ID.
     pub async fn drain_residual_lines(&mut self) {
-        while let Ok(Some(_)) =
+        while let Ok(Some(Ok(line))) =
             tokio::time::timeout(Duration::from_millis(10), self.lines_stream.next()).await
         {
+            let trimmed = line.trim();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if value.get("event").and_then(|v| v.as_str()) == Some("init") {
+                    if let Some(conv_id) = value.get("conversation_id").and_then(|v| v.as_str()) {
+                        debug!(conversation_id = %conv_id, "Captured conversation_id during buffer drain");
+                        self.active_conversation_id = Some(conv_id.to_string());
+                    }
+                }
+            }
         }
     }
 

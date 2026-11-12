@@ -407,7 +407,8 @@ async fn run_daemon_loop(
                             ptt_accumulated.clear();
                             turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
-                            if let Ok(mut p) = player.try_lock() {
+                            {
+                                let mut p = player.lock().await;
                                 if p.is_playing() {
                                     let _ = p.stop_immediately();
                                     info!("Barge-in: interrupted active playback via PTT.");
@@ -650,13 +651,9 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             "Explicit conversation rotation intent detected: '{}'",
             prompt
         );
-        let new_session_id = match ctx.session_mgr.rotate_session().await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("Failed to rotate session: {e}");
-                uuid::Uuid::new_v4().to_string()
-            }
-        };
+        if let Err(e) = ctx.session_mgr.rotate_session().await {
+            warn!("Failed to rotate session: {e}");
+        }
 
         // Terminate active Antigravity process and spawn fresh session
         let mut brain_guard = ctx.brain.lock().await;
@@ -677,8 +674,6 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             "stream-json".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            "--conversation".to_string(),
-            new_session_id,
         ];
         *brain_guard = AntigravityClient::spawn(&agy_bin, &new_args).ok();
 
@@ -856,10 +851,16 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                     Ok(Some(BrainEvent::TextChunk { content })) => {
                         response_received = true;
                         response_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(real_id) = client.conversation_id() {
+                            let _ = ctx.session_mgr.update_conversation_id(real_id).await;
+                        }
                         let _ = tokenizer.feed_token(&content).await;
                     }
                     Ok(Some(BrainEvent::ToolCall { name, args })) => {
                         info!("Brain active tool call: '{}'", name);
+                        if let Some(real_id) = client.conversation_id() {
+                            let _ = ctx.session_mgr.update_conversation_id(real_id).await;
+                        }
 
                         // Extract command payload from tool args or name for risk evaluation
                         let command_payload =
