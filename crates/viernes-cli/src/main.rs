@@ -1015,10 +1015,9 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
     if !response_received && ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id
     {
         warn!("No tokens received from Antigravity; emitting direct fallback.");
-        let fallback = format!(
-            "A la orden, Señor. Procesando su solicitud sobre {}.",
-            prompt
-        );
+        let fallback =
+            "Mil disculpas, Señor. El servicio en la nube demoró en responder. Por favor intente nuevamente."
+                .to_string();
         let _ = tokenizer.feed_token(&fallback).await;
     }
 
