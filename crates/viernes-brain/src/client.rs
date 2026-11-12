@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::BrainError;
 
-/// Inactivity timeout threshold for tokens stream (60 seconds).
-pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Inactivity timeout threshold for tokens stream (120 seconds).
+pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Graceful shutdown timeout before sending SIGKILL (3 seconds).
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
