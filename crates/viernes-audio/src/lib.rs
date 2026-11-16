@@ -8,6 +8,7 @@
 
 pub mod capture;
 pub mod devices;
+pub mod ducking;
 pub mod ptt;
 pub mod resample;
 pub mod stt;
@@ -18,6 +19,7 @@ pub use devices::{
     resolve_device, resolve_input_device_from_env, resolve_output_device_from_env, AudioDeviceInfo,
     CpalDeviceEnumerator, DeviceEnumerator, MockDeviceEnumerator,
 };
+pub use ducking::{parse_duckable_streams, AudioDucker, DuckedStream};
 pub use ptt::{CaptureArbitrationMode, MockPttListener, PttArbitrator, PttEvent, PttListener};
 pub use resample::{downmix_to_mono, process_to_16k_mono, resample_linear};
 pub use stt::{
