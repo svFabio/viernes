@@ -374,8 +374,37 @@ async fn run_daemon_loop(
                 .as_millis() as u64;
             let _ = st.write_to_disk();
 
-            if record.to_state == SystemState::Idle {
+            if record.to_state == SystemState::Idle || record.to_state == SystemState::Listening {
                 ducker_transition.restore().await;
+            }
+        }
+    });
+
+    // 8b. Background audio playback event listener for ducking restoration
+    let mut playback_event_rx = state_machine.subscribe_events();
+    let ducker_events = ducker.clone();
+    let player_events = player.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = playback_event_rx.recv().await {
+            match event {
+                SystemEvent::FillerPlaybackFinished => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let is_playing = if let Ok(p) = player_events.try_lock() {
+                        p.is_playing()
+                    } else {
+                        false
+                    };
+                    if !is_playing {
+                        debug!(
+                            "Filler finished and response not yet audible; restoring media volume"
+                        );
+                        ducker_events.restore().await;
+                    }
+                }
+                SystemEvent::PlaybackFinished | SystemEvent::ResetToIdle | SystemEvent::BargeIn => {
+                    ducker_events.restore().await;
+                }
+                _ => {}
             }
         }
     });
@@ -416,13 +445,13 @@ async fn run_daemon_loop(
                             ptt_active = true;
                             ptt_accumulated.clear();
                             turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            ducker.duck().await;
                             let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
                             {
                                 let mut p = player.lock().await;
                                 if p.is_playing() {
                                     let _ = p.stop_immediately();
                                     info!("Barge-in: interrupted active playback via PTT.");
+                                    ducker.restore().await;
                                 }
                             }
                             vad.set_silence_timeout_enabled(false);
@@ -502,12 +531,12 @@ async fn run_daemon_loop(
                                 );
                                 barge_in_consecutive_frames = 0;
                                 turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                ducker.duck().await;
                                 if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
                                         let _ = p.stop_immediately();
                                     }
                                 }
+                                ducker.restore().await;
                                 let _ = state_machine.dispatch(SystemEvent::BargeIn).await;
                                 vad.start_speech_capture();
                                 playback_cooldown_until = std::time::Instant::now() + std::time::Duration::from_millis(150);
@@ -544,12 +573,12 @@ async fn run_daemon_loop(
                             VadEvent::VoiceStarted => {
                                 info!("VAD detected speech onset (VoiceStarted)");
                                 turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                ducker.duck().await;
                                 let _ = state_machine.dispatch(SystemEvent::VoiceStarted).await;
                                 if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
                                         let _ = p.stop_immediately();
                                         info!("Barge-in: interrupted active playback.");
+                                        ducker.restore().await;
                                     }
                                 }
                             }
@@ -717,6 +746,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             .await;
         let _ = ctx.sm.dispatch(SystemEvent::SpeakingStarted).await;
         if let Ok(audio) = ctx.tts.synthesize_resilient(ack).await {
+            ctx.ducker.duck().await;
             let mut p = ctx.player.lock().await;
             let _ = p.enqueue_chunk(audio).await;
         }
@@ -767,13 +797,17 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                 "Enqueuing instant filler directly from RAM (< 1ms): '{}'",
                 filler
             );
-            let mut p = ctx.player.lock().await;
             if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
-                let _ = p.enqueue_filler(audio).await;
+                ctx.ducker.duck().await;
+                let mut p = ctx.player.lock().await;
+                if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
+                    let _ = p.enqueue_filler(audio).await;
+                }
             }
         } else {
             let tts_filler = ctx.tts.clone();
             let player_filler = ctx.player.clone();
+            let ducker_filler = ctx.ducker.clone();
             let epoch = ctx.turn_epoch.clone();
             let turn_id = ctx.turn_id;
             tokio::spawn(async move {
@@ -781,9 +815,12 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                     return;
                 }
                 if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
-                    let mut p = player_filler.lock().await;
                     if epoch.load(std::sync::atomic::Ordering::SeqCst) == turn_id {
-                        let _ = p.enqueue_filler(audio).await;
+                        ducker_filler.duck().await;
+                        let mut p = player_filler.lock().await;
+                        if epoch.load(std::sync::atomic::Ordering::SeqCst) == turn_id {
+                            let _ = p.enqueue_filler(audio).await;
+                        }
                     }
                 }
             });
@@ -796,6 +833,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
 
     let tts_worker = ctx.tts.clone();
     let player_worker = ctx.player.clone();
+    let ducker_worker = ctx.ducker.clone();
     let sm_worker = ctx.sm.clone();
     let status_worker = ctx.status.clone();
     let resp_started_worker = response_started.clone();
@@ -838,6 +876,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                         debug!("Barge-in: discarding synthesized audio for cancelled turn");
                         break;
                     }
+                    ducker_worker.duck().await;
                     let mut p = player_worker.lock().await;
                     if epoch_worker.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
                         break;
@@ -919,6 +958,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                             );
                             let tts_warn = ctx.tts.clone();
                             let player_warn = ctx.player.clone();
+                            let ducker_warn = ctx.ducker.clone();
                             let epoch_warn = ctx.turn_epoch.clone();
                             let turn_id = ctx.turn_id;
                             tokio::spawn(async move {
@@ -926,6 +966,12 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                                     return;
                                 }
                                 if let Ok(audio) = tts_warn.synthesize_resilient(&warn_msg).await {
+                                    if epoch_warn.load(std::sync::atomic::Ordering::SeqCst)
+                                        != turn_id
+                                    {
+                                        return;
+                                    }
+                                    ducker_warn.duck().await;
                                     let mut p = player_warn.lock().await;
                                     if epoch_warn.load(std::sync::atomic::Ordering::SeqCst)
                                         != turn_id
@@ -949,6 +995,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                                 last_filler_time = std::time::Instant::now();
                                 let tts_tool = ctx.tts.clone();
                                 let player_tool = ctx.player.clone();
+                                let ducker_tool = ctx.ducker.clone();
                                 let fillers_ref = ctx.fillers.clone();
                                 let resp_started_tool = response_started.clone();
                                 let epoch_tool = ctx.turn_epoch.clone();
@@ -977,6 +1024,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                                             tracing::debug!("Discarding tool filler because assistant response already arrived or turn cancelled");
                                             return;
                                         }
+                                        ducker_tool.duck().await;
                                         let mut p = player_tool.lock().await;
                                         if resp_started_tool
                                             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1059,6 +1107,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             .dispatch(SystemEvent::SentenceReady(suggestion.to_string()))
             .await;
         if let Ok(audio) = ctx.tts.synthesize_resilient(suggestion).await {
+            ctx.ducker.duck().await;
             let mut p = ctx.player.lock().await;
             let _ = p.enqueue_chunk(audio).await;
         }
@@ -1068,6 +1117,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
     while ctx.player.lock().await.is_playing() {
         if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
             debug!("Barge-in detected during audio drain: exiting turn immediately");
+            ctx.ducker.restore().await;
             return;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1196,5 +1246,64 @@ mod tests {
         let parsed_tui = CliArgs::try_parse_from(["viernes", "--tui"]);
         assert!(parsed_tui.is_ok());
         assert!(parsed_tui.unwrap().tui);
+    }
+
+    #[tokio::test]
+    async fn test_playback_ducking_lifecycle_events() {
+        use viernes_tts::SilentAudioSink;
+
+        let ducker = Arc::new(AudioDucker::new(true, 40));
+        let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(SilentAudioSink::new())));
+        let sm = StateMachine::new(16);
+        let mut event_rx = sm.subscribe_events();
+
+        let ducker_events = ducker.clone();
+        let player_events = player.clone();
+        let listener = tokio::spawn(async move {
+            while let Ok(event) = event_rx.recv().await {
+                match event {
+                    SystemEvent::FillerPlaybackFinished => {
+                        let is_playing = if let Ok(p) = player_events.try_lock() {
+                            p.is_playing()
+                        } else {
+                            false
+                        };
+                        if !is_playing {
+                            ducker_events.restore().await;
+                        }
+                    }
+                    SystemEvent::PlaybackFinished
+                    | SystemEvent::ResetToIdle
+                    | SystemEvent::BargeIn => {
+                        ducker_events.restore().await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 1. Initial idle state: music is NOT ducked
+        assert!(!ducker.is_ducked());
+
+        // 2. Filler starts playing: duck music
+        ducker.duck().await;
+        assert!(ducker.is_ducked());
+
+        // 3. Filler finishes playing and assistant response is not yet ready: music restores
+        let _ = sm.dispatch(SystemEvent::FillerPlaybackFinished).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(!ducker.is_ducked());
+
+        // 4. Assistant response audio begins playing: duck music
+        ducker.duck().await;
+        assert!(ducker.is_ducked());
+
+        // 5. Assistant response playback finishes: music restores
+        let _ = sm.dispatch(SystemEvent::PlaybackFinished).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(!ducker.is_ducked());
+
+        listener.abort();
     }
 }
