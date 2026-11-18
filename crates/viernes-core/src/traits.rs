@@ -69,6 +69,11 @@ pub trait AudioPlayback: Send + Sync + std::fmt::Debug {
     /// Instantly halts playback and clears pending queued buffers (Barge-in).
     fn stop_immediately(&mut self) -> Result<(), ViernesError>;
 
+    /// Sets output playback volume factor (e.g. 1.0 = 100%, 1.3 = 130%).
+    fn set_volume(&mut self, _volume: f32) -> Result<(), ViernesError> {
+        Ok(())
+    }
+
     /// Indicates whether audio is currently sounding through output speakers.
     fn is_playing(&self) -> bool;
 }

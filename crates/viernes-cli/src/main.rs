@@ -261,10 +261,13 @@ async fn run_daemon_loop(
 
     // 2. Audio Playback, Resident STT & TTS setup
     let event_tx = state_machine.event_sender();
-    let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> =
-        Arc::new(tokio::sync::Mutex::new(
-            StreamingAudioPlayer::create_resilient_player(Some(event_tx)),
-        ));
+    let initial_volume = (config.viernes_volume_percent as f32) / 100.0;
+    let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> = Arc::new(
+        tokio::sync::Mutex::new(StreamingAudioPlayer::create_resilient_player_with_volume(
+            Some(event_tx),
+            initial_volume,
+        )),
+    );
     let tts_engine = Arc::new(ResilientTtsEngine::from_env());
     let transcriber = Arc::new(
         LocalWhisperTranscriber::new(WhisperConfig::default())

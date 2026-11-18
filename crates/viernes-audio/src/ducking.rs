@@ -110,7 +110,7 @@ pub struct AudioDucker {
 
 impl Default for AudioDucker {
     fn default() -> Self {
-        Self::new(true, 20)
+        Self::new(true, 40)
     }
 }
 
