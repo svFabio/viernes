@@ -42,6 +42,8 @@ pub enum DeviceFocus {
     Speaker,
     /// Background media audio ducking attenuation controls.
     AudioDucking,
+    /// Viernes voice output volume boost controls.
+    ViernesVolume,
     /// Audio level test controls.
     MicTest,
 }
@@ -71,8 +73,10 @@ pub struct DevicesView {
     pub status_message: Option<String>,
     /// Whether background audio ducking is enabled.
     pub ducking_enabled: bool,
-    /// Target ducking volume percentage (0..=100).
+    /// Target ducking volume percentage for background media (0..=100).
     pub ducking_volume_percent: u32,
+    /// Playback volume percentage for Viernes assistant voice output (10..=200).
+    pub viernes_volume_percent: u32,
     /// Whether ducking settings have unsaved modifications.
     pub has_unsaved_ducking_changes: bool,
     /// Target path to environment variables file (.env).
@@ -99,8 +103,12 @@ impl DevicesView {
             .map(|h| PathBuf::from(h).join(".config/viernes/.env"))
             .unwrap_or_else(|_| PathBuf::from(".env"));
 
-        let (ducking_enabled, ducking_volume_percent) = match config {
-            Some(c) => (c.audio_ducking_enabled, c.audio_ducking_volume_percent),
+        let (ducking_enabled, ducking_volume_percent, viernes_volume_percent) = match config {
+            Some(c) => (
+                c.audio_ducking_enabled,
+                c.audio_ducking_volume_percent,
+                c.viernes_volume_percent,
+            ),
             None => {
                 let enabled = std::env::var("AUDIO_DUCKING_ENABLED")
                     .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -108,9 +116,14 @@ impl DevicesView {
                 let pct = std::env::var("AUDIO_DUCKING_VOLUME_PERCENT")
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(20)
+                    .unwrap_or(40)
                     .min(100);
-                (enabled, pct)
+                let v_pct = std::env::var("VIERNES_VOLUME_PERCENT")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(130)
+                    .clamp(10, 200);
+                (enabled, pct, v_pct)
             }
         };
 
@@ -127,6 +140,7 @@ impl DevicesView {
             status_message: None,
             ducking_enabled,
             ducking_volume_percent,
+            viernes_volume_percent,
             has_unsaved_ducking_changes: false,
             env_path,
         };
@@ -150,7 +164,8 @@ impl DevicesView {
             is_testing_mic: false,
             status_message: None,
             ducking_enabled: true,
-            ducking_volume_percent: 20,
+            ducking_volume_percent: 40,
+            viernes_volume_percent: 130,
             has_unsaved_ducking_changes: false,
             env_path: PathBuf::from("/tmp/test_viernes_mock.env"),
         };
@@ -198,12 +213,13 @@ impl DevicesView {
         Ok(list)
     }
 
-    /// Cycles focus between Microphone, Speaker, AudioDucking, and MicTest.
+    /// Cycles focus between Microphone, Speaker, AudioDucking, ViernesVolume, and MicTest.
     pub fn next_focus(&mut self) {
         self.focus = match self.focus {
             DeviceFocus::Microphone => DeviceFocus::Speaker,
             DeviceFocus::Speaker => DeviceFocus::AudioDucking,
-            DeviceFocus::AudioDucking => DeviceFocus::MicTest,
+            DeviceFocus::AudioDucking => DeviceFocus::ViernesVolume,
+            DeviceFocus::ViernesVolume => DeviceFocus::MicTest,
             DeviceFocus::MicTest => DeviceFocus::Microphone,
         };
     }
@@ -214,11 +230,12 @@ impl DevicesView {
             DeviceFocus::Microphone => DeviceFocus::MicTest,
             DeviceFocus::Speaker => DeviceFocus::Microphone,
             DeviceFocus::AudioDucking => DeviceFocus::Speaker,
-            DeviceFocus::MicTest => DeviceFocus::AudioDucking,
+            DeviceFocus::ViernesVolume => DeviceFocus::AudioDucking,
+            DeviceFocus::MicTest => DeviceFocus::ViernesVolume,
         };
     }
 
-    /// Moves selection up in the currently focused dropdown list or decreases ducking volume.
+    /// Moves selection up in the currently focused dropdown list or decreases volume percent.
     pub fn select_prev(&mut self) {
         match self.focus {
             DeviceFocus::Microphone => {
@@ -243,15 +260,23 @@ impl DevicesView {
                 self.ducking_volume_percent = self.ducking_volume_percent.saturating_sub(5);
                 self.has_unsaved_ducking_changes = true;
                 self.status_message = Some(format!(
-                    "Volumen de atenuación: {}%",
+                    "Volumen de música atenuada: {}%",
                     self.ducking_volume_percent
+                ));
+            }
+            DeviceFocus::ViernesVolume => {
+                self.viernes_volume_percent = self.viernes_volume_percent.saturating_sub(5).max(10);
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!(
+                    "Volumen de voz de Viernes: {}%",
+                    self.viernes_volume_percent
                 ));
             }
             DeviceFocus::MicTest => {}
         }
     }
 
-    /// Moves selection down in the currently focused dropdown list or increases ducking volume.
+    /// Moves selection down in the currently focused dropdown list or increases volume percent.
     pub fn select_next(&mut self) {
         match self.focus {
             DeviceFocus::Microphone => {
@@ -268,8 +293,16 @@ impl DevicesView {
                 self.ducking_volume_percent = (self.ducking_volume_percent + 5).min(100);
                 self.has_unsaved_ducking_changes = true;
                 self.status_message = Some(format!(
-                    "Volumen de atenuación: {}%",
+                    "Volumen de música atenuada: {}%",
                     self.ducking_volume_percent
+                ));
+            }
+            DeviceFocus::ViernesVolume => {
+                self.viernes_volume_percent = (self.viernes_volume_percent + 5).min(200);
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!(
+                    "Volumen de voz de Viernes: {}%",
+                    self.viernes_volume_percent
                 ));
             }
             DeviceFocus::MicTest => {}
@@ -303,6 +336,11 @@ impl DevicesView {
                     }
                 ));
             }
+            DeviceFocus::ViernesVolume => {
+                self.viernes_volume_percent = 130;
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some("Volumen de Viernes restablecido a 130%".into());
+            }
             DeviceFocus::MicTest => {
                 self.is_testing_mic = !self.is_testing_mic;
                 if !self.is_testing_mic {
@@ -318,9 +356,11 @@ impl DevicesView {
             &self.env_path,
             self.ducking_enabled,
             self.ducking_volume_percent,
+            self.viernes_volume_percent,
         )?;
         self.has_unsaved_ducking_changes = false;
-        self.status_message = Some("Atenuación guardada en ~/.config/viernes/.env (0600)".into());
+        self.status_message =
+            Some("Atenuación y volumen guardados en ~/.config/viernes/.env (0600)".into());
         Ok(())
     }
 
@@ -541,8 +581,10 @@ impl DevicesView {
         )]));
         f.render_widget(test_status_p, vu_chunks[1]);
 
-        // 3B. Background Audio Ducking Controls (PipeWire / PulseAudio)
-        let ducking_border_style = if self.focus == DeviceFocus::AudioDucking {
+        // 3B. Audio Ducking & Assistant Voice Boost Controls (PipeWire / PulseAudio)
+        let ducking_border_style = if self.focus == DeviceFocus::AudioDucking
+            || self.focus == DeviceFocus::ViernesVolume
+        {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -568,16 +610,36 @@ impl DevicesView {
             Span::raw("")
         };
 
-        let ducking_title = if self.focus == DeviceFocus::AudioDucking {
-            " Atenuación de Música (Ducking) [ACTIVO] "
+        let ducking_title = match self.focus {
+            DeviceFocus::AudioDucking => " Atenuación de Música [ACTIVA] & Volumen Viernes ",
+            DeviceFocus::ViernesVolume => " Atenuación de Música & Volumen Viernes [ACTIVO] ",
+            _ => " Atenuación de Música & Volumen Viernes ",
+        };
+
+        let music_prefix = if self.focus == DeviceFocus::AudioDucking {
+            " ► Música Atenuada: "
         } else {
-            " Atenuación de Música (Ducking) "
+            "   Música Atenuada: "
+        };
+        let viernes_prefix = if self.focus == DeviceFocus::ViernesVolume {
+            " ► Volumen Viernes: "
+        } else {
+            "   Volumen Viernes: "
         };
 
         let ducking_box = Paragraph::new(vec![
             Line::from(vec![Span::raw("Estado: "), duck_status_span, unsaved_badge]),
             Line::from(vec![
-                Span::raw("Volumen Música: "),
+                Span::styled(
+                    music_prefix,
+                    if self.focus == DeviceFocus::AudioDucking {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
+                ),
                 Span::styled(
                     format!("{}%", self.ducking_volume_percent),
                     if self.ducking_enabled {
@@ -590,10 +652,28 @@ impl DevicesView {
                 ),
                 Span::raw(" (Ajustar: [←/→] o [-/+])"),
             ]),
-            Line::from(Span::styled(
-                "Atenúa Spotify/navegador mientras Viernes escucha o habla",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(vec![
+                Span::styled(
+                    viernes_prefix,
+                    if self.focus == DeviceFocus::ViernesVolume {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
+                ),
+                Span::styled(
+                    format!("{}%", self.viernes_volume_percent),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " [MÁS ALTO / PRIORITARIO]",
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
         ])
         .block(
             Block::default()
@@ -718,6 +798,7 @@ pub fn save_ducking_to_env(
     path: &std::path::Path,
     enabled: bool,
     volume_percent: u32,
+    viernes_volume: u32,
 ) -> Result<(), String> {
     let lines: Vec<String> = if path.exists() {
         std::fs::read_to_string(path)
@@ -729,9 +810,10 @@ pub fn save_ducking_to_env(
         Vec::new()
     };
 
-    let mut new_lines = Vec::with_capacity(lines.len() + 2);
+    let mut new_lines = Vec::with_capacity(lines.len() + 3);
     let mut enabled_found = false;
     let mut percent_found = false;
+    let mut viernes_vol_found = false;
 
     for line in lines {
         let trimmed = line.trim();
@@ -741,6 +823,9 @@ pub fn save_ducking_to_env(
         } else if trimmed.starts_with("AUDIO_DUCKING_VOLUME_PERCENT=") {
             new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
             percent_found = true;
+        } else if trimmed.starts_with("VIERNES_VOLUME_PERCENT=") {
+            new_lines.push(format!("VIERNES_VOLUME_PERCENT={viernes_volume}"));
+            viernes_vol_found = true;
         } else {
             new_lines.push(line);
         }
@@ -751,6 +836,9 @@ pub fn save_ducking_to_env(
     }
     if !percent_found {
         new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
+    }
+    if !viernes_vol_found {
+        new_lines.push(format!("VIERNES_VOLUME_PERCENT={viernes_volume}"));
     }
 
     let content = new_lines.join("\n") + "\n";
@@ -864,7 +952,8 @@ mod tests {
             "PipeWire Capture (Default)"
         );
         assert!(view.ducking_enabled);
-        assert_eq!(view.ducking_volume_percent, 20);
+        assert_eq!(view.ducking_volume_percent, 40);
+        assert_eq!(view.viernes_volume_percent, 130);
     }
 
     #[test]
@@ -878,6 +967,8 @@ mod tests {
         view.next_focus();
         assert_eq!(view.focus, DeviceFocus::AudioDucking);
         view.next_focus();
+        assert_eq!(view.focus, DeviceFocus::ViernesVolume);
+        view.next_focus();
         assert_eq!(view.focus, DeviceFocus::MicTest);
         view.next_focus();
         assert_eq!(view.focus, DeviceFocus::Microphone);
@@ -885,6 +976,8 @@ mod tests {
         // Reverse focus
         view.prev_focus();
         assert_eq!(view.focus, DeviceFocus::MicTest);
+        view.prev_focus();
+        assert_eq!(view.focus, DeviceFocus::ViernesVolume);
         view.prev_focus();
         assert_eq!(view.focus, DeviceFocus::AudioDucking);
 
@@ -934,7 +1027,7 @@ mod tests {
 
         view.focus = DeviceFocus::AudioDucking;
         assert!(view.ducking_enabled);
-        assert_eq!(view.ducking_volume_percent, 20);
+        assert_eq!(view.ducking_volume_percent, 40);
 
         // Toggle ducking
         view.toggle_action();
@@ -946,13 +1039,21 @@ mod tests {
 
         // Increase volume by 5%
         view.select_next();
-        assert_eq!(view.ducking_volume_percent, 25);
+        assert_eq!(view.ducking_volume_percent, 45);
 
         // Decrease volume by 5% twice
         view.select_prev();
-        assert_eq!(view.ducking_volume_percent, 20);
+        assert_eq!(view.ducking_volume_percent, 40);
         view.select_prev();
-        assert_eq!(view.ducking_volume_percent, 15);
+        assert_eq!(view.ducking_volume_percent, 35);
+
+        // Test Viernes volume adjustment
+        view.focus = DeviceFocus::ViernesVolume;
+        assert_eq!(view.viernes_volume_percent, 130);
+        view.select_next();
+        assert_eq!(view.viernes_volume_percent, 135);
+        view.select_prev();
+        assert_eq!(view.viernes_volume_percent, 130);
     }
 
     #[test]
@@ -969,7 +1070,8 @@ mod tests {
         let mut view = DevicesView::new_mock(inputs, outputs);
         view.env_path = temp_env.clone();
         view.ducking_enabled = true;
-        view.ducking_volume_percent = 35;
+        view.ducking_volume_percent = 45;
+        view.viernes_volume_percent = 140;
         view.has_unsaved_ducking_changes = true;
 
         let res = view.save_ducking_config();
@@ -979,7 +1081,8 @@ mod tests {
         let saved_content = std::fs::read_to_string(&temp_env).unwrap();
         assert!(saved_content.contains("ELEVENLABS_VOICE_ID=test123"));
         assert!(saved_content.contains("AUDIO_DUCKING_ENABLED=true"));
-        assert!(saved_content.contains("AUDIO_DUCKING_VOLUME_PERCENT=35"));
+        assert!(saved_content.contains("AUDIO_DUCKING_VOLUME_PERCENT=45"));
+        assert!(saved_content.contains("VIERNES_VOLUME_PERCENT=140"));
 
         let _ = std::fs::remove_file(&temp_env);
     }

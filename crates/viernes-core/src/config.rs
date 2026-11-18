@@ -36,8 +36,11 @@ pub struct ViernesConfig {
     /// Whether automatic audio ducking (lowering music volume while Viernes speaks) is enabled.
     pub audio_ducking_enabled: bool,
 
-    /// Target volume percent for background media during ducking (e.g. 20%).
+    /// Target volume percent for background media during ducking (e.g. 40%).
     pub audio_ducking_volume_percent: u32,
+
+    /// Playback volume percentage for Viernes assistant voice output (e.g. 130% for high clarity over background).
+    pub viernes_volume_percent: u32,
 }
 
 impl Default for ViernesConfig {
@@ -52,7 +55,8 @@ impl Default for ViernesConfig {
             audio_output_device: None,
             temp_dir: PathBuf::from("/tmp/viernes"),
             audio_ducking_enabled: true,
-            audio_ducking_volume_percent: 20,
+            audio_ducking_volume_percent: 40,
+            viernes_volume_percent: 130,
         }
     }
 }
@@ -158,6 +162,12 @@ impl ViernesConfig {
             }
         }
 
+        if let Ok(vol_str) = std::env::var("VIERNES_VOLUME_PERCENT") {
+            if let Ok(parsed) = vol_str.trim().parse::<u32>() {
+                config.viernes_volume_percent = parsed.clamp(10, 200);
+            }
+        }
+
         Ok(config)
     }
 }
@@ -174,6 +184,7 @@ mod tests {
         assert_eq!(cfg.silence_timeout_ms, 800);
         assert_eq!(cfg.temp_dir, PathBuf::from("/tmp/viernes"));
         assert!(cfg.audio_ducking_enabled);
-        assert_eq!(cfg.audio_ducking_volume_percent, 20);
+        assert_eq!(cfg.audio_ducking_volume_percent, 40);
+        assert_eq!(cfg.viernes_volume_percent, 130);
     }
 }

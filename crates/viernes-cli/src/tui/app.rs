@@ -504,6 +504,8 @@ impl TuiApp {
                 KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => {
                     if self.devices_view.focus
                         == crate::tui::views::devices::DeviceFocus::AudioDucking
+                        || self.devices_view.focus
+                            == crate::tui::views::devices::DeviceFocus::ViernesVolume
                     {
                         self.devices_view.select_prev();
                     }
@@ -511,6 +513,8 @@ impl TuiApp {
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') => {
                     if self.devices_view.focus
                         == crate::tui::views::devices::DeviceFocus::AudioDucking
+                        || self.devices_view.focus
+                            == crate::tui::views::devices::DeviceFocus::ViernesVolume
                     {
                         self.devices_view.select_next();
                     }
@@ -524,12 +528,16 @@ impl TuiApp {
                     self.devices_view.focus = crate::tui::views::devices::DeviceFocus::AudioDucking;
                     self.devices_view.toggle_action();
                 }
+                KeyCode::Char('v') => {
+                    self.devices_view.focus =
+                        crate::tui::views::devices::DeviceFocus::ViernesVolume;
+                }
                 KeyCode::Char('s') => {
                     if let Err(e) = self.devices_view.save_ducking_config() {
                         self.status_line = Some(format!("Error guardando atenuación: {e}"));
                     } else {
                         self.status_line =
-                            Some("Configuración de atenuación guardada en .env (0600)".into());
+                            Some("Configuración de audio guardada en .env (0600)".into());
                     }
                 }
                 KeyCode::Char('r') => self.devices_view.refresh_from_host(),

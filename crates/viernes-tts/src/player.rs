@@ -107,6 +107,7 @@ impl AudioPlayback for SilentAudioSink {
 enum PlayerCommand {
     PlayChunk(Vec<u8>),
     PlayFiller(Vec<u8>),
+    SetVolume(f32),
     Stop,
 }
 
@@ -126,10 +127,16 @@ impl fmt::Debug for StreamingAudioPlayer {
 }
 
 impl StreamingAudioPlayer {
-    /// Creates and initializes the streaming audio player on a dedicated OS thread.
-    ///
-    /// If hardware initialization fails (e.g., in headless CI), returns a descriptive `TtsError::Playback`.
+    /// Creates and initializes the streaming audio player on a dedicated OS thread with default 1.0 volume.
     pub fn new(event_tx: Option<broadcast::Sender<SystemEvent>>) -> Result<Self, TtsError> {
+        Self::new_with_volume(event_tx, 1.0)
+    }
+
+    /// Creates and initializes the streaming audio player with a specified volume multiplier.
+    pub fn new_with_volume(
+        event_tx: Option<broadcast::Sender<SystemEvent>>,
+        initial_volume: f32,
+    ) -> Result<Self, TtsError> {
         let (command_tx, command_rx) = crossbeam_channel::unbounded::<PlayerCommand>();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
 
@@ -157,6 +164,9 @@ impl StreamingAudioPlayer {
                         return;
                     }
                 };
+
+                let mut current_volume: f32 = initial_volume.max(0.0);
+                sink.set_volume(current_volume);
 
                 // Notify parent thread that audio hardware is ready
                 let _ = init_tx.send(Ok(()));
@@ -190,11 +200,17 @@ impl StreamingAudioPlayer {
                                 }
                             }
                         }
+                        Ok(PlayerCommand::SetVolume(vol)) => {
+                            current_volume = vol.max(0.0);
+                            sink.set_volume(current_volume);
+                            debug!(volume = current_volume, "Updated audio playback volume factor");
+                        }
                         Ok(PlayerCommand::Stop) => {
                             debug!("Immediate stop received; recreating sink to prevent rodio freeze");
                             match Sink::try_new(&stream_handle) {
                                 Ok(new_sink) => {
                                     sink.stop();
+                                    new_sink.set_volume(current_volume);
                                     sink = new_sink;
                                 }
                                 Err(err) => {
@@ -254,7 +270,16 @@ impl StreamingAudioPlayer {
     pub fn create_resilient_player(
         event_tx: Option<broadcast::Sender<SystemEvent>>,
     ) -> Box<dyn AudioPlayback> {
-        match Self::new(event_tx.clone()) {
+        Self::create_resilient_player_with_volume(event_tx, 1.0)
+    }
+
+    /// Creates an auto-fallback player with a specific volume multiplier.
+    #[must_use]
+    pub fn create_resilient_player_with_volume(
+        event_tx: Option<broadcast::Sender<SystemEvent>>,
+        initial_volume: f32,
+    ) -> Box<dyn AudioPlayback> {
+        match Self::new_with_volume(event_tx.clone(), initial_volume) {
             Ok(player) => Box::new(player),
             Err(err) => {
                 warn!("Falling back to SilentAudioSink due to: {}", err);
@@ -270,6 +295,13 @@ impl StreamingAudioPlayer {
 
 #[async_trait]
 impl AudioPlayback for StreamingAudioPlayer {
+    fn set_volume(&mut self, volume: f32) -> Result<(), ViernesError> {
+        self.command_tx
+            .send(PlayerCommand::SetVolume(volume))
+            .map_err(|e| ViernesError::Audio(format!("Failed to set playback volume: {e}")))?;
+        Ok(())
+    }
+
     async fn enqueue_chunk(&mut self, audio_bytes: Vec<u8>) -> Result<(), ViernesError> {
         if audio_bytes.is_empty() {
             return Err(ViernesError::Audio("Cannot play empty audio chunk".into()));
