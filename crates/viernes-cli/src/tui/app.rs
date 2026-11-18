@@ -197,7 +197,7 @@ impl TuiApp {
             ptt_active: false,
             daemon_connected,
             fillers_view: FillersView::new(None, None),
-            devices_view: DevicesView::new(),
+            devices_view: DevicesView::with_config(config.as_ref()),
             service_view: ServiceView::new(),
             status_line: Some("Viernes TUI Dashboard inicializado".into()),
             last_synced_turn,
@@ -501,8 +501,37 @@ impl TuiApp {
             ActiveTab::AudioDevices => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.devices_view.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.devices_view.select_next(),
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => {
+                    if self.devices_view.focus
+                        == crate::tui::views::devices::DeviceFocus::AudioDucking
+                    {
+                        self.devices_view.select_prev();
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') => {
+                    if self.devices_view.focus
+                        == crate::tui::views::devices::DeviceFocus::AudioDucking
+                    {
+                        self.devices_view.select_next();
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => self.devices_view.toggle_action(),
-                KeyCode::Char('m') => self.devices_view.toggle_action(),
+                KeyCode::Char('m') => {
+                    self.devices_view.focus = crate::tui::views::devices::DeviceFocus::MicTest;
+                    self.devices_view.toggle_action();
+                }
+                KeyCode::Char('d') => {
+                    self.devices_view.focus = crate::tui::views::devices::DeviceFocus::AudioDucking;
+                    self.devices_view.toggle_action();
+                }
+                KeyCode::Char('s') => {
+                    if let Err(e) = self.devices_view.save_ducking_config() {
+                        self.status_line = Some(format!("Error guardando atenuación: {e}"));
+                    } else {
+                        self.status_line =
+                            Some("Configuración de atenuación guardada en .env (0600)".into());
+                    }
+                }
                 KeyCode::Char('r') => self.devices_view.refresh_from_host(),
                 _ => {}
             },

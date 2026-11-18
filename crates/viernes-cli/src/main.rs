@@ -10,6 +10,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::{debug, info, warn};
 use viernes_audio::capture::{AudioCaptureConfig, CpalAudioCapture};
+use viernes_audio::ducking::AudioDucker;
 use viernes_audio::ptt::{IpcSocketPttListener, PttEvent, PttListener};
 use viernes_audio::stt::{LocalWhisperTranscriber, WhisperConfig};
 use viernes_audio::vad::{VadEvent, VoiceActivityDetector};
@@ -269,6 +270,7 @@ async fn run_daemon_loop(
         LocalWhisperTranscriber::new(WhisperConfig::default())
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
     );
+    let ducker = Arc::new(AudioDucker::from_config(config));
 
     // 3. Fillers Manager & Pre-warming (in-memory audio cache)
     let fillers_mgr = Arc::new(FillerCacheManager::new(None::<&str>).unwrap_or_else(|_| {
@@ -354,6 +356,7 @@ async fn run_daemon_loop(
 
     // 8. Background transition logger and live status sync task
     let status_tracker = live_status.clone();
+    let ducker_transition = ducker.clone();
     tokio::spawn(async move {
         while let Ok(record) = transition_rx.recv().await {
             info!(
@@ -367,6 +370,10 @@ async fn run_daemon_loop(
                 .unwrap_or_default()
                 .as_millis() as u64;
             let _ = st.write_to_disk();
+
+            if record.to_state == SystemState::Idle {
+                ducker_transition.restore().await;
+            }
         }
     });
 
@@ -406,6 +413,7 @@ async fn run_daemon_loop(
                             ptt_active = true;
                             ptt_accumulated.clear();
                             turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            ducker.duck().await;
                             let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
                             {
                                 let mut p = player.lock().await;
@@ -434,6 +442,7 @@ async fn run_daemon_loop(
                                     pcm_buffer.len()
                                 );
                                 let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
+                                ducker.restore().await;
                                 continue;
                             }
 
@@ -454,6 +463,7 @@ async fn run_daemon_loop(
                                 stt: transcriber.clone(),
                                 tts: tts_engine.clone(),
                                 player: player.clone(),
+                                ducker: ducker.clone(),
                                 fillers: fillers_mgr.clone(),
                                 brain: brain_client.clone(),
                                 status: live_status.clone(),
@@ -489,6 +499,7 @@ async fn run_daemon_loop(
                                 );
                                 barge_in_consecutive_frames = 0;
                                 turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                ducker.duck().await;
                                 if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
                                         let _ = p.stop_immediately();
@@ -530,6 +541,7 @@ async fn run_daemon_loop(
                             VadEvent::VoiceStarted => {
                                 info!("VAD detected speech onset (VoiceStarted)");
                                 turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                ducker.duck().await;
                                 let _ = state_machine.dispatch(SystemEvent::VoiceStarted).await;
                                 if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
@@ -547,6 +559,7 @@ async fn run_daemon_loop(
                                             pcm_buffer.len()
                                         );
                                         let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
+                                        ducker.restore().await;
                                         continue;
                                     }
 
@@ -567,6 +580,7 @@ async fn run_daemon_loop(
                                         stt: transcriber.clone(),
                                         tts: tts_engine.clone(),
                                         player: player.clone(),
+                                        ducker: ducker.clone(),
                                         fillers: fillers_mgr.clone(),
                                         brain: brain_client.clone(),
                                         status: live_status.clone(),
@@ -591,6 +605,7 @@ async fn run_daemon_loop(
     }
     let _ = ptt_listener.stop().await;
     let _ = temp_storage.clean_all();
+    ducker.restore().await;
     let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
     info!("All subsystem streams stopped cleanly. Viernes terminated.");
     Ok(())
@@ -602,6 +617,7 @@ struct SpeechTurnContext {
     stt: Arc<LocalWhisperTranscriber>,
     tts: Arc<ResilientTtsEngine>,
     player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
+    ducker: Arc<AudioDucker>,
     fillers: Arc<FillerCacheManager>,
     brain: Arc<tokio::sync::Mutex<Option<AntigravityClient>>>,
     status: Arc<tokio::sync::Mutex<DaemonLiveStatus>>,
@@ -622,6 +638,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             pcm.len()
         );
         let _ = ctx.sm.dispatch(SystemEvent::ResetToIdle).await;
+        ctx.ducker.restore().await;
         return;
     }
 
@@ -640,6 +657,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
     if prompt.is_empty() {
         info!("No speech recognized in audio buffer. Resetting to Idle.");
         let _ = ctx.sm.dispatch(SystemEvent::ResetToIdle).await;
+        ctx.ducker.restore().await;
         return;
     }
 
@@ -707,6 +725,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         }
         if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
             let _ = ctx.sm.dispatch(SystemEvent::PlaybackFinished).await;
+            ctx.ducker.restore().await;
         }
         return;
     }
@@ -1053,6 +1072,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
 
     if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
         let _ = ctx.sm.dispatch(SystemEvent::PlaybackFinished).await;
+        ctx.ducker.restore().await;
     }
 }
 

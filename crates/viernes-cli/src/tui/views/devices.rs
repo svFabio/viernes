@@ -1,5 +1,7 @@
 //! Audio Hardware Explorer and Device Selector View (Tab 4).
 
+use std::path::PathBuf;
+
 use cpal::traits::{DeviceTrait, HostTrait};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,6 +11,7 @@ use ratatui::Frame;
 use viernes_audio::devices::{
     AudioDeviceInfo, CpalDeviceEnumerator, DeviceEnumerator, MockDeviceEnumerator,
 };
+use viernes_core::config::ViernesConfig;
 
 /// Formats an audio device for descriptive list summary presentation.
 #[must_use]
@@ -37,6 +40,8 @@ pub enum DeviceFocus {
     Microphone,
     /// Speaker / Output devices dropdown list.
     Speaker,
+    /// Background media audio ducking attenuation controls.
+    AudioDucking,
     /// Audio level test controls.
     MicTest,
 }
@@ -64,6 +69,14 @@ pub struct DevicesView {
     pub is_testing_mic: bool,
     /// Transient status or error message.
     pub status_message: Option<String>,
+    /// Whether background audio ducking is enabled.
+    pub ducking_enabled: bool,
+    /// Target ducking volume percentage (0..=100).
+    pub ducking_volume_percent: u32,
+    /// Whether ducking settings have unsaved modifications.
+    pub has_unsaved_ducking_changes: bool,
+    /// Target path to environment variables file (.env).
+    pub env_path: PathBuf,
 }
 
 impl Default for DevicesView {
@@ -76,6 +89,31 @@ impl DevicesView {
     /// Creates a new `DevicesView` and enumerates hardware devices via default host.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(None)
+    }
+
+    /// Creates a new `DevicesView` populated from optional [`ViernesConfig`].
+    #[must_use]
+    pub fn with_config(config: Option<&ViernesConfig>) -> Self {
+        let env_path = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".config/viernes/.env"))
+            .unwrap_or_else(|_| PathBuf::from(".env"));
+
+        let (ducking_enabled, ducking_volume_percent) = match config {
+            Some(c) => (c.audio_ducking_enabled, c.audio_ducking_volume_percent),
+            None => {
+                let enabled = std::env::var("AUDIO_DUCKING_ENABLED")
+                    .map(|v| v.to_lowercase() == "true" || v == "1")
+                    .unwrap_or(true);
+                let pct = std::env::var("AUDIO_DUCKING_VOLUME_PERCENT")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(20)
+                    .min(100);
+                (enabled, pct)
+            }
+        };
+
         let mut view = Self {
             input_devices: Vec::new(),
             output_devices: Vec::new(),
@@ -87,6 +125,10 @@ impl DevicesView {
             mic_level: 0.0,
             is_testing_mic: false,
             status_message: None,
+            ducking_enabled,
+            ducking_volume_percent,
+            has_unsaved_ducking_changes: false,
+            env_path,
         };
         view.refresh_with_enumerator(&CpalDeviceEnumerator::new());
         view
@@ -107,6 +149,10 @@ impl DevicesView {
             mic_level: 0.0,
             is_testing_mic: false,
             status_message: None,
+            ducking_enabled: true,
+            ducking_volume_percent: 20,
+            has_unsaved_ducking_changes: false,
+            env_path: PathBuf::from("/tmp/test_viernes_mock.env"),
         };
         view.refresh_with_enumerator(&enumerator);
         view
@@ -152,11 +198,12 @@ impl DevicesView {
         Ok(list)
     }
 
-    /// Cycles focus between Microphone, Speaker, and MicTest.
+    /// Cycles focus between Microphone, Speaker, AudioDucking, and MicTest.
     pub fn next_focus(&mut self) {
         self.focus = match self.focus {
             DeviceFocus::Microphone => DeviceFocus::Speaker,
-            DeviceFocus::Speaker => DeviceFocus::MicTest,
+            DeviceFocus::Speaker => DeviceFocus::AudioDucking,
+            DeviceFocus::AudioDucking => DeviceFocus::MicTest,
             DeviceFocus::MicTest => DeviceFocus::Microphone,
         };
     }
@@ -166,11 +213,12 @@ impl DevicesView {
         self.focus = match self.focus {
             DeviceFocus::Microphone => DeviceFocus::MicTest,
             DeviceFocus::Speaker => DeviceFocus::Microphone,
-            DeviceFocus::MicTest => DeviceFocus::Speaker,
+            DeviceFocus::AudioDucking => DeviceFocus::Speaker,
+            DeviceFocus::MicTest => DeviceFocus::AudioDucking,
         };
     }
 
-    /// Moves selection up in the currently focused dropdown list.
+    /// Moves selection up in the currently focused dropdown list or decreases ducking volume.
     pub fn select_prev(&mut self) {
         match self.focus {
             DeviceFocus::Microphone => {
@@ -191,11 +239,19 @@ impl DevicesView {
                     }
                 }
             }
+            DeviceFocus::AudioDucking => {
+                self.ducking_volume_percent = self.ducking_volume_percent.saturating_sub(5);
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!(
+                    "Volumen de atenuación: {}%",
+                    self.ducking_volume_percent
+                ));
+            }
             DeviceFocus::MicTest => {}
         }
     }
 
-    /// Moves selection down in the currently focused dropdown list.
+    /// Moves selection down in the currently focused dropdown list or increases ducking volume.
     pub fn select_next(&mut self) {
         match self.focus {
             DeviceFocus::Microphone => {
@@ -208,11 +264,19 @@ impl DevicesView {
                     self.selected_output = (self.selected_output + 1) % self.output_devices.len();
                 }
             }
+            DeviceFocus::AudioDucking => {
+                self.ducking_volume_percent = (self.ducking_volume_percent + 5).min(100);
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!(
+                    "Volumen de atenuación: {}%",
+                    self.ducking_volume_percent
+                ));
+            }
             DeviceFocus::MicTest => {}
         }
     }
 
-    /// Toggles the dropdown open/close state or triggers test.
+    /// Toggles the dropdown open/close state, ducking enabled state, or triggers mic test.
     pub fn toggle_action(&mut self) {
         match self.focus {
             DeviceFocus::Microphone => {
@@ -227,6 +291,18 @@ impl DevicesView {
                     self.input_dropdown_open = false;
                 }
             }
+            DeviceFocus::AudioDucking => {
+                self.ducking_enabled = !self.ducking_enabled;
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!(
+                    "Atenuación de audio (Ducking): {}",
+                    if self.ducking_enabled {
+                        "Activada"
+                    } else {
+                        "Desactivada"
+                    }
+                ));
+            }
             DeviceFocus::MicTest => {
                 self.is_testing_mic = !self.is_testing_mic;
                 if !self.is_testing_mic {
@@ -234,6 +310,18 @@ impl DevicesView {
                 }
             }
         }
+    }
+
+    /// Persists audio ducking settings to `.env` file.
+    pub fn save_ducking_config(&mut self) -> Result<(), String> {
+        save_ducking_to_env(
+            &self.env_path,
+            self.ducking_enabled,
+            self.ducking_volume_percent,
+        )?;
+        self.has_unsaved_ducking_changes = false;
+        self.status_message = Some("Atenuación guardada en ~/.config/viernes/.env (0600)".into());
+        Ok(())
     }
 
     /// Confirms current selection and closes open dropdowns.
@@ -269,8 +357,8 @@ impl DevicesView {
             .margin(1)
             .constraints([
                 Constraint::Length(3), // Title / Subtitle
-                Constraint::Length(7), // Dropdown selectors
-                Constraint::Length(6), // VU meter audio level widget
+                Constraint::Length(7), // Dropdown selectors (Mic & Speaker)
+                Constraint::Length(6), // Row 3: VU meter (50%) & Audio Ducking (50%)
                 Constraint::Min(3),    // Device details or dropdown expand
                 Constraint::Length(2), // Help / shortcuts
             ])
@@ -397,11 +485,17 @@ impl DevicesView {
         );
         f.render_widget(spk_box, selector_chunks[1]);
 
-        // 3. Audio Level Meter Widget (VU Meter)
+        // Row 3: Left = VU Meter (50%), Right = Audio Ducking Controls (50%)
+        let row3_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[2]);
+
+        // 3A. Audio Level Meter Widget (VU Meter)
         let vu_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Length(2)])
-            .split(chunks[2]);
+            .split(row3_chunks[0]);
 
         let pct = (self.mic_level * 100.0) as u16;
         let gauge_color = if pct > 80 {
@@ -417,7 +511,7 @@ impl DevicesView {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Vúmetro de Entrada (Nivel de Micrófono en Tiempo Real) ")
+                    .title(" Vúmetro de Entrada ")
                     .border_style(if self.focus == DeviceFocus::MicTest {
                         Style::default().fg(Color::Yellow)
                     } else {
@@ -430,9 +524,9 @@ impl DevicesView {
         f.render_widget(vu_gauge, vu_chunks[0]);
 
         let test_status_str = if self.is_testing_mic {
-            "● PRUEBA ACTIVA — Hable al micrófono para verificar energía"
+            "● PRUEBA ACTIVA — Hable al micrófono"
         } else {
-            "○ PRUEBA DETENIDA — Presione [Espacio] o [m] para activar monitoreo de entrada"
+            "○ Presione [Espacio] o [m] para probar"
         };
         let test_status_color = if self.is_testing_mic {
             Color::Green
@@ -446,6 +540,68 @@ impl DevicesView {
                 .add_modifier(Modifier::BOLD),
         )]));
         f.render_widget(test_status_p, vu_chunks[1]);
+
+        // 3B. Background Audio Ducking Controls (PipeWire / PulseAudio)
+        let ducking_border_style = if self.focus == DeviceFocus::AudioDucking {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let duck_status_span = if self.ducking_enabled {
+            Span::styled(
+                "[x] ACTIVADA (Música baja al hablar)",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "[ ] DESACTIVADA (Volumen constante)",
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+
+        let unsaved_badge = if self.has_unsaved_ducking_changes {
+            Span::styled(" *[s: guardar]", Style::default().fg(Color::LightRed))
+        } else {
+            Span::raw("")
+        };
+
+        let ducking_title = if self.focus == DeviceFocus::AudioDucking {
+            " Atenuación de Música (Ducking) [ACTIVO] "
+        } else {
+            " Atenuación de Música (Ducking) "
+        };
+
+        let ducking_box = Paragraph::new(vec![
+            Line::from(vec![Span::raw("Estado: "), duck_status_span, unsaved_badge]),
+            Line::from(vec![
+                Span::raw("Volumen Música: "),
+                Span::styled(
+                    format!("{}%", self.ducking_volume_percent),
+                    if self.ducking_enabled {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::raw(" (Ajustar: [←/→] o [-/+])"),
+            ]),
+            Line::from(Span::styled(
+                "Atenúa Spotify/navegador mientras Viernes escucha o habla",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ducking_title)
+                .border_style(ducking_border_style),
+        );
+        f.render_widget(ducking_box, row3_chunks[1]);
 
         // 4. Detail / Expanded Dropdown section
         if self.input_dropdown_open {
@@ -540,19 +696,101 @@ impl DevicesView {
         // 5. Shortcuts help footer
         let help = Paragraph::new(Line::from(vec![
             Span::styled("[Tab]: ", Style::default().fg(Color::Yellow)),
-            Span::raw("Cambiar sección │ "),
+            Span::raw("Sección │ "),
             Span::styled("[↑/↓]: ", Style::default().fg(Color::Yellow)),
             Span::raw("Navegar │ "),
-            Span::styled("[Enter]: ", Style::default().fg(Color::Yellow)),
-            Span::raw("Desplegar/Confirmar │ "),
-            Span::styled("[m]: ", Style::default().fg(Color::Yellow)),
-            Span::raw("Probar Micrófono │ "),
+            Span::styled("[Enter/Espacio]: ", Style::default().fg(Color::Yellow)),
+            Span::raw("Acción │ "),
+            Span::styled("[←/→]: ", Style::default().fg(Color::Yellow)),
+            Span::raw("Vol % │ "),
+            Span::styled("[s]: ", Style::default().fg(Color::Yellow)),
+            Span::raw("Guardar .env │ "),
             Span::styled("[r]: ", Style::default().fg(Color::Yellow)),
-            Span::raw("Re-enumerar"),
+            Span::raw("Refrescar"),
         ]))
         .alignment(Alignment::Center);
         f.render_widget(help, chunks[4]);
     }
+}
+
+/// Helper to update or append audio ducking configuration in a `.env` file preserving comments and keys.
+pub fn save_ducking_to_env(
+    path: &std::path::Path,
+    enabled: bool,
+    volume_percent: u32,
+) -> Result<(), String> {
+    let lines: Vec<String> = if path.exists() {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read env file: {e}"))?
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut new_lines = Vec::with_capacity(lines.len() + 2);
+    let mut enabled_found = false;
+    let mut percent_found = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("AUDIO_DUCKING_ENABLED=") {
+            new_lines.push(format!("AUDIO_DUCKING_ENABLED={enabled}"));
+            enabled_found = true;
+        } else if trimmed.starts_with("AUDIO_DUCKING_VOLUME_PERCENT=") {
+            new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
+            percent_found = true;
+        } else {
+            new_lines.push(line);
+        }
+    }
+
+    if !enabled_found {
+        new_lines.push(format!("AUDIO_DUCKING_ENABLED={enabled}"));
+    }
+    if !percent_found {
+        new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
+    }
+
+    let content = new_lines.join("\n") + "\n";
+    let temp_path = path.with_extension("tmp");
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+
+        #[cfg(unix)]
+        {
+            if let Ok(metadata) = file.metadata() {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                let _ = file.set_permissions(permissions);
+            }
+        }
+
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write content: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temporary file: {e}"))?;
+    }
+
+    std::fs::rename(&temp_path, path).map_err(|e| format!("Atomic rename failed: {e}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -625,6 +863,8 @@ mod tests {
             view.selected_input_device().unwrap().name,
             "PipeWire Capture (Default)"
         );
+        assert!(view.ducking_enabled);
+        assert_eq!(view.ducking_volume_percent, 20);
     }
 
     #[test]
@@ -636,11 +876,20 @@ mod tests {
         view.next_focus();
         assert_eq!(view.focus, DeviceFocus::Speaker);
         view.next_focus();
+        assert_eq!(view.focus, DeviceFocus::AudioDucking);
+        view.next_focus();
         assert_eq!(view.focus, DeviceFocus::MicTest);
         view.next_focus();
         assert_eq!(view.focus, DeviceFocus::Microphone);
 
+        // Reverse focus
+        view.prev_focus();
+        assert_eq!(view.focus, DeviceFocus::MicTest);
+        view.prev_focus();
+        assert_eq!(view.focus, DeviceFocus::AudioDucking);
+
         // Select next device in microphone list
+        view.focus = DeviceFocus::Microphone;
         view.select_next();
         assert_eq!(view.selected_input, 1);
         assert_eq!(view.selected_input_device().unwrap().name, "USB Mic Studio");
@@ -676,6 +925,63 @@ mod tests {
 
         view.set_mic_level(0.42);
         assert!((view.mic_level - 0.42).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_devices_view_audio_ducking_toggle_and_volume_adjustment() {
+        let (inputs, outputs) = make_test_devices();
+        let mut view = DevicesView::new_mock(inputs, outputs);
+
+        view.focus = DeviceFocus::AudioDucking;
+        assert!(view.ducking_enabled);
+        assert_eq!(view.ducking_volume_percent, 20);
+
+        // Toggle ducking
+        view.toggle_action();
+        assert!(!view.ducking_enabled);
+        assert!(view.has_unsaved_ducking_changes);
+
+        view.toggle_action();
+        assert!(view.ducking_enabled);
+
+        // Increase volume by 5%
+        view.select_next();
+        assert_eq!(view.ducking_volume_percent, 25);
+
+        // Decrease volume by 5% twice
+        view.select_prev();
+        assert_eq!(view.ducking_volume_percent, 20);
+        view.select_prev();
+        assert_eq!(view.ducking_volume_percent, 15);
+    }
+
+    #[test]
+    fn test_devices_view_audio_ducking_persistence_to_env() {
+        let temp_env =
+            std::env::temp_dir().join(format!("test_viernes_ducking_{}.env", std::process::id()));
+        let _ = std::fs::remove_file(&temp_env);
+
+        let initial_content =
+            "# Test config\nELEVENLABS_VOICE_ID=test123\nAUDIO_DUCKING_ENABLED=false\n";
+        std::fs::write(&temp_env, initial_content).unwrap();
+
+        let (inputs, outputs) = make_test_devices();
+        let mut view = DevicesView::new_mock(inputs, outputs);
+        view.env_path = temp_env.clone();
+        view.ducking_enabled = true;
+        view.ducking_volume_percent = 35;
+        view.has_unsaved_ducking_changes = true;
+
+        let res = view.save_ducking_config();
+        assert!(res.is_ok());
+        assert!(!view.has_unsaved_ducking_changes);
+
+        let saved_content = std::fs::read_to_string(&temp_env).unwrap();
+        assert!(saved_content.contains("ELEVENLABS_VOICE_ID=test123"));
+        assert!(saved_content.contains("AUDIO_DUCKING_ENABLED=true"));
+        assert!(saved_content.contains("AUDIO_DUCKING_VOLUME_PERCENT=35"));
+
+        let _ = std::fs::remove_file(&temp_env);
     }
 
     #[test]
