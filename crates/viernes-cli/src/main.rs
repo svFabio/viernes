@@ -401,7 +401,7 @@ async fn run_daemon_loop(
                         ducker_events.restore().await;
                     }
                 }
-                SystemEvent::PlaybackFinished | SystemEvent::ResetToIdle | SystemEvent::BargeIn => {
+                SystemEvent::ResetToIdle | SystemEvent::BargeIn => {
                     ducker_events.restore().await;
                 }
                 _ => {}
@@ -750,6 +750,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             let mut p = ctx.player.lock().await;
             let _ = p.enqueue_chunk(audio).await;
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
         while ctx.player.lock().await.is_playing() {
             if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
                 return;
@@ -1113,6 +1114,8 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         }
     }
 
+    // Small guard sleep to ensure last synthesized chunk has been registered in player thread
+    tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
     // Drain until player finishes speaking so assistant_state remains Speaking while audio is audible
     while ctx.player.lock().await.is_playing() {
         if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
@@ -1257,6 +1260,17 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(Box::new(SilentAudioSink::new())));
         let sm = StateMachine::new(16);
         let mut event_rx = sm.subscribe_events();
+        let mut transition_rx = sm.subscribe_transitions();
+
+        let ducker_trans = ducker.clone();
+        let trans_listener = tokio::spawn(async move {
+            while let Ok(record) = transition_rx.recv().await {
+                if record.to_state == SystemState::Idle || record.to_state == SystemState::Listening
+                {
+                    ducker_trans.restore().await;
+                }
+            }
+        });
 
         let ducker_events = ducker.clone();
         let player_events = player.clone();
@@ -1273,9 +1287,7 @@ mod tests {
                             ducker_events.restore().await;
                         }
                     }
-                    SystemEvent::PlaybackFinished
-                    | SystemEvent::ResetToIdle
-                    | SystemEvent::BargeIn => {
+                    SystemEvent::ResetToIdle | SystemEvent::BargeIn => {
                         ducker_events.restore().await;
                     }
                     _ => {}
@@ -1295,15 +1307,17 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         assert!(!ducker.is_ducked());
 
-        // 4. Assistant response audio begins playing: duck music
+        // 4. Assistant response audio begins playing: transition to Speaking and duck music
+        let _ = sm.dispatch(SystemEvent::SpeakingStarted).await;
         ducker.duck().await;
         assert!(ducker.is_ducked());
 
-        // 5. Assistant response playback finishes: music restores
+        // 5. Assistant response playback finishes: transition to Idle and music restores
         let _ = sm.dispatch(SystemEvent::PlaybackFinished).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         assert!(!ducker.is_ducked());
 
         listener.abort();
+        trans_listener.abort();
     }
 }
