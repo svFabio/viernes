@@ -184,6 +184,9 @@ impl StreamingAudioPlayer {
                                 }
                                 Err(err) => {
                                     warn!(error = %err, "Failed decoding MP3 audio stream");
+                                    if sink.empty() && command_rx.is_empty() {
+                                        playing_clone.store(false, Ordering::SeqCst);
+                                    }
                                 }
                             }
                         }
@@ -197,6 +200,9 @@ impl StreamingAudioPlayer {
                                 }
                                 Err(err) => {
                                     warn!(error = %err, "Failed decoding filler MP3 audio stream");
+                                    if sink.empty() && command_rx.is_empty() {
+                                        playing_clone.store(false, Ordering::SeqCst);
+                                    }
                                 }
                             }
                         }
@@ -222,7 +228,10 @@ impl StreamingAudioPlayer {
                             playing_clone.store(false, Ordering::SeqCst);
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                            if playing_clone.load(Ordering::SeqCst) && sink.empty() {
+                            if playing_clone.load(Ordering::SeqCst)
+                                && sink.empty()
+                                && command_rx.is_empty()
+                            {
                                 playing_clone.store(false, Ordering::SeqCst);
                                 if current_is_filler {
                                     current_is_filler = false;
@@ -307,6 +316,7 @@ impl AudioPlayback for StreamingAudioPlayer {
             return Err(ViernesError::Audio("Cannot play empty audio chunk".into()));
         }
 
+        self.playing_flag.store(true, Ordering::SeqCst);
         self.command_tx
             .send(PlayerCommand::PlayChunk(audio_bytes))
             .map_err(|e| ViernesError::Audio(format!("Failed to enqueue audio chunk: {e}")))?;
@@ -319,6 +329,7 @@ impl AudioPlayback for StreamingAudioPlayer {
             return Err(ViernesError::Audio("Cannot play empty audio chunk".into()));
         }
 
+        self.playing_flag.store(true, Ordering::SeqCst);
         self.command_tx
             .send(PlayerCommand::PlayFiller(audio_bytes))
             .map_err(|e| {
