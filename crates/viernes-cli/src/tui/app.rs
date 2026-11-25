@@ -260,7 +260,7 @@ impl TuiApp {
         let bar_count = self.spectrum_bars.len();
         if self.assistant_state == SystemState::Speaking {
             let t = (self.tick_count as f32) * 0.22;
-            for i in 0..bar_count {
+            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
                 let fi = i as f32 / bar_count as f32;
                 let formant1 = (-(fi - 0.20).powi(2) / 0.03).exp();
                 let formant2 = (-(fi - 0.52).powi(2) / 0.05).exp() * 0.85;
@@ -273,33 +273,30 @@ impl TuiApp {
 
                 let dynamic_amp = (wave1 * 0.45 + wave2 * 0.35 + wave3 * 0.20) * envelope;
                 let target_height = (0.2 + dynamic_amp * 0.8).clamp(0.08, 0.98);
-                self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.35 + target_height * 0.65).clamp(0.05, 1.0);
+                *bar = (*bar * 0.35 + target_height * 0.65).clamp(0.05, 1.0);
             }
         } else if self.assistant_state == SystemState::Listening {
             let t = (self.tick_count as f32) * 0.20;
-            for i in 0..bar_count {
+            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
                 let fi = i as f32 / bar_count as f32;
                 let wave = ((fi * 10.0 + t).sin() * 0.5 + 0.5) * 0.5 + 0.1;
-                self.spectrum_bars[i] = (self.spectrum_bars[i] * 0.4 + wave * 0.6).clamp(0.05, 0.7);
+                *bar = (*bar * 0.4 + wave * 0.6).clamp(0.05, 0.7);
             }
         } else if self.assistant_state == SystemState::Thinking {
             let t = (self.tick_count as f32) * 0.12;
             let pulse = (t.sin() * 0.5 + 0.5) * 0.4 + 0.08;
-            for i in 0..bar_count {
+            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
                 let fi = i as f32 / bar_count as f32;
                 let wave = (fi * 6.0 - t).cos().abs() * 0.25 + pulse * 0.75;
-                self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.5 + wave * 0.5).clamp(0.05, 0.55);
+                *bar = (*bar * 0.5 + wave * 0.5).clamp(0.05, 0.55);
             }
         } else {
             // Quiescent idle baseline wave
             let t = (self.tick_count as f32) * 0.05;
-            for i in 0..bar_count {
+            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
                 let fi = i as f32 / bar_count as f32;
                 let wave = ((fi * 4.0 + t).sin() * 0.5 + 0.5) * 0.06 + 0.02;
-                self.spectrum_bars[i] =
-                    (self.spectrum_bars[i] * 0.8 + wave * 0.2).clamp(0.01, 0.12);
+                *bar = (*bar * 0.8 + wave * 0.2).clamp(0.01, 0.12);
             }
         }
 

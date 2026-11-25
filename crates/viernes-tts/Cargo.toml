@@ -24,9 +24,6 @@ futures = "0.3"
 # ElevenLabs HTTP client with streaming & TLS
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
 
-# Edge-TTS native WebSocket client
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
-
 # Non-blocking audio playback
 rodio = { version = "0.19", default-features = false, features = ["symphonia-mp3"] }
 

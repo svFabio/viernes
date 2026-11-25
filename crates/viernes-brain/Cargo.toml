@@ -7,7 +7,6 @@ license.workspace = true
 description = "Antigravity NDJSON client, sentence tokenizer, and session lifecycle manager for Viernes"
 
 [dependencies]
-viernes-core.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 serde.workspace = true
