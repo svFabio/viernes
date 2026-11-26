@@ -1255,7 +1255,7 @@ mod tests {
     async fn test_playback_ducking_lifecycle_events() {
         use viernes_tts::SilentAudioSink;
 
-        let ducker = Arc::new(AudioDucker::new(true, 40));
+        let ducker = Arc::new(AudioDucker::new_dry_run(true, 40));
         let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(SilentAudioSink::new())));
         let sm = StateMachine::new(16);

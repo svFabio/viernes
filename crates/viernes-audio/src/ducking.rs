@@ -106,6 +106,7 @@ pub struct AudioDucker {
     target_volume_percent: AtomicU32,
     ducked_streams: Arc<Mutex<Vec<DuckedStream>>>,
     is_ducked: Arc<AtomicBool>,
+    dry_run: bool,
 }
 
 impl Default for AudioDucker {
@@ -123,6 +124,19 @@ impl AudioDucker {
             target_volume_percent: AtomicU32::new(target_volume_percent.min(100)),
             ducked_streams: Arc::new(Mutex::new(Vec::new())),
             is_ducked: Arc::new(AtomicBool::new(false)),
+            dry_run: false,
+        }
+    }
+
+    /// Creates a hermetic `AudioDucker` that tracks duck/restore state without invoking `pactl`.
+    #[must_use]
+    pub fn new_dry_run(enabled: bool, target_volume_percent: u32) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            target_volume_percent: AtomicU32::new(target_volume_percent.min(100)),
+            ducked_streams: Arc::new(Mutex::new(Vec::new())),
+            is_ducked: Arc::new(AtomicBool::new(false)),
+            dry_run: true,
         }
     }
 
@@ -175,6 +189,10 @@ impl AudioDucker {
 
         if self.is_ducked.swap(true, Ordering::SeqCst) {
             // Already ducked; protect original volume snapshot
+            return 0;
+        }
+
+        if self.dry_run {
             return 0;
         }
 
@@ -232,6 +250,10 @@ impl AudioDucker {
     /// Idempotent: Safe to call repeatedly or when no streams were ducked.
     pub async fn restore(&self) -> usize {
         if !self.is_ducked.swap(false, Ordering::SeqCst) {
+            return 0;
+        }
+
+        if self.dry_run {
             return 0;
         }
 
