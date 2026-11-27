@@ -13,9 +13,9 @@ use viernes_audio::capture::{AudioCaptureConfig, CpalAudioCapture};
 use viernes_audio::ducking::AudioDucker;
 use viernes_audio::ptt::{IpcSocketPttListener, PttEvent, PttListener};
 use viernes_audio::stt::{LocalWhisperTranscriber, WhisperConfig};
-use viernes_audio::vad::{VadEvent, VoiceActivityDetector};
+use viernes_audio::vad::{VadEvent, VadState, VoiceActivityDetector};
 use viernes_brain::client::{AntigravityClient, BrainEvent};
-use viernes_brain::confirmation::RiskClassifier;
+use viernes_brain::confirmation::{ConfirmationManager, RiskClassifier};
 use viernes_brain::fillers::FillerCacheManager;
 use viernes_brain::session::SessionPointerManager;
 use viernes_brain::tokenizer::SentenceTokenizer;
@@ -64,7 +64,7 @@ struct CliArgs {
     #[arg(long)]
     benchmark: bool,
 
-    /// Send Push-to-Talk IPC trigger to running daemon (e.g. "press", "release", "cancel")
+    /// Send Push-to-Talk IPC trigger to running daemon (e.g. "press", "release", "cancel", "reload")
     #[arg(long, value_name = "COMMAND")]
     ptt: Option<String>,
 
@@ -74,15 +74,26 @@ struct CliArgs {
 }
 
 /// Silences verbose C-level stderr output (such as ALSA/libasound diagnostic messages)
-/// by redirecting fd 2 to a log file during interactive TUI execution,
+/// by redirecting fd 2 to a private log file during interactive TUI execution,
 /// preserving Rust backtraces and journald diagnostics in daemon/CLI mode.
 #[cfg(target_os = "linux")]
 fn silence_c_stderr() {
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/viernes_alsa.log")
-        .or_else(|_| std::fs::File::create("/dev/null"));
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let alsa_log_path = viernes_core::default_alsa_log_path();
+    let log_file = (|| -> std::io::Result<std::fs::File> {
+        if let Some(parent) = alsa_log_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                viernes_core::ensure_private_dir(parent)?;
+            }
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&alsa_log_path)
+    })()
+    .or_else(|_| std::fs::File::create("/dev/null"));
 
     if let Ok(file) = log_file {
         use std::os::unix::io::AsRawFd;
@@ -109,9 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return tui::run_tui(config).await;
     }
 
-    // Silence verbose C-level stderr (ALSA channel map diagnostics) preserving Rust tracing logs
-    silence_c_stderr();
-
     // Initialize structured tracing to stdout
     tracing_subscriber::fmt()
         .with_writer(std::io::stdout)
@@ -131,6 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.check_config {
         info!("Configuration loaded successfully:");
         info!("  Voice ID: {}", config.elevenlabs_voice_id);
+        info!(
+            "  Model ID: {}",
+            config.elevenlabs_model_id.as_deref().unwrap_or("default")
+        );
         info!("  Key Pool Size: {}", config.elevenlabs_api_keys.len());
         info!("  VAD Threshold: {:.4}", config.vad_threshold);
         info!("  Silence Timeout: {} ms", config.silence_timeout_ms);
@@ -180,7 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let test_phrase = "A la orden, Señor. Viernes en línea y lista para operar.";
         info!("Audition test: '{}'", test_phrase);
         let tts = ResilientTtsEngine::from_env();
-        let mut player = StreamingAudioPlayer::create_resilient_player(None);
+        let initial_volume = (config.viernes_volume_percent as f32) / 100.0;
+        let mut player = StreamingAudioPlayer::create_resilient_player_with_options(
+            None,
+            initial_volume,
+            config.audio_output_device.as_deref(),
+        );
 
         info!("Synthesizing test audio via TTS engine...");
         let audio_bytes = tts.synthesize_resilient(test_phrase).await?;
@@ -203,6 +220,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let new_id = mgr.rotate_session().await?;
         info!("Dynamic session rotated successfully. New ID: {}", new_id);
         println!("Viernes conversation session rotated to: {}", new_id);
+        let socket_path = resolve_ptt_socket_path();
+        if let Err(err) = send_ipc_ptt(&socket_path, "reload").await {
+            if err.kind() != std::io::ErrorKind::NotFound
+                && err.kind() != std::io::ErrorKind::ConnectionRefused
+            {
+                warn!("Failed to notify running daemon to reload session: {err}");
+            }
+        }
         return Ok(());
     }
 
@@ -222,85 +247,117 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Main non-blocking event loop listening for OS signals and driving the voice pipeline.
-async fn run_daemon_loop(
-    config: &ViernesConfig,
-    continuous: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let state_machine = Arc::new(StateMachine::new(256));
-    let mut transition_rx = state_machine.subscribe_transitions();
-    info!(
-        "Daemon initialized in state: {} (mode: {})",
-        state_machine.state().await,
-        if continuous {
-            "Continuous VAD"
-        } else {
-            "Push-to-Talk"
-        }
-    );
+/// Coordinates monotonic turn epochs and race-free asynchronous cancellation notifications.
+#[derive(Clone)]
+struct TurnCoordinator {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    cancel_notify: Arc<tokio::sync::Notify>,
+    epoch_tx: tokio::sync::watch::Sender<u64>,
+}
 
-    // 1. Audio Capture & VAD setup
-    let capture_config = AudioCaptureConfig {
-        device_query: None,
-        preferred_sample_rate: 16_000,
-        chunk_ms: 20,
-        channel_capacity: 128,
-    };
-    let mut capture = CpalAudioCapture::new(capture_config);
-    capture.set_recording_active(false);
-    let audio_rx = capture.receiver();
-    let audio_active = capture.start_stream().await.is_ok();
-    if audio_active {
-        info!("Real-time audio capture hardware stream active.");
-    } else {
-        warn!("Audio hardware capture stream unavailable (running in event-driven headless mode).");
+impl TurnCoordinator {
+    fn new() -> Self {
+        let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
+        Self {
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            epoch_tx,
+        }
     }
 
-    let mut vad =
-        VoiceActivityDetector::new(16_000, config.vad_threshold, config.silence_timeout_ms);
+    /// Increments the turn epoch, notifies all active waiters, and returns the new epoch.
+    fn bump(&self) -> u64 {
+        let next = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let _ = self.epoch_tx.send(next);
+        self.cancel_notify.notify_waiters();
+        next
+    }
 
-    // 2. Audio Playback, Resident STT & TTS setup
-    let event_tx = state_machine.event_sender();
-    let initial_volume = (config.viernes_volume_percent as f32) / 100.0;
-    let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> = Arc::new(
-        tokio::sync::Mutex::new(StreamingAudioPlayer::create_resilient_player_with_volume(
-            Some(event_tx),
-            initial_volume,
-        )),
-    );
-    let tts_engine = Arc::new(ResilientTtsEngine::from_env());
-    let transcriber = Arc::new(
-        LocalWhisperTranscriber::new(WhisperConfig::default())
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
-    );
-    let ducker = Arc::new(AudioDucker::from_config(config));
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
-    // 3. Fillers Manager & Pre-warming (in-memory audio cache)
-    let fillers_mgr = Arc::new(FillerCacheManager::new(None::<&str>).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let dynamic_path = std::path::PathBuf::from(home).join(".config/viernes/fillers.json");
-        FillerCacheManager::new(Some(dynamic_path)).unwrap_or_else(|_| {
-            FillerCacheManager::new(Some("fillers.json")).expect("valid filler fallback")
-        })
-    }));
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let fillers_cache_dir =
-        std::path::PathBuf::from(home_dir).join(".config/viernes/fillers_cache");
-    let loaded_fillers = fillers_mgr.prewarm_audio_cache(&fillers_cache_dir).await;
-    info!(
-        loaded_fillers,
-        "Conversational Fillers engine active with in-memory RAM audio cache"
-    );
+    fn is_current(&self, turn_id: u64) -> bool {
+        self.current_epoch() == turn_id
+    }
 
-    // 4. Session Pointer Manager & Resident Antigravity Brain Client
-    let session_mgr = Arc::new(
-        SessionPointerManager::new(None::<&str>)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
-    );
-    let active_session_id = session_mgr.current_session_id().await;
-    info!("Active conversation session ID: {}", active_session_id);
+    /// Resolves immediately if `epoch` has already advanced past `turn_id`,
+    /// or as soon as `bump()` advances it.
+    async fn wait_cancelled(&self, turn_id: u64) {
+        let mut rx = self.epoch_tx.subscribe();
+        if *rx.borrow_and_update() != turn_id {
+            return;
+        }
+        tokio::select! {
+            _ = rx.wait_for(|&v| v != turn_id) => {}
+            _ = async {
+                loop {
+                    self.cancel_notify.notified().await;
+                    if self.current_epoch() != turn_id {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    }
+}
 
-    let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+/// Aborts all tracked per-turn spawned subtasks when dropped or explicitly cleared.
+struct TaskAbortGuard(Vec<tokio::task::JoinHandle<()>>);
+
+impl TaskAbortGuard {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.0.retain(|h| !h.is_finished());
+        self.0.push(handle);
+    }
+
+    fn abort_all(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for TaskAbortGuard {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn update_and_persist_status<F>(status: &tokio::sync::Mutex<DaemonLiveStatus>, mutate: F)
+where
+    F: FnOnce(&mut DaemonLiveStatus),
+{
+    let snapshot = {
+        let mut st = status.lock().await;
+        mutate(&mut st);
+        st.timestamp_ms = now_unix_ms();
+        st.clone()
+    };
+    let _ = snapshot.write_to_disk();
+}
+
+fn spawn_restore_ducking(ducker: &Arc<AudioDucker>) {
+    if ducker.is_ducked() {
+        let ducker_clone = ducker.clone();
+        tokio::spawn(async move {
+            ducker_clone.restore().await;
+        });
+    }
+}
+
+fn build_agy_args(session_id: Option<&str>) -> Vec<String> {
     let agy_model =
         std::env::var("VIERNES_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
     let mut agy_args = vec![
@@ -315,12 +372,160 @@ async fn run_daemon_loop(
         "--output-format".to_string(),
         "stream-json".to_string(),
     ];
-    if !active_session_id.is_empty() {
-        agy_args.push("--conversation".to_string());
-        agy_args.push(active_session_id);
+    if let Some(id) = session_id {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            agy_args.push("--conversation".to_string());
+            agy_args.push(trimmed.to_string());
+        }
     }
+    agy_args
+}
+
+fn spawn_antigravity_client(
+    session_id: Option<&str>,
+) -> Result<AntigravityClient, viernes_brain::error::BrainError> {
+    let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+    let args = build_agy_args(session_id);
+    AntigravityClient::spawn(&agy_bin, &args)
+}
+
+/// Transcribes a spoken confirmation response, classifies affirmative/negative intent,
+/// resolves the pending confirmation oneshot, and dispatches `ConfirmationReceived`.
+async fn route_confirmation_response<S: SpeechToText + ?Sized>(
+    pcm: &[f32],
+    stt: &S,
+    pending_confirmation: &tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    sm: &StateMachine,
+) -> bool {
+    let prompt = match stt.transcribe(pcm, 16_000).await {
+        Ok(text) => text.trim().to_string(),
+        Err(e) => {
+            warn!("Confirmation STT transcription error: {e}");
+            String::new()
+        }
+    };
+    let confirmed = RiskClassifier::default()
+        .parse_confirmation_response(&prompt)
+        .unwrap_or(false);
+    info!(
+        transcript = %prompt,
+        confirmed,
+        "Processed voice confirmation response"
+    );
+
+    let tx_opt = {
+        let mut guard = pending_confirmation.lock().await;
+        guard.take()
+    };
+    if let Some(tx) = tx_opt {
+        let _ = tx.send(confirmed);
+    }
+    let _ = sm
+        .dispatch(SystemEvent::ConfirmationReceived { confirmed })
+        .await;
+    confirmed
+}
+
+/// Main non-blocking event loop listening for OS signals and driving the voice pipeline.
+async fn run_daemon_loop(
+    config: &ViernesConfig,
+    continuous: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut active_config = config.clone();
+    let state_machine = Arc::new(StateMachine::new(256));
+    let mut transition_rx = state_machine.subscribe_transitions();
+    info!(
+        "Daemon initialized in state: {} (mode: {})",
+        state_machine.state().await,
+        if continuous {
+            "Continuous VAD"
+        } else {
+            "Push-to-Talk"
+        }
+    );
+
+    // 1. Audio Capture & VAD setup
+    let capture_config = AudioCaptureConfig {
+        device_query: active_config.audio_input_device.clone(),
+        preferred_sample_rate: 16_000,
+        chunk_ms: 20,
+        channel_capacity: 128,
+    };
+    let mut capture = CpalAudioCapture::new(capture_config);
+    capture.set_recording_active(false);
+    let audio_rx = capture.receiver();
+    let audio_active = capture.start_stream().await.is_ok();
+    if audio_active {
+        info!("Real-time audio capture hardware stream active.");
+    } else {
+        warn!("Audio hardware capture stream unavailable (running in event-driven headless mode).");
+    }
+
+    let mut vad = VoiceActivityDetector::new(
+        16_000,
+        active_config.vad_threshold,
+        active_config.silence_timeout_ms,
+    );
+
+    // 2. Audio Playback, Resident STT, TTS & Orphaned Ducking Recovery setup
+    let event_tx = state_machine.event_sender();
+    let initial_volume = (active_config.viernes_volume_percent as f32) / 100.0;
+    let player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>> = Arc::new(
+        tokio::sync::Mutex::new(StreamingAudioPlayer::create_resilient_player_with_options(
+            Some(event_tx),
+            initial_volume,
+            active_config.audio_output_device.as_deref(),
+        )),
+    );
+    let tts_engine = Arc::new(tokio::sync::RwLock::new(Arc::new(
+        ResilientTtsEngine::from_env(),
+    )));
+    let transcriber = Arc::new(
+        LocalWhisperTranscriber::new(WhisperConfig::default())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
+    );
+    let ducker = Arc::new(AudioDucker::from_config(&active_config));
+    let recovered_ducking = ducker.recover_orphaned_ducking().await;
+    if recovered_ducking > 0 {
+        info!(
+            recovered_ducking,
+            "Recovered orphaned media stream ducking from previous session"
+        );
+    }
+
+    // 3. Fillers Manager & Pre-warming (in-memory audio cache)
+    let fillers_mgr = Arc::new(
+        FillerCacheManager::new(None::<&str>)
+            .or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                let dynamic_path =
+                    std::path::PathBuf::from(home).join(".config/viernes/fillers.json");
+                FillerCacheManager::new(Some(dynamic_path))
+            })
+            .or_else(|_| FillerCacheManager::new(Some("fillers.json")))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
+    );
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let fillers_cache_dir =
+        std::path::PathBuf::from(home_dir).join(".config/viernes/fillers_cache");
+    let loaded_fillers = fillers_mgr.prewarm_audio_cache(&fillers_cache_dir).await;
+    info!(
+        loaded_fillers,
+        "Conversational Fillers engine active with in-memory RAM audio cache"
+    );
+
+    // 4. Session Pointer Manager & Resident Antigravity Brain Client
+    let initial_session_mgr = SessionPointerManager::new(None::<&str>)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let active_session_id = initial_session_mgr.current_session_id().await;
+    info!("Active conversation session ID: {}", active_session_id);
+    let session_mgr = Arc::new(tokio::sync::RwLock::new(Arc::new(initial_session_mgr)));
+
+    let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
+    let initial_sid = (!active_session_id.is_empty()).then_some(active_session_id.as_str());
     let brain_client: Arc<tokio::sync::Mutex<Option<AntigravityClient>>> =
-        match AntigravityClient::spawn(&agy_bin, &agy_args) {
+        match spawn_antigravity_client(initial_sid) {
             Ok(client) => {
                 info!("Resident Antigravity brain spawned successfully ({agy_bin})");
                 Arc::new(tokio::sync::Mutex::new(Some(client)))
@@ -344,12 +549,12 @@ async fn run_daemon_loop(
         last_user_prompt: String::new(),
         last_assistant_text: String::new(),
         turn_counter: 0,
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
+        timestamp_ms: now_unix_ms(),
     }));
-    let _ = live_status.lock().await.write_to_disk();
+    {
+        let initial_snapshot = live_status.lock().await.clone();
+        let _ = initial_snapshot.write_to_disk();
+    }
 
     // 7. Signal Handlers
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -360,19 +565,19 @@ async fn run_daemon_loop(
     // 8. Background transition logger and live status sync task
     let status_tracker = live_status.clone();
     let ducker_transition = ducker.clone();
-    tokio::spawn(async move {
+    let transition_handle = tokio::spawn(async move {
         while let Ok(record) = transition_rx.recv().await {
             info!(
                 "Lifecycle Transition: {} -> {} (trigger: {:?})",
                 record.from_state, record.to_state, record.trigger_event
             );
-            let mut st = status_tracker.lock().await;
-            st.state = record.to_state;
-            st.timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let _ = st.write_to_disk();
+            let snapshot = {
+                let mut st = status_tracker.lock().await;
+                st.state = record.to_state;
+                st.timestamp_ms = now_unix_ms();
+                st.clone()
+            };
+            let _ = snapshot.write_to_disk();
 
             if record.to_state == SystemState::Idle || record.to_state == SystemState::Listening {
                 ducker_transition.restore().await;
@@ -384,7 +589,7 @@ async fn run_daemon_loop(
     let mut playback_event_rx = state_machine.subscribe_events();
     let ducker_events = ducker.clone();
     let player_events = player.clone();
-    tokio::spawn(async move {
+    let playback_events_handle = tokio::spawn(async move {
         while let Ok(event) = playback_event_rx.recv().await {
             match event {
                 SystemEvent::FillerPlaybackFinished => {
@@ -411,14 +616,18 @@ async fn run_daemon_loop(
 
     // 9. Temporary Storage Manager & Initial Stale Audio Cleanup
     let temp_storage = Arc::new(viernes_tts::TempStorageManager::new(
-        config.temp_dir.clone(),
+        active_config.temp_dir.clone(),
     ));
     if let Err(e) = temp_storage.purge_excess_and_expired() {
         warn!("Initial temp storage cleanup failed: {e}");
     }
 
-    // 10. Atomic Turn Epoch Tracker for Barge-in Cancellation
-    let turn_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // 10. Turn Coordinator, Confirmation Channel & Reload Lock
+    let turn_coord = TurnCoordinator::new();
+    let pending_confirmation: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let mut active_turn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // 11. Main event processing loop with Acoustic Echo Suppression & Continuous Barge-in
     let mut chunk_interval = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -428,6 +637,8 @@ async fn run_daemon_loop(
     let mut barge_in_consecutive_frames = 0;
 
     loop {
+        active_turn_handles.retain(|h| !h.is_finished());
+
         tokio::select! {
             _ = sigint.recv() => {
                 info!("Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
@@ -444,15 +655,26 @@ async fn run_daemon_loop(
                             info!("Push-to-Talk IPC event: Pressed");
                             ptt_active = true;
                             ptt_accumulated.clear();
-                            turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
-                            {
+                            let awaiting_confirm =
+                                state_machine.state().await == SystemState::AwaitingConfirmation;
+                            if !awaiting_confirm {
+                                turn_coord.bump();
+                                let _ = state_machine.dispatch(SystemEvent::PttPressed).await;
+                            }
+                            let interrupted_playback = {
                                 let mut p = player.lock().await;
                                 if p.is_playing() {
                                     let _ = p.stop_immediately();
-                                    info!("Barge-in: interrupted active playback via PTT.");
-                                    ducker.restore().await;
+                                    true
+                                } else {
+                                    false
                                 }
+                            };
+                            if interrupted_playback {
+                                info!("Barge-in: interrupted active playback via PTT.");
+                            }
+                            if interrupted_playback || ducker.is_ducked() {
+                                spawn_restore_ducking(&ducker);
                             }
                             vad.set_silence_timeout_enabled(false);
                             vad.start_speech_capture();
@@ -460,7 +682,11 @@ async fn run_daemon_loop(
                         PttEvent::Released => {
                             info!("Push-to-Talk IPC event: Released");
                             ptt_active = false;
-                            let _ = state_machine.dispatch(SystemEvent::PttReleased).await;
+                            let awaiting_confirm =
+                                state_machine.state().await == SystemState::AwaitingConfirmation;
+                            if !awaiting_confirm {
+                                let _ = state_machine.dispatch(SystemEvent::PttReleased).await;
+                            }
                             vad.set_silence_timeout_enabled(continuous);
                             let pcm_buffer = vad
                                 .force_finish()
@@ -473,8 +699,25 @@ async fn run_daemon_loop(
                                     "PTT audio too short ({} samples < 2400 / 150ms); discarding micro-click",
                                     pcm_buffer.len()
                                 );
-                                let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
-                                ducker.restore().await;
+                                if !awaiting_confirm {
+                                    let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
+                                    spawn_restore_ducking(&ducker);
+                                }
+                                continue;
+                            }
+
+                            if awaiting_confirm {
+                                info!(
+                                    "PTT confirmation speech finished ({} samples)",
+                                    pcm_buffer.len()
+                                );
+                                let stt_c = transcriber.clone();
+                                let pending_c = pending_confirmation.clone();
+                                let sm_c = state_machine.clone();
+                                tokio::spawn(async move {
+                                    route_confirmation_response(&pcm_buffer, &*stt_c, &pending_c, &sm_c)
+                                        .await;
+                                });
                                 continue;
                             }
 
@@ -484,12 +727,12 @@ async fn run_daemon_loop(
                             );
                             let _ = state_machine
                                 .dispatch(SystemEvent::VoiceFinished {
-                                    samples: pcm_buffer.clone(),
+                                    samples: Vec::new(),
                                     sample_rate: 16_000,
                                 })
                                 .await;
 
-                            let turn_id = turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let turn_id = turn_coord.bump();
                             let ctx = SpeechTurnContext {
                                 sm: state_machine.clone(),
                                 stt: transcriber.clone(),
@@ -500,11 +743,113 @@ async fn run_daemon_loop(
                                 brain: brain_client.clone(),
                                 status: live_status.clone(),
                                 session_mgr: session_mgr.clone(),
-                                turn_epoch: turn_epoch.clone(),
+                                turn_coord: turn_coord.clone(),
+                                pending_confirmation: pending_confirmation.clone(),
                                 turn_id,
                             };
-                            tokio::spawn(async move {
+                            active_turn_handles.push(tokio::spawn(async move {
                                 process_speech_turn(pcm_buffer, ctx).await;
+                            }));
+                        }
+                        PttEvent::Cancel => {
+                            info!("Push-to-Talk IPC event: Cancel");
+                            ptt_active = false;
+                            ptt_accumulated.clear();
+                            barge_in_consecutive_frames = 0;
+                            if let Some(tx) = pending_confirmation.lock().await.take() {
+                                let _ = tx.send(false);
+                            }
+                            turn_coord.bump();
+                            {
+                                let mut p = player.lock().await;
+                                if p.is_playing() {
+                                    let _ = p.stop_immediately();
+                                }
+                            }
+                            vad.reset();
+                            vad.set_silence_timeout_enabled(continuous);
+                            spawn_restore_ducking(&ducker);
+                            let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
+                        }
+                        PttEvent::Reload => {
+                            info!("Push-to-Talk IPC event: Reload");
+                            match ViernesConfig::load_from_env(None) {
+                                Ok(new_cfg) => {
+                                    ducker.set_enabled(new_cfg.audio_ducking_enabled);
+                                    ducker.set_target_volume_percent(
+                                        new_cfg.audio_ducking_volume_percent,
+                                    );
+                                    if !ptt_active && vad.state() == VadState::Silence {
+                                        let timeout_enabled = vad.is_silence_timeout_enabled();
+                                        vad = VoiceActivityDetector::new(
+                                            16_000,
+                                            new_cfg.vad_threshold,
+                                            new_cfg.silence_timeout_ms,
+                                        );
+                                        vad.set_silence_timeout_enabled(timeout_enabled);
+                                    } else {
+                                        vad.set_threshold(new_cfg.vad_threshold);
+                                    }
+                                    active_config = new_cfg;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reload .env configuration: {e}");
+                                }
+                            }
+
+                            let new_vol = (active_config.viernes_volume_percent as f32) / 100.0;
+                            let fillers_r = fillers_mgr.clone();
+                            let cache_dir_r = fillers_cache_dir.clone();
+                            let tts_r = tts_engine.clone();
+                            let player_r = player.clone();
+                            let session_r = session_mgr.clone();
+                            let brain_r = brain_client.clone();
+                            let turn_r = turn_coord.clone();
+                            let reload_lock_r = reload_lock.clone();
+
+                            tokio::spawn(async move {
+                                let _guard = reload_lock_r.lock().await;
+                                if let Err(e) = fillers_r.reload().await {
+                                    warn!("Failed to reload conversational fillers: {e}");
+                                }
+                                let loaded = fillers_r.prewarm_audio_cache(&cache_dir_r).await;
+                                info!(loaded, "Reloaded conversational fillers audio cache");
+
+                                let fresh_tts = Arc::new(ResilientTtsEngine::from_env());
+                                *tts_r.write().await = fresh_tts;
+
+                                {
+                                    let mut p = player_r.lock().await;
+                                    let _ = p.set_volume(new_vol);
+                                }
+
+                                match SessionPointerManager::new(None::<&str>) {
+                                    Ok(disk_mgr) => {
+                                        let disk_id = disk_mgr.current_session_id().await;
+                                        let current_id = {
+                                            let mgr = session_r.read().await;
+                                            mgr.current_session_id().await
+                                        };
+                                        if disk_id != current_id {
+                                            info!(
+                                                old_session = %current_id,
+                                                new_session = %disk_id,
+                                                "Session pointer changed on disk; respawning Antigravity brain"
+                                            );
+                                            turn_r.bump();
+                                            *session_r.write().await = Arc::new(disk_mgr);
+                                            let mut brain_guard = brain_r.lock().await;
+                                            if let Some(ref mut client) = *brain_guard {
+                                                let _ = client.terminate().await;
+                                            }
+                                            let sid = (!disk_id.is_empty()).then_some(disk_id.as_str());
+                                            *brain_guard = spawn_antigravity_client(sid).ok();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to reload session.json from disk: {e}");
+                                    }
+                                }
                             });
                         }
                     }
@@ -520,7 +865,7 @@ async fn run_daemon_loop(
                     if is_playing {
                         // Acoustic Barge-in: Monitor microphone for speech interrupting the speaker
                         let rms = viernes_audio::vad::compute_rms(&chunk);
-                        let barge_in_threshold = (config.vad_threshold * 1.8).max(0.04);
+                        let barge_in_threshold = (active_config.vad_threshold * 1.8).max(0.04);
 
                         if continuous && rms >= barge_in_threshold {
                             barge_in_consecutive_frames += 1;
@@ -530,14 +875,20 @@ async fn run_daemon_loop(
                                     rms, barge_in_threshold
                                 );
                                 barge_in_consecutive_frames = 0;
-                                turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let awaiting_confirm = state_machine.state().await
+                                    == SystemState::AwaitingConfirmation;
+                                if !awaiting_confirm {
+                                    turn_coord.bump();
+                                }
                                 if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
                                         let _ = p.stop_immediately();
                                     }
                                 }
-                                ducker.restore().await;
-                                let _ = state_machine.dispatch(SystemEvent::BargeIn).await;
+                                spawn_restore_ducking(&ducker);
+                                if !awaiting_confirm {
+                                    let _ = state_machine.dispatch(SystemEvent::BargeIn).await;
+                                }
                                 vad.start_speech_capture();
                                 playback_cooldown_until = std::time::Instant::now() + std::time::Duration::from_millis(150);
                             }
@@ -572,26 +923,63 @@ async fn run_daemon_loop(
                         match event {
                             VadEvent::VoiceStarted => {
                                 info!("VAD detected speech onset (VoiceStarted)");
-                                turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                let _ = state_machine.dispatch(SystemEvent::VoiceStarted).await;
-                                if let Ok(mut p) = player.try_lock() {
+                                let awaiting_confirm = state_machine.state().await
+                                    == SystemState::AwaitingConfirmation;
+                                if !awaiting_confirm {
+                                    turn_coord.bump();
+                                    let _ = state_machine.dispatch(SystemEvent::VoiceStarted).await;
+                                }
+                                let interrupted = if let Ok(mut p) = player.try_lock() {
                                     if p.is_playing() {
                                         let _ = p.stop_immediately();
-                                        info!("Barge-in: interrupted active playback.");
-                                        ducker.restore().await;
+                                        true
+                                    } else {
+                                        false
                                     }
+                                } else {
+                                    false
+                                };
+                                if interrupted {
+                                    info!("Barge-in: interrupted active playback.");
+                                    spawn_restore_ducking(&ducker);
                                 }
                             }
                             VadEvent::VoiceFinished(pcm_buffer) => {
                                 if continuous {
+                                    let awaiting_confirm = state_machine.state().await
+                                        == SystemState::AwaitingConfirmation;
                                     // Discard micro-clicks (< 2400 samples / 150ms @ 16kHz)
                                     if pcm_buffer.len() < 2400 {
                                         info!(
                                             "Continuous speech segment too short ({} samples < 2400 / 150ms); discarding",
                                             pcm_buffer.len()
                                         );
-                                        let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
-                                        ducker.restore().await;
+                                        if !awaiting_confirm {
+                                            let _ = state_machine
+                                                .dispatch(SystemEvent::ResetToIdle)
+                                                .await;
+                                            spawn_restore_ducking(&ducker);
+                                        }
+                                        continue;
+                                    }
+
+                                    if awaiting_confirm {
+                                        info!(
+                                            "VAD confirmation speech finished ({} samples)",
+                                            pcm_buffer.len()
+                                        );
+                                        let stt_c = transcriber.clone();
+                                        let pending_c = pending_confirmation.clone();
+                                        let sm_c = state_machine.clone();
+                                        tokio::spawn(async move {
+                                            route_confirmation_response(
+                                                &pcm_buffer,
+                                                &*stt_c,
+                                                &pending_c,
+                                                &sm_c,
+                                            )
+                                            .await;
+                                        });
                                         continue;
                                     }
 
@@ -601,12 +989,12 @@ async fn run_daemon_loop(
                                     );
                                     let _ = state_machine
                                         .dispatch(SystemEvent::VoiceFinished {
-                                            samples: pcm_buffer.clone(),
+                                            samples: Vec::new(),
                                             sample_rate: 16_000,
                                         })
                                         .await;
 
-                                    let turn_id = turn_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                    let turn_id = turn_coord.bump();
                                     let ctx = SpeechTurnContext {
                                         sm: state_machine.clone(),
                                         stt: transcriber.clone(),
@@ -617,12 +1005,13 @@ async fn run_daemon_loop(
                                         brain: brain_client.clone(),
                                         status: live_status.clone(),
                                         session_mgr: session_mgr.clone(),
-                                        turn_epoch: turn_epoch.clone(),
+                                        turn_coord: turn_coord.clone(),
+                                        pending_confirmation: pending_confirmation.clone(),
                                         turn_id,
                                     };
-                                    tokio::spawn(async move {
+                                    active_turn_handles.push(tokio::spawn(async move {
                                         process_speech_turn(pcm_buffer, ctx).await;
-                                    });
+                                    }));
                                 }
                             }
                         }
@@ -632,10 +1021,26 @@ async fn run_daemon_loop(
         }
     }
 
+    turn_coord.bump();
+    if let Some(tx) = pending_confirmation.lock().await.take() {
+        let _ = tx.send(false);
+    }
+    for handle in active_turn_handles.drain(..) {
+        handle.abort();
+    }
     if audio_active {
         let _ = capture.stop_stream().await;
     }
     let _ = ptt_listener.stop().await;
+    {
+        let mut brain_guard = brain_client.lock().await;
+        if let Some(ref mut client) = *brain_guard {
+            let _ = client.terminate().await;
+        }
+        *brain_guard = None;
+    }
+    transition_handle.abort();
+    playback_events_handle.abort();
     let _ = temp_storage.clean_all();
     ducker.restore().await;
     let _ = state_machine.dispatch(SystemEvent::ResetToIdle).await;
@@ -647,20 +1052,104 @@ async fn run_daemon_loop(
 struct SpeechTurnContext {
     sm: Arc<StateMachine>,
     stt: Arc<LocalWhisperTranscriber>,
-    tts: Arc<ResilientTtsEngine>,
+    tts: Arc<tokio::sync::RwLock<Arc<ResilientTtsEngine>>>,
     player: Arc<tokio::sync::Mutex<Box<dyn AudioPlayback>>>,
     ducker: Arc<AudioDucker>,
     fillers: Arc<FillerCacheManager>,
     brain: Arc<tokio::sync::Mutex<Option<AntigravityClient>>>,
     status: Arc<tokio::sync::Mutex<DaemonLiveStatus>>,
-    session_mgr: Arc<SessionPointerManager>,
-    turn_epoch: Arc<std::sync::atomic::AtomicU64>,
+    session_mgr: Arc<tokio::sync::RwLock<Arc<SessionPointerManager>>>,
+    turn_coord: TurnCoordinator,
+    pending_confirmation: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
     turn_id: u64,
+}
+
+async fn wait_player_drain(
+    player: &tokio::sync::Mutex<Box<dyn AudioPlayback>>,
+    turn_coord: &TurnCoordinator,
+    turn_id: u64,
+) -> bool {
+    tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
+    loop {
+        if !turn_coord.is_current(turn_id) {
+            return false;
+        }
+        let playing = {
+            let guard = player.lock().await;
+            guard.is_playing()
+        };
+        if !playing {
+            return true;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Speaks a short standalone utterance (e.g. rotation ack or cancellation notice) and drains playback.
+async fn speak_turn_message(ctx: &SpeechTurnContext, text: &str, user_prompt: Option<String>) {
+    let tts_snapshot = ctx.tts.read().await.clone();
+    let synth_res = tokio::select! {
+        biased;
+        _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+            ctx.ducker.restore().await;
+            return;
+        }
+        res = tts_snapshot.synthesize_resilient(text) => res,
+    };
+
+    if !ctx.turn_coord.is_current(ctx.turn_id) {
+        ctx.ducker.restore().await;
+        return;
+    }
+
+    match synth_res {
+        Ok(audio) => {
+            update_and_persist_status(&ctx.status, |st| {
+                if let Some(prompt) = user_prompt {
+                    st.last_user_prompt = prompt;
+                    st.turn_counter += 1;
+                }
+                st.last_assistant_text = text.to_string();
+            })
+            .await;
+
+            let _ = ctx
+                .sm
+                .dispatch(SystemEvent::SentenceReady(text.to_string()))
+                .await;
+            let _ = ctx.sm.dispatch(SystemEvent::SpeakingStarted).await;
+
+            ctx.ducker.duck().await;
+            {
+                let mut p = ctx.player.lock().await;
+                if !ctx.turn_coord.is_current(ctx.turn_id) {
+                    drop(p);
+                    ctx.ducker.restore().await;
+                    return;
+                }
+                let _ = p.enqueue_chunk(audio).await;
+            }
+
+            if wait_player_drain(&ctx.player, &ctx.turn_coord, ctx.turn_id).await {
+                let _ = ctx.sm.dispatch(SystemEvent::PlaybackFinished).await;
+            }
+            ctx.ducker.restore().await;
+        }
+        Err(e) => {
+            warn!("TTS synthesis failed for standalone turn message: {e}");
+            if ctx.turn_coord.is_current(ctx.turn_id) {
+                let _ = ctx.sm.dispatch(SystemEvent::ResetToIdle).await;
+            }
+            ctx.ducker.restore().await;
+        }
+    }
 }
 
 /// Orchestrates an end-to-end voice turn: STT -> Instant Filler -> Brain streaming -> Tokenizer -> TTS.
 async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
-    if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
+    ctx.sm.reset_barge_in();
+
+    if !ctx.turn_coord.is_current(ctx.turn_id) {
         return;
     }
 
@@ -682,7 +1171,7 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
         }
     };
 
-    if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
+    if !ctx.turn_coord.is_current(ctx.turn_id) {
         return;
     }
 
@@ -695,92 +1184,60 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
 
     info!("STT Result: '{}'", prompt);
 
+    let active_session_mgr = ctx.session_mgr.read().await.clone();
+
     // 1. Explicit Session Rotation Intent Detection
-    if ctx.session_mgr.detects_rotation_intent(&prompt) {
+    if active_session_mgr.detects_rotation_intent(&prompt) {
         info!(
             "Explicit conversation rotation intent detected: '{}'",
             prompt
         );
-        if let Err(e) = ctx.session_mgr.rotate_session().await {
-            warn!("Failed to rotate session: {e}");
-        }
+        let new_session_id = match active_session_mgr.rotate_session().await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!("Failed to rotate session: {e}");
+                None
+            }
+        };
 
-        // Terminate active Antigravity process and spawn fresh session
-        let mut brain_guard = ctx.brain.lock().await;
-        if let Some(ref mut client) = *brain_guard {
-            let _ = client.terminate().await;
+        // Terminate active Antigravity process and spawn fresh session with --conversation
+        {
+            let mut brain_guard = tokio::select! {
+                biased;
+                _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => return,
+                guard = ctx.brain.lock() => guard,
+            };
+            if !ctx.turn_coord.is_current(ctx.turn_id) {
+                return;
+            }
+            if let Some(ref mut client) = *brain_guard {
+                let _ = client.terminate().await;
+            }
+            let sid = new_session_id.as_deref().filter(|id| !id.trim().is_empty());
+            *brain_guard = spawn_antigravity_client(sid).ok();
         }
-        let agy_bin = std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
-        let agy_model = std::env::var("VIERNES_AGY_MODEL")
-            .unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
-        let new_args = vec![
-            "--model".to_string(),
-            agy_model,
-            "--effort".to_string(),
-            "low".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-            "--disable-slash-commands".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-        ];
-        *brain_guard = AntigravityClient::spawn(&agy_bin, &new_args).ok();
 
         let ack =
             "A la orden, Señor. Archivo la sesión actual e inicio una nueva conversación limpia.";
-        {
-            let mut st = ctx.status.lock().await;
-            st.last_user_prompt = prompt;
-            st.last_assistant_text = ack.to_string();
-            st.turn_counter += 1;
-            st.timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let _ = st.write_to_disk();
-        }
-        let _ = ctx
-            .sm
-            .dispatch(SystemEvent::SentenceReady(ack.to_string()))
-            .await;
-        let _ = ctx.sm.dispatch(SystemEvent::SpeakingStarted).await;
-        if let Ok(audio) = ctx.tts.synthesize_resilient(ack).await {
-            ctx.ducker.duck().await;
-            let mut p = ctx.player.lock().await;
-            let _ = p.enqueue_chunk(audio).await;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
-        while ctx.player.lock().await.is_playing() {
-            if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
-                return;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
-        if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
-            let _ = ctx.sm.dispatch(SystemEvent::PlaybackFinished).await;
-            ctx.ducker.restore().await;
-        }
+        speak_turn_message(&ctx, ack, Some(prompt)).await;
         return;
     }
 
-    let _ = ctx.session_mgr.increment_turn_count().await;
+    let _ = active_session_mgr.increment_turn_count().await;
 
-    {
-        let mut st = ctx.status.lock().await;
+    update_and_persist_status(&ctx.status, |st| {
         st.last_user_prompt = prompt.clone();
         st.last_assistant_text.clear();
         st.turn_counter += 1;
-        st.timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let _ = st.write_to_disk();
-    }
+    })
+    .await;
+
     let _ = ctx
         .sm
         .dispatch(SystemEvent::TranscriptReady(prompt.clone()))
         .await;
+
+    let mut spawned_tasks = TaskAbortGuard::new();
 
     // Strict Filler policy: At most 2 fillers per turn (1 immediate acknowledgment + at most 1 tool filler if delayed)
     let mut total_fillers_played = 0;
@@ -798,10 +1255,10 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                 "Enqueuing instant filler directly from RAM (< 1ms): '{}'",
                 filler
             );
-            if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
+            if ctx.turn_coord.is_current(ctx.turn_id) {
                 ctx.ducker.duck().await;
                 let mut p = ctx.player.lock().await;
-                if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
+                if ctx.turn_coord.is_current(ctx.turn_id) {
                     let _ = p.enqueue_filler(audio).await;
                 }
             }
@@ -809,22 +1266,28 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             let tts_filler = ctx.tts.clone();
             let player_filler = ctx.player.clone();
             let ducker_filler = ctx.ducker.clone();
-            let epoch = ctx.turn_epoch.clone();
+            let coord_filler = ctx.turn_coord.clone();
             let turn_id = ctx.turn_id;
-            tokio::spawn(async move {
-                if epoch.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
+            spawned_tasks.push(tokio::spawn(async move {
+                if !coord_filler.is_current(turn_id) {
                     return;
                 }
-                if let Ok(audio) = tts_filler.synthesize_resilient(&filler).await {
-                    if epoch.load(std::sync::atomic::Ordering::SeqCst) == turn_id {
+                let tts_snapshot = tts_filler.read().await.clone();
+                let synth_res = tokio::select! {
+                    biased;
+                    _ = coord_filler.wait_cancelled(turn_id) => return,
+                    res = tts_snapshot.synthesize_resilient(&filler) => res,
+                };
+                if let Ok(audio) = synth_res {
+                    if coord_filler.is_current(turn_id) {
                         ducker_filler.duck().await;
                         let mut p = player_filler.lock().await;
-                        if epoch.load(std::sync::atomic::Ordering::SeqCst) == turn_id {
+                        if coord_filler.is_current(turn_id) {
                             let _ = p.enqueue_filler(audio).await;
                         }
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -838,11 +1301,22 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
     let sm_worker = ctx.sm.clone();
     let status_worker = ctx.status.clone();
     let resp_started_worker = response_started.clone();
-    let epoch_worker = ctx.turn_epoch.clone();
+    let coord_worker = ctx.turn_coord.clone();
     let turn_id = ctx.turn_id;
-    let synthesis_worker = tokio::spawn(async move {
-        while let Some(sentence) = rx.recv().await {
-            if epoch_worker.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
+    let mut synthesis_worker = Some(tokio::spawn(async move {
+        loop {
+            let sentence_opt = tokio::select! {
+                biased;
+                _ = coord_worker.wait_cancelled(turn_id) => {
+                    debug!("Barge-in: aborting sentence synthesis worker");
+                    break;
+                }
+                msg = rx.recv() => msg,
+            };
+            let Some(sentence) = sentence_opt else {
+                break;
+            };
+            if !coord_worker.is_current(turn_id) {
                 debug!("Barge-in: aborting sentence synthesis worker");
                 break;
             }
@@ -850,36 +1324,41 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
             if trimmed.is_empty() {
                 continue;
             }
-            resp_started_worker.store(true, std::sync::atomic::Ordering::SeqCst);
             info!("Synthesizing sentence: '{}'", trimmed);
-            {
-                let mut st = status_worker.lock().await;
-                if st.last_assistant_text.is_empty() {
-                    st.last_assistant_text = trimmed.to_string();
-                } else {
-                    st.last_assistant_text.push(' ');
-                    st.last_assistant_text.push_str(trimmed);
+            let tts_snapshot = tts_worker.read().await.clone();
+            let synth_res = tokio::select! {
+                biased;
+                _ = coord_worker.wait_cancelled(turn_id) => {
+                    debug!("Barge-in: cancelling in-flight TTS synthesis");
+                    break;
                 }
-                st.timestamp_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let _ = st.write_to_disk();
-            }
-            let _ = sm_worker
-                .dispatch(SystemEvent::SentenceReady(trimmed.to_string()))
-                .await;
-            let _ = sm_worker.dispatch(SystemEvent::SpeakingStarted).await;
+                res = tts_snapshot.synthesize_resilient(trimmed) => res,
+            };
 
-            match tts_worker.synthesize_resilient(trimmed).await {
+            match synth_res {
                 Ok(audio_bytes) => {
-                    if epoch_worker.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
+                    if !coord_worker.is_current(turn_id) {
                         debug!("Barge-in: discarding synthesized audio for cancelled turn");
                         break;
                     }
+                    resp_started_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    update_and_persist_status(&status_worker, |st| {
+                        if st.last_assistant_text.is_empty() {
+                            st.last_assistant_text = trimmed.to_string();
+                        } else {
+                            st.last_assistant_text.push(' ');
+                            st.last_assistant_text.push_str(trimmed);
+                        }
+                    })
+                    .await;
+                    let _ = sm_worker
+                        .dispatch(SystemEvent::SentenceReady(trimmed.to_string()))
+                        .await;
+                    let _ = sm_worker.dispatch(SystemEvent::SpeakingStarted).await;
+
                     ducker_worker.duck().await;
                     let mut p = player_worker.lock().await;
-                    if epoch_worker.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
+                    if !coord_worker.is_current(turn_id) {
                         break;
                     }
                     let _ = p.enqueue_chunk(audio_bytes).await;
@@ -889,203 +1368,290 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
                 }
             }
         }
-    });
+    }));
 
     // 3. Stream from resident Antigravity Brain
     let risk_classifier = RiskClassifier::default();
-    let mut brain_guard = ctx.brain.lock().await;
+    let mut brain_guard = tokio::select! {
+        biased;
+        _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+            if let Some(handle) = synthesis_worker.take() {
+                handle.abort();
+            }
+            spawned_tasks.abort_all();
+            ctx.ducker.restore().await;
+            return;
+        }
+        guard = ctx.brain.lock() => guard,
+    };
+
     let mut response_received = false;
+    let mut cancelled = !ctx.turn_coord.is_current(ctx.turn_id);
+    let mut aborted_by_confirmation = false;
 
-    if let Some(ref mut client) = *brain_guard {
-        // Drain any residual stale lines from previous turns to prevent pipeline lag/desync
-        client.drain_residual_lines().await;
+    if !cancelled {
+        if let Some(ref mut client) = *brain_guard {
+            // Drain any residual stale lines from previous turns to prevent pipeline lag/desync
+            client.drain_residual_lines().await;
 
-        if let Err(e) = client.send_prompt(&prompt).await {
-            warn!("Failed to send prompt to resident Antigravity client: {e}");
-        } else {
-            let mut stream_failed = false;
-            loop {
-                if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
-                    debug!("Barge-in: aborting token stream from brain for obsolete turn");
-                    break;
-                }
-                match client.next_event().await {
-                    Ok(Some(BrainEvent::TextChunk { content })) => {
-                        response_received = true;
-                        response_started.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if let Some(real_id) = client.conversation_id() {
-                            let _ = ctx.session_mgr.update_conversation_id(real_id).await;
-                        }
-                        let _ = tokenizer.feed_token(&content).await;
+            if !ctx.turn_coord.is_current(ctx.turn_id) {
+                cancelled = true;
+            } else if let Err(e) = client.send_prompt(&prompt).await {
+                warn!("Failed to send prompt to resident Antigravity client: {e}");
+            } else {
+                let mut stream_failed = false;
+                loop {
+                    if !ctx.turn_coord.is_current(ctx.turn_id) {
+                        debug!("Barge-in: aborting token stream from brain for obsolete turn");
+                        cancelled = true;
+                        break;
                     }
-                    Ok(Some(BrainEvent::ToolCall { name, args })) => {
-                        info!("Brain active tool call: '{}'", name);
-                        if let Some(real_id) = client.conversation_id() {
-                            let _ = ctx.session_mgr.update_conversation_id(real_id).await;
+                    let ev_res = tokio::select! {
+                        biased;
+                        _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+                            debug!("Barge-in: turn cancelled while awaiting Antigravity brain event");
+                            cancelled = true;
+                            break;
                         }
+                        res = client.next_event() => res,
+                    };
+                    match ev_res {
+                        Ok(Some(BrainEvent::TextChunk { content })) => {
+                            response_received = true;
+                            response_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(real_id) = client.conversation_id() {
+                                let _ = active_session_mgr.update_conversation_id(real_id).await;
+                            }
+                            let _ = tokenizer.feed_token(&content).await;
+                        }
+                        Ok(Some(BrainEvent::ToolCall { name, args })) => {
+                            info!("Brain active tool call: '{}'", name);
+                            if let Some(real_id) = client.conversation_id() {
+                                let _ = active_session_mgr.update_conversation_id(real_id).await;
+                            }
 
-                        // Extract command payload from tool args or name for risk evaluation
-                        let command_payload =
-                            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                                cmd.to_string()
-                            } else if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
-                                cmd.to_string()
-                            } else if let Some(s) = args.as_str() {
-                                s.to_string()
-                            } else if !args.is_null() {
-                                args.to_string()
-                            } else {
-                                name.clone()
-                            };
+                            // Extract command payload from tool args or name for risk evaluation
+                            let command_payload =
+                                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                                    cmd.to_string()
+                                } else if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
+                                    cmd.to_string()
+                                } else if let Some(s) = args.as_str() {
+                                    s.to_string()
+                                } else if !args.is_null() {
+                                    args.to_string()
+                                } else {
+                                    name.clone()
+                                };
 
-                        if risk_classifier.is_destructive(&command_payload)
-                            || risk_classifier.is_destructive(&name)
-                        {
-                            warn!(
-                                tool = %name,
-                                payload = %command_payload,
-                                "Destructive tool action detected; requesting user voice confirmation"
-                            );
-                            let _ = ctx
-                                .sm
-                                .dispatch(SystemEvent::AwaitingConfirmationRequested {
-                                    action: format!("{name}: {command_payload}"),
-                                })
-                                .await;
-
-                            let warn_msg = format!(
-                                "Atención Señor: Se ha solicitado una acción de riesgo en {}. ¿Desea que proceda?",
-                                name
-                            );
-                            let tts_warn = ctx.tts.clone();
-                            let player_warn = ctx.player.clone();
-                            let ducker_warn = ctx.ducker.clone();
-                            let epoch_warn = ctx.turn_epoch.clone();
-                            let turn_id = ctx.turn_id;
-                            tokio::spawn(async move {
-                                if epoch_warn.load(std::sync::atomic::Ordering::SeqCst) != turn_id {
-                                    return;
-                                }
-                                if let Ok(audio) = tts_warn.synthesize_resilient(&warn_msg).await {
-                                    if epoch_warn.load(std::sync::atomic::Ordering::SeqCst)
-                                        != turn_id
-                                    {
-                                        return;
-                                    }
-                                    ducker_warn.duck().await;
-                                    let mut p = player_warn.lock().await;
-                                    if epoch_warn.load(std::sync::atomic::Ordering::SeqCst)
-                                        != turn_id
-                                    {
-                                        return;
-                                    }
-                                    let _ = p.enqueue_chunk(audio).await;
-                                }
-                            });
-                        } else if total_fillers_played < 2
-                            && !response_started.load(std::sync::atomic::Ordering::SeqCst)
-                            && last_filler_time.elapsed() >= std::time::Duration::from_millis(3500)
-                        {
-                            if let Some(tool_filler) = ctx.fillers.select_tool_filler(&name).await {
-                                info!(
-                                    "Dispatching tool conversational filler ({}/2): '{}'",
-                                    total_fillers_played + 1,
-                                    tool_filler
+                            if risk_classifier.is_destructive(&command_payload)
+                                || risk_classifier.is_destructive(&name)
+                            {
+                                warn!(
+                                    tool = %name,
+                                    payload = %command_payload,
+                                    "Destructive tool action detected; requesting user voice confirmation"
                                 );
-                                total_fillers_played += 1;
-                                last_filler_time = std::time::Instant::now();
-                                let tts_tool = ctx.tts.clone();
-                                let player_tool = ctx.player.clone();
-                                let ducker_tool = ctx.ducker.clone();
-                                let fillers_ref = ctx.fillers.clone();
-                                let resp_started_tool = response_started.clone();
-                                let epoch_tool = ctx.turn_epoch.clone();
-                                let turn_id = ctx.turn_id;
-                                tokio::spawn(async move {
-                                    if epoch_tool.load(std::sync::atomic::Ordering::SeqCst)
-                                        != turn_id
-                                    {
-                                        return;
-                                    }
-                                    let audio_opt = if let Some(cached) =
-                                        fillers_ref.get_cached_audio(&tool_filler).await
-                                    {
-                                        debug!("Dispatching pre-warmed tool filler audio directly from RAM");
-                                        Some(cached)
-                                    } else {
-                                        tts_tool.synthesize_resilient(&tool_filler).await.ok()
-                                    };
+                                let _ = ctx
+                                    .sm
+                                    .dispatch(SystemEvent::AwaitingConfirmationRequested {
+                                        action: format!("{name}: {command_payload}"),
+                                    })
+                                    .await;
 
-                                    if let Some(audio) = audio_opt {
-                                        if resp_started_tool
-                                            .load(std::sync::atomic::Ordering::SeqCst)
-                                            || epoch_tool.load(std::sync::atomic::Ordering::SeqCst)
-                                                != turn_id
-                                        {
-                                            tracing::debug!("Discarding tool filler because assistant response already arrived or turn cancelled");
-                                            return;
-                                        }
-                                        ducker_tool.duck().await;
-                                        let mut p = player_tool.lock().await;
-                                        if resp_started_tool
-                                            .load(std::sync::atomic::Ordering::SeqCst)
-                                            || epoch_tool.load(std::sync::atomic::Ordering::SeqCst)
-                                                != turn_id
-                                        {
-                                            tracing::debug!("Discarding tool filler because assistant response already enqueued or turn cancelled");
-                                            return;
-                                        }
-                                        let _ = p.enqueue_filler(audio).await;
+                                let (confirm_tx, confirm_rx) =
+                                    tokio::sync::oneshot::channel::<bool>();
+                                {
+                                    let mut guard = ctx.pending_confirmation.lock().await;
+                                    *guard = Some(confirm_tx);
+                                }
+                                let (str_tx, str_rx) = tokio::sync::oneshot::channel::<String>();
+                                let forward_handle = tokio::spawn(async move {
+                                    if let Ok(confirmed) = confirm_rx.await {
+                                        let decision_text =
+                                            if confirmed { "confirmado" } else { "cancelar" };
+                                        let _ = str_tx.send(decision_text.to_string());
                                     }
                                 });
+
+                                let warn_msg = format!(
+                                    "Atención Señor: Se ha solicitado una acción de riesgo en {}. ¿Desea que proceda?",
+                                    name
+                                );
+                                let tts_snapshot = ctx.tts.read().await.clone();
+                                let warn_synth = tokio::select! {
+                                    biased;
+                                    _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+                                        forward_handle.abort();
+                                        let _ = ctx.pending_confirmation.lock().await.take();
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    res = tts_snapshot.synthesize_resilient(&warn_msg) => res,
+                                };
+                                if !ctx.turn_coord.is_current(ctx.turn_id) {
+                                    forward_handle.abort();
+                                    let _ = ctx.pending_confirmation.lock().await.take();
+                                    cancelled = true;
+                                    break;
+                                }
+                                if let Ok(audio) = warn_synth {
+                                    ctx.ducker.duck().await;
+                                    let mut p = ctx.player.lock().await;
+                                    if ctx.turn_coord.is_current(ctx.turn_id) {
+                                        let _ = p.enqueue_chunk(audio).await;
+                                    }
+                                }
+
+                                let confirm_mgr = ConfirmationManager::new();
+                                let confirm_res = tokio::select! {
+                                    biased;
+                                    _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+                                        forward_handle.abort();
+                                        let _ = ctx.pending_confirmation.lock().await.take();
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    res = confirm_mgr.await_confirmation(str_rx) => res,
+                                };
+                                forward_handle.abort();
+                                let _ = ctx.pending_confirmation.lock().await.take();
+
+                                match confirm_res {
+                                    Ok(true) => {
+                                        if ctx.sm.state().await == SystemState::AwaitingConfirmation
+                                        {
+                                            let _ = ctx
+                                                .sm
+                                                .dispatch(SystemEvent::ConfirmationReceived {
+                                                    confirmed: true,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    Ok(false) | Err(_) => {
+                                        warn!(
+                                            tool = %name,
+                                            "Destructive action rejected or timed out; aborting brain stream"
+                                        );
+                                        aborted_by_confirmation = true;
+                                        break;
+                                    }
+                                }
+                            } else if total_fillers_played < 2
+                                && !response_started.load(std::sync::atomic::Ordering::SeqCst)
+                                && last_filler_time.elapsed()
+                                    >= std::time::Duration::from_millis(3500)
+                            {
+                                if let Some(tool_filler) =
+                                    ctx.fillers.select_tool_filler(&name).await
+                                {
+                                    info!(
+                                        "Dispatching tool conversational filler ({}/2): '{}'",
+                                        total_fillers_played + 1,
+                                        tool_filler
+                                    );
+                                    total_fillers_played += 1;
+                                    last_filler_time = std::time::Instant::now();
+                                    let tts_tool = ctx.tts.clone();
+                                    let player_tool = ctx.player.clone();
+                                    let ducker_tool = ctx.ducker.clone();
+                                    let fillers_ref = ctx.fillers.clone();
+                                    let resp_started_tool = response_started.clone();
+                                    let coord_tool = ctx.turn_coord.clone();
+                                    let turn_id = ctx.turn_id;
+                                    spawned_tasks.push(tokio::spawn(async move {
+                                        if !coord_tool.is_current(turn_id) {
+                                            return;
+                                        }
+                                        let audio_opt = if let Some(cached) =
+                                            fillers_ref.get_cached_audio(&tool_filler).await
+                                        {
+                                            debug!("Dispatching pre-warmed tool filler audio directly from RAM");
+                                            Some(cached)
+                                        } else {
+                                            let tts_snapshot = tts_tool.read().await.clone();
+                                            tokio::select! {
+                                                biased;
+                                                _ = coord_tool.wait_cancelled(turn_id) => return,
+                                                res = tts_snapshot.synthesize_resilient(&tool_filler) => res.ok(),
+                                            }
+                                        };
+
+                                        if let Some(audio) = audio_opt {
+                                            if resp_started_tool
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                                || !coord_tool.is_current(turn_id)
+                                            {
+                                                tracing::debug!("Discarding tool filler because assistant response already arrived or turn cancelled");
+                                                return;
+                                            }
+                                            ducker_tool.duck().await;
+                                            let mut p = player_tool.lock().await;
+                                            if resp_started_tool
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                                || !coord_tool.is_current(turn_id)
+                                            {
+                                                tracing::debug!("Discarding tool filler because assistant response already enqueued or turn cancelled");
+                                                return;
+                                            }
+                                            let _ = p.enqueue_filler(audio).await;
+                                        }
+                                    }));
+                                }
                             }
                         }
-                    }
-                    Ok(Some(BrainEvent::Done)) | Ok(None) => {
-                        if let Some(real_id) = client.conversation_id() {
-                            let _ = ctx.session_mgr.update_conversation_id(real_id).await;
+                        Ok(Some(BrainEvent::Done)) | Ok(None) => {
+                            if let Some(real_id) = client.conversation_id() {
+                                let _ = active_session_mgr.update_conversation_id(real_id).await;
+                            }
+                            break;
                         }
-                        break;
+                        Err(err) => {
+                            warn!("Antigravity stream error/timeout: {err}; restarting resident process to prevent pipeline desync");
+                            stream_failed = true;
+                            break;
+                        }
+                        _ => {}
                     }
-                    Err(err) => {
-                        warn!("Antigravity stream error/timeout: {err}; restarting resident process to prevent pipeline desync");
-                        stream_failed = true;
-                        break;
-                    }
-                    _ => {}
                 }
-            }
 
-            if stream_failed {
-                let _ = client.terminate().await;
-                let agy_bin =
-                    std::env::var("VIERNES_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
-                let agy_model = std::env::var("VIERNES_AGY_MODEL")
-                    .unwrap_or_else(|_| "gemini-3.8-flash-low".to_string());
-                let current_id = ctx.session_mgr.current_session_id().await;
-                let mut agy_args = vec![
-                    "--model".to_string(),
-                    agy_model,
-                    "--effort".to_string(),
-                    "low".to_string(),
-                    "--dangerously-skip-permissions".to_string(),
-                    "--disable-slash-commands".to_string(),
-                    "--input-format".to_string(),
-                    "stream-json".to_string(),
-                    "--output-format".to_string(),
-                    "stream-json".to_string(),
-                ];
-                if !current_id.is_empty() {
-                    agy_args.push("--conversation".to_string());
-                    agy_args.push(current_id);
+                if stream_failed || cancelled || aborted_by_confirmation {
+                    let _ = client.terminate().await;
+                    let current_id = active_session_mgr.current_session_id().await;
+                    let sid = (!current_id.is_empty()).then_some(current_id.as_str());
+                    *brain_guard = spawn_antigravity_client(sid).ok();
                 }
-                *brain_guard = AntigravityClient::spawn(&agy_bin, &agy_args).ok();
             }
         }
     }
+    drop(brain_guard);
 
-    if !response_received && ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id
-    {
+    if cancelled || !ctx.turn_coord.is_current(ctx.turn_id) {
+        if let Some(handle) = synthesis_worker.take() {
+            handle.abort();
+        }
+        spawned_tasks.abort_all();
+        ctx.ducker.restore().await;
+        return;
+    }
+
+    if aborted_by_confirmation {
+        if let Some(handle) = synthesis_worker.take() {
+            handle.abort();
+        }
+        spawned_tasks.abort_all();
+        if ctx.sm.state().await == SystemState::AwaitingConfirmation {
+            let _ = ctx
+                .sm
+                .dispatch(SystemEvent::ConfirmationReceived { confirmed: false })
+                .await;
+        }
+        speak_turn_message(&ctx, "Acción cancelada, Señor.", None).await;
+        return;
+    }
+
+    if !response_received && ctx.turn_coord.is_current(ctx.turn_id) {
         warn!("No tokens received from Antigravity; emitting direct fallback.");
         let fallback =
             "Mil disculpas, Señor. El servicio en la nube demoró en responder. Por favor intente nuevamente."
@@ -1095,41 +1661,55 @@ async fn process_speech_turn(pcm: Vec<f32>, ctx: SpeechTurnContext) {
 
     let _ = tokenizer.flush().await;
     drop(tokenizer);
-    let _ = synthesis_worker.await;
+    if let Some(mut handle) = synthesis_worker.take() {
+        tokio::select! {
+            _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+                handle.abort();
+                spawned_tasks.abort_all();
+                ctx.ducker.restore().await;
+                return;
+            }
+            _ = &mut handle => {}
+        }
+    }
 
     // Proactive Context Warning: If turn count reaches threshold, suggest rotating cleanly
-    if ctx.session_mgr.should_suggest_rotation().await
-        && ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id
+    if active_session_mgr.should_suggest_rotation().await && ctx.turn_coord.is_current(ctx.turn_id)
     {
         let suggestion = "Por cierto, Señor, esta conversación acumula bastante contexto. Si desea que iniciemos una nueva sesión limpia, solo pídamelo cuando guste.";
         info!("Proactively suggesting session rotation due to high turn count");
-        let _ = ctx
-            .sm
-            .dispatch(SystemEvent::SentenceReady(suggestion.to_string()))
-            .await;
-        if let Ok(audio) = ctx.tts.synthesize_resilient(suggestion).await {
-            ctx.ducker.duck().await;
-            let mut p = ctx.player.lock().await;
-            let _ = p.enqueue_chunk(audio).await;
+        let tts_snapshot = ctx.tts.read().await.clone();
+        let suggest_res = tokio::select! {
+            biased;
+            _ = ctx.turn_coord.wait_cancelled(ctx.turn_id) => {
+                spawned_tasks.abort_all();
+                ctx.ducker.restore().await;
+                return;
+            }
+            res = tts_snapshot.synthesize_resilient(suggestion) => res,
+        };
+        if let Ok(audio) = suggest_res {
+            if ctx.turn_coord.is_current(ctx.turn_id) {
+                let _ = ctx
+                    .sm
+                    .dispatch(SystemEvent::SentenceReady(suggestion.to_string()))
+                    .await;
+                let _ = ctx.sm.dispatch(SystemEvent::SpeakingStarted).await;
+                ctx.ducker.duck().await;
+                let mut p = ctx.player.lock().await;
+                if ctx.turn_coord.is_current(ctx.turn_id) {
+                    let _ = p.enqueue_chunk(audio).await;
+                }
+            }
         }
     }
 
-    // Small guard sleep to ensure last synthesized chunk has been registered in player thread
-    tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
-    // Drain until player finishes speaking so assistant_state remains Speaking while audio is audible
-    while ctx.player.lock().await.is_playing() {
-        if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) != ctx.turn_id {
-            debug!("Barge-in detected during audio drain: exiting turn immediately");
-            ctx.ducker.restore().await;
-            return;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-
-    if ctx.turn_epoch.load(std::sync::atomic::Ordering::SeqCst) == ctx.turn_id {
+    if wait_player_drain(&ctx.player, &ctx.turn_coord, ctx.turn_id).await {
         let _ = ctx.sm.dispatch(SystemEvent::PlaybackFinished).await;
-        ctx.ducker.restore().await;
+    } else {
+        debug!("Barge-in detected during audio drain: exiting turn immediately");
     }
+    ctx.ducker.restore().await;
 }
 
 /// Executes representative workloads across VAD, DSP resampling, sentence tokenization, and state machine transitions.
@@ -1206,16 +1786,34 @@ async fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Sends a Push-to-Talk IPC trigger command directly to the active Viernes daemon socket.
-async fn send_ptt_command(command: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Resolves the Push-to-Talk IPC socket path, honoring `VIERNES_PTT_SOCKET` or `default_ptt_socket_path()`.
+fn resolve_ptt_socket_path() -> std::path::PathBuf {
+    std::env::var("VIERNES_PTT_SOCKET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(viernes_core::default_ptt_socket_path)
+}
+
+/// Sends a Push-to-Talk IPC command to the specified Unix domain socket path.
+async fn send_ipc_ptt(socket_path: &std::path::Path, command: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
-    let socket_path =
-        std::env::var("VIERNES_PTT_SOCKET").unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
+    let mut stream = UnixStream::connect(socket_path).await?;
+    stream
+        .write_all(format!("{}\n", command.trim()).as_bytes())
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
 
-    let path = std::path::Path::new(&socket_path);
-    if !path.exists() {
+/// Sends a Push-to-Talk IPC trigger command directly to the active Viernes daemon socket.
+async fn send_ptt_command(command: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = resolve_ptt_socket_path();
+
+    if !socket_path.exists() {
         eprintln!(
             "Error: Viernes daemon is not running (socket {:?} not found).",
             socket_path
@@ -1224,11 +1822,7 @@ async fn send_ptt_command(command: &str) -> Result<(), Box<dyn std::error::Error
         std::process::exit(1);
     }
 
-    let mut stream = UnixStream::connect(path).await?;
-    stream
-        .write_all(format!("{}\n", command.trim()).as_bytes())
-        .await?;
-    stream.flush().await?;
+    send_ipc_ptt(&socket_path, command).await?;
     Ok(())
 }
 
@@ -1246,9 +1840,173 @@ mod tests {
         assert!(parsed_ptt.is_ok());
         assert_eq!(parsed_ptt.unwrap().ptt.as_deref(), Some("press"));
 
+        let parsed_cancel = CliArgs::try_parse_from(["viernes", "--ptt", "cancel"]);
+        assert!(parsed_cancel.is_ok());
+        assert_eq!(parsed_cancel.unwrap().ptt.as_deref(), Some("cancel"));
+
+        let parsed_reload = CliArgs::try_parse_from(["viernes", "--ptt", "reload"]);
+        assert!(parsed_reload.is_ok());
+        assert_eq!(parsed_reload.unwrap().ptt.as_deref(), Some("reload"));
+
+        let parsed_new_conv = CliArgs::try_parse_from(["viernes", "--new-conversation"]);
+        assert!(parsed_new_conv.is_ok());
+        assert!(parsed_new_conv.unwrap().new_conversation);
+
         let parsed_tui = CliArgs::try_parse_from(["viernes", "--tui"]);
         assert!(parsed_tui.is_ok());
         assert!(parsed_tui.unwrap().tui);
+    }
+
+    #[test]
+    fn test_build_agy_args_conversation_flag() {
+        let with_session = build_agy_args(Some("session-abc-123"));
+        assert!(with_session
+            .windows(2)
+            .any(|w| w[0] == "--conversation" && w[1] == "session-abc-123"));
+
+        let without_session = build_agy_args(None);
+        assert!(!without_session.iter().any(|a| a == "--conversation"));
+
+        let empty_session = build_agy_args(Some("   "));
+        assert!(!empty_session.iter().any(|a| a == "--conversation"));
+    }
+
+    #[tokio::test]
+    async fn test_turn_coordinator_epoch_cancellation() {
+        let coord = TurnCoordinator::new();
+        let turn_1 = coord.bump();
+        assert!(coord.is_current(turn_1));
+
+        // Bumping the epoch cancels turn_1 immediately for both waiting and future callers
+        let waiter_coord = coord.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_coord.wait_cancelled(turn_1).await;
+        });
+
+        tokio::task::yield_now().await;
+        let turn_2 = coord.bump();
+        assert!(!coord.is_current(turn_1));
+        assert!(coord.is_current(turn_2));
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("wait_cancelled should wake when epoch bumps")
+            .unwrap();
+
+        // Already-cancelled epoch resolves immediately without blocking
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            coord.wait_cancelled(turn_1),
+        )
+        .await
+        .expect("already-obsolete turn should resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn test_confirmation_response_routing() {
+        use viernes_core::traits::FakeSpeechToText;
+
+        // 1. Affirmative confirmation: routes `true` and transitions AwaitingConfirmation -> Thinking
+        let sm = StateMachine::new(16);
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "rm -rf ./tmp".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(sm.state().await, SystemState::AwaitingConfirmation);
+
+        let pending = tokio::sync::Mutex::new(None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *pending.lock().await = Some(tx);
+
+        let stt_yes = FakeSpeechToText {
+            default_transcript: "sí, procede".into(),
+        };
+        let decision = route_confirmation_response(&[0.1; 3200], &stt_yes, &pending, &sm).await;
+        assert!(decision);
+        assert!(rx.await.unwrap());
+        assert_eq!(sm.state().await, SystemState::Thinking);
+
+        // 2. Negative confirmation: routes `false` and transitions AwaitingConfirmation -> Idle
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "git reset --hard".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(sm.state().await, SystemState::AwaitingConfirmation);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *pending.lock().await = Some(tx);
+
+        let stt_no = FakeSpeechToText {
+            default_transcript: "no, cancela".into(),
+        };
+        let decision = route_confirmation_response(&[0.1; 3200], &stt_no, &pending, &sm).await;
+        assert!(!decision);
+        assert!(!rx.await.unwrap());
+        assert_eq!(sm.state().await, SystemState::Idle);
+
+        // 3. Ambiguous confirmation: defaults safely to `false` and transitions -> Idle
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "mkfs.ext4 /dev/sda1".into(),
+        })
+        .await
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *pending.lock().await = Some(tx);
+
+        let stt_ambiguous = FakeSpeechToText {
+            default_transcript: "tal vez más tarde".into(),
+        };
+        let decision =
+            route_confirmation_response(&[0.1; 3200], &stt_ambiguous, &pending, &sm).await;
+        assert!(!decision);
+        assert!(!rx.await.unwrap());
+        assert_eq!(sm.state().await, SystemState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_send_ipc_ptt_roundtrip() {
+        use viernes_audio::ptt::IpcSocketPttListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("ptt.sock");
+        let mut listener = IpcSocketPttListener::new(&socket_path);
+        listener.start().await.unwrap();
+        let rx = listener.event_receiver();
+
+        send_ipc_ptt(&socket_path, "cancel").await.unwrap();
+        send_ipc_ptt(&socket_path, "reload").await.unwrap();
+
+        let ev1 = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(ev) = rx.try_recv() {
+                    return ev;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let ev2 = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(ev) = rx.try_recv() {
+                    return ev;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(ev1, PttEvent::Cancel);
+        assert_eq!(ev2, PttEvent::Reload);
+
+        listener.stop().await.unwrap();
     }
 
     #[tokio::test]

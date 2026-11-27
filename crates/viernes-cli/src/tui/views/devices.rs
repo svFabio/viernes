@@ -77,8 +77,12 @@ pub struct DevicesView {
     pub ducking_volume_percent: u32,
     /// Playback volume percentage for Viernes assistant voice output (10..=200).
     pub viernes_volume_percent: u32,
-    /// Whether ducking settings have unsaved modifications.
+    /// Whether ducking or device settings have unsaved modifications.
     pub has_unsaved_ducking_changes: bool,
+    /// Preferred input device name loaded from config/env (if any).
+    pub configured_input_device: Option<String>,
+    /// Preferred output device name loaded from config/env (if any).
+    pub configured_output_device: Option<String>,
     /// Target path to environment variables file (.env).
     pub env_path: PathBuf,
 }
@@ -103,11 +107,19 @@ impl DevicesView {
             .map(|h| PathBuf::from(h).join(".config/viernes/.env"))
             .unwrap_or_else(|_| PathBuf::from(".env"));
 
-        let (ducking_enabled, ducking_volume_percent, viernes_volume_percent) = match config {
+        let (
+            ducking_enabled,
+            ducking_volume_percent,
+            viernes_volume_percent,
+            configured_input_device,
+            configured_output_device,
+        ) = match config {
             Some(c) => (
                 c.audio_ducking_enabled,
                 c.audio_ducking_volume_percent,
                 c.viernes_volume_percent,
+                c.audio_input_device.clone(),
+                c.audio_output_device.clone(),
             ),
             None => {
                 let enabled = std::env::var("AUDIO_DUCKING_ENABLED")
@@ -123,7 +135,15 @@ impl DevicesView {
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(130)
                     .clamp(10, 200);
-                (enabled, pct, v_pct)
+                let in_dev = std::env::var("AUDIO_INPUT_DEVICE")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let out_dev = std::env::var("AUDIO_OUTPUT_DEVICE")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                (enabled, pct, v_pct, in_dev, out_dev)
             }
         };
 
@@ -142,6 +162,8 @@ impl DevicesView {
             ducking_volume_percent,
             viernes_volume_percent,
             has_unsaved_ducking_changes: false,
+            configured_input_device,
+            configured_output_device,
             env_path,
         };
         view.refresh_with_enumerator(&CpalDeviceEnumerator::new());
@@ -167,6 +189,8 @@ impl DevicesView {
             ducking_volume_percent: 40,
             viernes_volume_percent: 130,
             has_unsaved_ducking_changes: false,
+            configured_input_device: None,
+            configured_output_device: None,
             env_path: PathBuf::from("/tmp/test_viernes_mock.env"),
         };
         view.refresh_with_enumerator(&enumerator);
@@ -176,12 +200,24 @@ impl DevicesView {
     /// Refreshes device collections using the provided enumerator.
     pub fn refresh_with_enumerator(&mut self, enumerator: &dyn DeviceEnumerator) {
         if let Ok(inputs) = enumerator.list_input_devices() {
-            self.selected_input = inputs.iter().position(|d| d.is_default).unwrap_or(0);
+            let configured_idx = self
+                .configured_input_device
+                .as_deref()
+                .and_then(|name| inputs.iter().position(|d| d.name == name));
+            self.selected_input = configured_idx
+                .or_else(|| inputs.iter().position(|d| d.is_default))
+                .unwrap_or(0);
             self.input_devices = inputs;
         }
 
         if let Ok(outputs) = enumerator.list_output_devices() {
-            self.selected_output = outputs.iter().position(|d| d.is_default).unwrap_or(0);
+            let configured_idx = self
+                .configured_output_device
+                .as_deref()
+                .and_then(|name| outputs.iter().position(|d| d.name == name));
+            self.selected_output = configured_idx
+                .or_else(|| outputs.iter().position(|d| d.is_default))
+                .unwrap_or(0);
             self.output_devices = outputs;
         }
 
@@ -245,6 +281,9 @@ impl DevicesView {
                     } else {
                         self.selected_input -= 1;
                     }
+                    if self.input_devices.len() > 1 {
+                        self.has_unsaved_ducking_changes = true;
+                    }
                 }
             }
             DeviceFocus::Speaker => {
@@ -253,6 +292,9 @@ impl DevicesView {
                         self.selected_output = self.output_devices.len() - 1;
                     } else {
                         self.selected_output -= 1;
+                    }
+                    if self.output_devices.len() > 1 {
+                        self.has_unsaved_ducking_changes = true;
                     }
                 }
             }
@@ -282,11 +324,17 @@ impl DevicesView {
             DeviceFocus::Microphone => {
                 if !self.input_devices.is_empty() {
                     self.selected_input = (self.selected_input + 1) % self.input_devices.len();
+                    if self.input_devices.len() > 1 {
+                        self.has_unsaved_ducking_changes = true;
+                    }
                 }
             }
             DeviceFocus::Speaker => {
                 if !self.output_devices.is_empty() {
                     self.selected_output = (self.selected_output + 1) % self.output_devices.len();
+                    if self.output_devices.len() > 1 {
+                        self.has_unsaved_ducking_changes = true;
+                    }
                 }
             }
             DeviceFocus::AudioDucking => {
@@ -350,25 +398,41 @@ impl DevicesView {
         }
     }
 
-    /// Persists audio ducking settings to `.env` file.
+    /// Persists audio ducking, volume, and selected input/output devices to `.env` file.
     pub fn save_ducking_config(&mut self) -> Result<(), String> {
-        save_ducking_to_env(
+        let input_name = self.selected_input_device().map(|d| d.name.clone());
+        let output_name = self.selected_output_device().map(|d| d.name.clone());
+        save_audio_settings_to_env(
             &self.env_path,
             self.ducking_enabled,
             self.ducking_volume_percent,
             self.viernes_volume_percent,
+            input_name.as_deref(),
+            output_name.as_deref(),
         )?;
+        self.configured_input_device = input_name;
+        self.configured_output_device = output_name;
         self.has_unsaved_ducking_changes = false;
-        self.status_message =
-            Some("Atenuación y volumen guardados en ~/.config/viernes/.env (0600)".into());
+        self.status_message = Some(
+            "Dispositivos, atenuación y volumen guardados en ~/.config/viernes/.env (0600)".into(),
+        );
         Ok(())
     }
 
     /// Confirms current selection and closes open dropdowns.
     pub fn confirm_selection(&mut self) {
+        let was_output_open = self.output_dropdown_open;
         self.input_dropdown_open = false;
         self.output_dropdown_open = false;
-        if let Some(dev) = self.input_devices.get(self.selected_input) {
+        if was_output_open || self.focus == DeviceFocus::Speaker {
+            if let Some(dev) = self.output_devices.get(self.selected_output) {
+                self.configured_output_device = Some(dev.name.clone());
+                self.has_unsaved_ducking_changes = true;
+                self.status_message = Some(format!("Altavoz seleccionado: {}", dev.name));
+            }
+        } else if let Some(dev) = self.input_devices.get(self.selected_input) {
+            self.configured_input_device = Some(dev.name.clone());
+            self.has_unsaved_ducking_changes = true;
             self.status_message = Some(format!("Micrófono seleccionado: {}", dev.name));
         }
     }
@@ -537,7 +601,12 @@ impl DevicesView {
             .constraints([Constraint::Length(3), Constraint::Length(2)])
             .split(row3_chunks[0]);
 
-        let pct = (self.mic_level * 100.0) as u16;
+        let clamped_level = if self.mic_level.is_finite() {
+            self.mic_level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let pct = (clamped_level * 100.0).round() as u16;
         let gauge_color = if pct > 80 {
             Color::Red
         } else if pct > 50 {
@@ -800,35 +869,81 @@ pub fn save_ducking_to_env(
     volume_percent: u32,
     viernes_volume: u32,
 ) -> Result<(), String> {
+    save_audio_settings_to_env(path, enabled, volume_percent, viernes_volume, None, None)
+}
+
+/// Atomically updates or appends audio ducking, volume, and optional device selections in `.env`
+/// with restricted `0600` permissions while preserving unrelated keys and comments.
+pub fn save_audio_settings_to_env(
+    path: &std::path::Path,
+    enabled: bool,
+    volume_percent: u32,
+    viernes_volume: u32,
+    input_device: Option<&str>,
+    output_device: Option<&str>,
+) -> Result<(), String> {
     let lines: Vec<String> = if path.exists() {
         std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read env file: {e}"))?
             .lines()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     } else {
         Vec::new()
     };
 
-    let mut new_lines = Vec::with_capacity(lines.len() + 3);
+    let format_quoted = |val: &str| val.replace('"', "\\\"");
+
+    let mut new_lines = Vec::with_capacity(lines.len() + 5);
     let mut enabled_found = false;
     let mut percent_found = false;
     let mut viernes_vol_found = false;
+    let mut input_dev_found = false;
+    let mut output_dev_found = false;
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.starts_with("AUDIO_DUCKING_ENABLED=") {
-            new_lines.push(format!("AUDIO_DUCKING_ENABLED={enabled}"));
-            enabled_found = true;
-        } else if trimmed.starts_with("AUDIO_DUCKING_VOLUME_PERCENT=") {
-            new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
-            percent_found = true;
-        } else if trimmed.starts_with("VIERNES_VOLUME_PERCENT=") {
-            new_lines.push(format!("VIERNES_VOLUME_PERCENT={viernes_volume}"));
-            viernes_vol_found = true;
-        } else {
-            new_lines.push(line);
+        if !trimmed.starts_with('#') {
+            if let Some((k, _)) = trimmed.split_once('=') {
+                match k.trim() {
+                    "AUDIO_DUCKING_ENABLED" => {
+                        new_lines.push(format!("AUDIO_DUCKING_ENABLED={enabled}"));
+                        enabled_found = true;
+                        continue;
+                    }
+                    "AUDIO_DUCKING_VOLUME_PERCENT" => {
+                        new_lines.push(format!("AUDIO_DUCKING_VOLUME_PERCENT={volume_percent}"));
+                        percent_found = true;
+                        continue;
+                    }
+                    "VIERNES_VOLUME_PERCENT" => {
+                        new_lines.push(format!("VIERNES_VOLUME_PERCENT={viernes_volume}"));
+                        viernes_vol_found = true;
+                        continue;
+                    }
+                    "AUDIO_INPUT_DEVICE" => {
+                        if let Some(in_dev) = input_device {
+                            new_lines
+                                .push(format!("AUDIO_INPUT_DEVICE=\"{}\"", format_quoted(in_dev)));
+                            input_dev_found = true;
+                            continue;
+                        }
+                    }
+                    "AUDIO_OUTPUT_DEVICE" => {
+                        if let Some(out_dev) = output_device {
+                            new_lines.push(format!(
+                                "AUDIO_OUTPUT_DEVICE=\"{}\"",
+                                format_quoted(out_dev)
+                            ));
+                            output_dev_found = true;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
+        new_lines.push(line);
     }
 
     if !enabled_found {
@@ -840,43 +955,67 @@ pub fn save_ducking_to_env(
     if !viernes_vol_found {
         new_lines.push(format!("VIERNES_VOLUME_PERCENT={viernes_volume}"));
     }
-
-    let content = new_lines.join("\n") + "\n";
-    let temp_path = path.with_extension("tmp");
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(in_dev) = input_device {
+        if !input_dev_found {
+            new_lines.push(format!("AUDIO_INPUT_DEVICE=\"{}\"", format_quoted(in_dev)));
+        }
+    }
+    if let Some(out_dev) = output_device {
+        if !output_dev_found {
+            new_lines.push(format!(
+                "AUDIO_OUTPUT_DEVICE=\"{}\"",
+                format_quoted(out_dev)
+            ));
+        }
     }
 
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
+    let content = new_lines.join("\n") + "\n";
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+    crate::tui::ensure_parent_dir(path)?;
 
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("env");
+    let temp_path = path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut open_opts = OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+
+    let mut file = open_opts
+        .open(&temp_path)
+        .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+
+    let write_result = (|| -> Result<(), String> {
         #[cfg(unix)]
         {
-            if let Ok(metadata) = file.metadata() {
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(0o600);
-                let _ = file.set_permissions(permissions);
-            }
+            let mut permissions = file
+                .metadata()
+                .map_err(|e| format!("Failed to read metadata: {e}"))?
+                .permissions();
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)
+                .map_err(|e| format!("Failed to set 0600 permissions: {e}"))?;
         }
 
         file.write_all(content.as_bytes())
             .map_err(|e| format!("Failed to write content: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("Failed to sync temporary file: {e}"))?;
-    }
+        drop(file);
 
-    std::fs::rename(&temp_path, path).map_err(|e| format!("Atomic rename failed: {e}"))?;
+        std::fs::rename(&temp_path, path).map_err(|e| format!("Atomic rename failed: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
 
     Ok(())
 }
@@ -1100,5 +1239,70 @@ mod tests {
                 view.render(f, f.area());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_devices_view_persists_input_and_output_devices_with_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "ELEVENLABS_VOICE_ID=\"jessica123\"\n").unwrap();
+
+        let (inputs, outputs) = make_test_devices();
+        let mut view = DevicesView::new_mock(inputs, outputs);
+        view.env_path = env_path.clone();
+
+        // Select second input device and second output device
+        view.focus = DeviceFocus::Microphone;
+        view.select_next();
+        view.confirm_selection();
+        assert!(view.has_unsaved_ducking_changes);
+
+        view.focus = DeviceFocus::Speaker;
+        view.select_next();
+        view.confirm_selection();
+
+        view.save_ducking_config().unwrap();
+        assert!(!view.has_unsaved_ducking_changes);
+
+        let saved = std::fs::read_to_string(&env_path).unwrap();
+        assert!(saved.contains("ELEVENLABS_VOICE_ID=\"jessica123\""));
+        assert!(saved.contains("AUDIO_INPUT_DEVICE=\"USB Mic Studio\""));
+        assert!(saved.contains("AUDIO_OUTPUT_DEVICE=\"Headphones Analog\""));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_devices_view_render_clamps_mic_level_over_one() {
+        let (inputs, outputs) = make_test_devices();
+        let mut view = DevicesView::new_mock(inputs, outputs);
+        // Bypass set_mic_level to verify render() defensively clamps out-of-range values
+        view.mic_level = 1.75;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                view.render(f, f.area());
+            })
+            .unwrap();
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("100%"));
+
+        view.mic_level = f32::NAN;
+        terminal
+            .draw(|f| {
+                view.render(f, f.area());
+            })
+            .unwrap();
+        let rendered_nan = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered_nan.contains("0%"));
     }
 }

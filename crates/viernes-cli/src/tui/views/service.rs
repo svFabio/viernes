@@ -12,10 +12,10 @@ use ratatui::Frame;
 
 use super::logs::LogsView;
 
-/// Default socket path used for IPC communication with the daemon.
-pub const DEFAULT_IPC_SOCKET: &str = "/tmp/viernes_ptt.sock";
 /// Systemd user service unit name.
 pub const SYSTEMD_SERVICE_UNIT: &str = "viernes-rust.service";
+/// Primary systemd user service unit name.
+pub const SYSTEMD_PRIMARY_UNIT: &str = "viernes.service";
 
 /// Snapshot of the running Viernes daemon health metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,14 +99,18 @@ pub struct SystemdServiceRunner {
 }
 
 impl SystemdServiceRunner {
-    /// Constructs a runner with default socket path.
+    /// Constructs a runner with default socket path from `viernes_core`.
     #[must_use]
     pub fn new() -> Self {
-        let path =
-            std::env::var("VIERNES_PTT_SOCKET").unwrap_or_else(|_| DEFAULT_IPC_SOCKET.to_string());
         Self {
-            ipc_socket_path: PathBuf::from(path),
+            ipc_socket_path: viernes_core::default_ptt_socket_path(),
         }
+    }
+
+    /// Returns the resolved executable path for invoking `viernes` subcommands.
+    #[must_use]
+    pub fn resolve_viernes_exe() -> PathBuf {
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("viernes"))
     }
 
     /// Scans `/proc` in safe Rust to locate any active `viernes --daemon` processes.
@@ -206,17 +210,22 @@ impl ServiceControlRunner for SystemdServiceRunner {
     }
 
     fn reset_session(&self) -> Result<(), String> {
-        let status = std::process::Command::new("viernes")
+        let exe = Self::resolve_viernes_exe();
+        let status = std::process::Command::new(&exe)
             .arg("--new-conversation")
             .status();
 
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(format!(
-                "viernes --new-conversation returned {:?}",
+                "{} --new-conversation returned {:?}",
+                exe.display(),
                 s.code()
             )),
-            Err(e) => Err(format!("Failed invoking viernes --new-conversation: {e}")),
+            Err(e) => Err(format!(
+                "Failed invoking {} --new-conversation: {e}",
+                exe.display()
+            )),
         }
     }
 
@@ -268,6 +277,167 @@ impl ServiceControlRunner for SystemdServiceRunner {
     }
 }
 
+/// Starts the daemon systemd user service asynchronously without blocking the UI thread.
+pub async fn start_service_async() -> Result<(), String> {
+    let status = tokio::process::Command::new("systemctl")
+        .args(["--user", "start", SYSTEMD_SERVICE_UNIT])
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("systemctl returned code {:?}", s.code())),
+        Err(e) => Err(format!("Failed executing systemctl start: {e}")),
+    }
+}
+
+/// Stops the daemon systemd user service asynchronously, falling back to procfs PID kill.
+pub async fn stop_service_async() -> Result<(), String> {
+    let status = tokio::process::Command::new("systemctl")
+        .args(["--user", "stop", SYSTEMD_SERVICE_UNIT])
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => {
+            let proc_match = tokio::task::spawn_blocking(SystemdServiceRunner::scan_procfs)
+                .await
+                .ok()
+                .flatten();
+            if let Some((pid, _, _)) = proc_match {
+                let _ = tokio::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status()
+                    .await;
+                return Ok(());
+            }
+            Err("Failed to stop service via systemctl and no PID found".into())
+        }
+        Err(e) => Err(format!("Failed executing systemctl stop: {e}")),
+    }
+}
+
+/// Restarts the daemon systemd user service asynchronously.
+pub async fn restart_service_async() -> Result<(), String> {
+    let status = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", SYSTEMD_SERVICE_UNIT])
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("systemctl restart returned {:?}", s.code())),
+        Err(e) => Err(format!("Failed executing systemctl restart: {e}")),
+    }
+}
+
+/// Rotates the active conversation session asynchronously using `current_exe()`.
+pub async fn reset_session_async() -> Result<(), String> {
+    let exe = SystemdServiceRunner::resolve_viernes_exe();
+    let status = tokio::process::Command::new(&exe)
+        .arg("--new-conversation")
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "{} --new-conversation returned {:?}",
+            exe.display(),
+            s.code()
+        )),
+        Err(e) => Err(format!(
+            "Failed invoking {} --new-conversation: {e}",
+            exe.display()
+        )),
+    }
+}
+
+/// Probes daemon health asynchronously without stalling the TUI event loop.
+pub async fn probe_health_async(ipc_socket_path: PathBuf) -> DaemonHealth {
+    let ipc_path_clone = ipc_socket_path.clone();
+    let ipc_future = tokio::task::spawn_blocking(move || ipc_path_clone.exists());
+    let proc_future = tokio::task::spawn_blocking(SystemdServiceRunner::scan_procfs);
+    let systemd_future = tokio::process::Command::new("systemctl")
+        .args(["--user", "is-active", SYSTEMD_SERVICE_UNIT])
+        .output();
+
+    let (ipc_res, proc_res, systemd_res) = tokio::join!(ipc_future, proc_future, systemd_future);
+    let ipc_connected = ipc_res.unwrap_or(false);
+    let is_systemd_active = systemd_res
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+
+    if let Ok(Some((pid, uptime, rss))) = proc_res {
+        return DaemonHealth {
+            is_active: true,
+            pid: Some(pid),
+            uptime_seconds: uptime,
+            memory_rss_bytes: rss,
+            ipc_connected,
+            source: if is_systemd_active {
+                "systemd user unit"
+            } else {
+                "procfs standalone"
+            }
+            .into(),
+        };
+    }
+
+    if is_systemd_active {
+        return DaemonHealth {
+            is_active: true,
+            pid: None,
+            uptime_seconds: 0,
+            memory_rss_bytes: 0,
+            ipc_connected,
+            source: "systemd user unit".into(),
+        };
+    }
+
+    DaemonHealth {
+        is_active: false,
+        pid: None,
+        uptime_seconds: 0,
+        memory_rss_bytes: 0,
+        ipc_connected,
+        source: "Inactivo".into(),
+    }
+}
+
+/// Fetches recent daemon log lines asynchronously via `journalctl`, returning an empty Vec on failure.
+pub async fn fetch_journal_logs_async(lines: usize) -> Vec<String> {
+    let limit = lines.max(1).to_string();
+    let output = tokio::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            SYSTEMD_PRIMARY_UNIT,
+            "-u",
+            SYSTEMD_SERVICE_UNIT,
+            "-n",
+            &limit,
+            "--no-pager",
+        ])
+        .output()
+        .await;
+
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty() && !line.starts_with("-- No entries --"))
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// State and UI rendering for Tab 5: Service Management, Health & Live Logs.
 #[derive(Debug)]
 pub struct ServiceView {
@@ -281,6 +451,10 @@ pub struct ServiceView {
     pub toast_message: Option<(String, bool)>, // (Message, is_error)
     /// Timestamp when toast message was published.
     pub toast_timestamp: Option<Instant>,
+    /// Configured IPC socket path displayed in status panel.
+    pub ipc_socket_path: PathBuf,
+    /// Previous journalctl snapshot used to deduplicate periodic log refreshes.
+    last_journal_snapshot: Vec<String>,
 }
 
 impl Default for ServiceView {
@@ -290,17 +464,19 @@ impl Default for ServiceView {
 }
 
 impl ServiceView {
-    /// Creates a production `ServiceView` querying live host services.
+    /// Creates a production `ServiceView` without blocking on initial health probe.
     #[must_use]
     pub fn new() -> Self {
+        let ipc_socket_path = viernes_core::default_ptt_socket_path();
         let runner = Box::new(SystemdServiceRunner::new());
-        let health = runner.probe_health();
         Self {
             runner,
-            health,
+            health: DaemonHealth::default(),
             logs: LogsView::new(),
             toast_message: None,
             toast_timestamp: None,
+            ipc_socket_path,
+            last_journal_snapshot: Vec::new(),
         }
     }
 
@@ -314,12 +490,67 @@ impl ServiceView {
             logs: LogsView::new(),
             toast_message: None,
             toast_timestamp: None,
+            ipc_socket_path: viernes_core::default_ptt_socket_path(),
+            last_journal_snapshot: Vec::new(),
         }
     }
 
-    /// Refreshes health status.
+    /// Refreshes health status synchronously via `runner`.
     pub fn refresh_health(&mut self) {
         self.health = self.runner.probe_health();
+    }
+
+    /// Updates cached health telemetry from an async probe.
+    pub fn apply_health(&mut self, health: DaemonHealth) {
+        self.health = health;
+    }
+
+    /// Appends only unseen journal log lines relative to the previous snapshot.
+    pub fn apply_journal_logs(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+
+        let start_idx = if self.last_journal_snapshot.is_empty() {
+            0
+        } else {
+            let max_overlap = self.last_journal_snapshot.len().min(lines.len());
+            let mut overlap = 0;
+            for k in (1..=max_overlap).rev() {
+                let prev_tail = &self.last_journal_snapshot[self.last_journal_snapshot.len() - k..];
+                let next_head = &lines[..k];
+                if prev_tail == next_head {
+                    overlap = k;
+                    break;
+                }
+            }
+            overlap
+        };
+
+        for line in &lines[start_idx..] {
+            self.logs.push_line(line.clone());
+        }
+        self.last_journal_snapshot = lines;
+    }
+
+    /// Applies the result of an asynchronous service lifecycle action to toast and logs.
+    pub fn apply_async_action_result(
+        &mut self,
+        success_toast: &str,
+        success_log: &str,
+        error_prefix: &str,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.set_toast(success_toast, false);
+                self.logs.push_line(success_log);
+            }
+            Err(e) => {
+                self.set_toast(format!("{error_prefix}: {e}"), true);
+                self.logs.push_line(format!("[ERROR] {error_prefix}: {e}"));
+            }
+        }
     }
 
     /// Sets a transient toast message expiring after 5 seconds.
@@ -438,9 +669,9 @@ impl ServiceView {
             .unwrap_or_else(|| "N/A".to_string());
 
         let ipc_str = if self.health.ipc_connected {
-            "Conectado (/tmp/viernes_ptt.sock)"
+            format!("Conectado ({})", self.ipc_socket_path.display())
         } else {
-            "Desconectado"
+            "Desconectado".to_string()
         };
         let ipc_color = if self.health.ipc_connected {
             Color::Green
@@ -658,5 +889,35 @@ mod tests {
                 view.render(f, f.area());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_apply_journal_logs_deduplicates_overlapping_snapshots() {
+        let runner = Box::new(MockRunner {
+            should_fail: false,
+            active: true,
+        });
+        let mut view = ServiceView::new_mock(runner);
+
+        view.apply_journal_logs(vec![
+            "12:00:01 [INFO] Boot".into(),
+            "12:00:02 [INFO] Ready".into(),
+        ]);
+        assert_eq!(view.logs.len(), 2);
+
+        // Overlapping snapshot should only append the new trailing line
+        view.apply_journal_logs(vec![
+            "12:00:01 [INFO] Boot".into(),
+            "12:00:02 [INFO] Ready".into(),
+            "12:00:03 [WARN] Latency spike".into(),
+        ]);
+        assert_eq!(view.logs.len(), 3);
+        assert!(view
+            .logs
+            .buffer
+            .back()
+            .unwrap()
+            .raw
+            .contains("Latency spike"));
     }
 }

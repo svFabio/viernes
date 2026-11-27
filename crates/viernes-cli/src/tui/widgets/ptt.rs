@@ -1,7 +1,7 @@
 //! Interactive Push-to-Talk emulator widget and Unix domain socket IPC client.
 
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -12,22 +12,19 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use viernes_core::state::SystemState;
 
-/// Canonical Unix domain socket endpoint utilized by the background daemon.
-pub const DAEMON_PTT_SOCKET: &str = "/tmp/viernes_ptt.sock";
-
-/// Returns the configured PTT IPC socket path.
+/// Returns the configured PTT IPC socket path from `viernes_core`.
 #[must_use]
-pub fn ptt_socket_path() -> String {
-    std::env::var("VIERNES_PTT_SOCKET").unwrap_or_else(|_| DAEMON_PTT_SOCKET.to_string())
+pub fn ptt_socket_path() -> PathBuf {
+    viernes_core::default_ptt_socket_path()
 }
 
-/// Sends a Push-to-Talk trigger command (`press`, `release`, `cancel`) to the background daemon.
+/// Sends a Push-to-Talk trigger command (`press`, `release`, `cancel`, `reload`) to the background daemon.
 pub async fn send_ipc_ptt(command: &str) -> io::Result<()> {
     let socket_path = ptt_socket_path();
-    if !Path::new(&socket_path).exists() {
+    if !socket_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("PTT socket '{socket_path}' does not exist"),
+            format!("PTT socket '{}' does not exist", socket_path.display()),
         ));
     }
 
@@ -89,6 +86,14 @@ impl Widget for PttWidget {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 Color::Cyan,
+            )
+        } else if self.state == SystemState::AwaitingConfirmation {
+            (
+                "[⚠ CONFIRMACIÓN REQUERIDA] Responde por voz o presiona Espacio / Esc",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+                Color::Rgb(255, 191, 0),
             )
         } else {
             (
