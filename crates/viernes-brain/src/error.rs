@@ -18,12 +18,16 @@ pub enum BrainError {
         stderr: String,
     },
 
-    /// No tokens received within configured inactivity window (15s).
+    /// No tokens received within configured inactivity window (120s).
     #[error("antigravity stream timeout after {duration_secs}s")]
     InactivityTimeout {
         /// Inactivity duration before timeout triggered.
         duration_secs: u64,
     },
+
+    /// Protocol framing or serialization error.
+    #[error("protocol error: {0}")]
+    ProtocolError(String),
 
     /// Deserialization error for NDJSON event.
     #[error("ndjson serde error: {0}")]

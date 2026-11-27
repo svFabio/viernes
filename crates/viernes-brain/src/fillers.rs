@@ -4,7 +4,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,24 +105,62 @@ impl FillerCacheManager {
             }
         };
 
-        let fillers = if file_path.exists() {
-            match std::fs::read_to_string(&file_path) {
-                Ok(content) => {
-                    serde_json::from_str::<FillerCollection>(&content).unwrap_or_default()
+        let fillers = match std::fs::read_to_string(&file_path) {
+            Ok(content) => match serde_json::from_str::<FillerCollection>(&content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    warn!(
+                        path = %file_path.display(),
+                        error = %e,
+                        "Failed to parse fillers configuration; using default fillers"
+                    );
+                    FillerCollection::default()
                 }
-                Err(_) => FillerCollection::default(),
-            }
-        } else {
-            let defaults = FillerCollection::default();
-            if let Some(parent) = file_path.parent() {
-                let _ = create_dir_all(parent);
-            }
-            if let Ok(serialized) = serde_json::to_string_pretty(&defaults) {
-                if let Ok(mut f) = File::create(&file_path) {
-                    let _ = f.write_all(serialized.as_bytes());
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let defaults = FillerCollection::default();
+                if let Some(parent) = file_path.parent() {
+                    if let Err(dir_err) = create_dir_all(parent) {
+                        warn!(
+                            path = %parent.display(),
+                            error = %dir_err,
+                            "Failed to create fillers configuration directory"
+                        );
+                    }
                 }
+                match serde_json::to_string_pretty(&defaults) {
+                    Ok(serialized) => match File::create(&file_path) {
+                        Ok(mut f) => {
+                            if let Err(write_err) = f.write_all(serialized.as_bytes()) {
+                                warn!(
+                                    path = %file_path.display(),
+                                    error = %write_err,
+                                    "Failed to write default fillers configuration"
+                                );
+                            }
+                        }
+                        Err(create_err) => {
+                            warn!(
+                                path = %file_path.display(),
+                                error = %create_err,
+                                "Failed to create default fillers configuration file"
+                            );
+                        }
+                    },
+                    Err(ser_err) => {
+                        warn!(error = %ser_err, "Failed to serialize default fillers configuration");
+                    }
+                }
+                defaults
             }
-            defaults
+            Err(e) => {
+                warn!(
+                    path = %file_path.display(),
+                    error = %e,
+                    "Failed to read fillers configuration; using default fillers"
+                );
+                FillerCollection::default()
+            }
         };
 
         Ok(Self {
@@ -141,7 +179,7 @@ impl FillerCacheManager {
             .replace('é', "e")
             .replace('í', "i")
             .replace('ó', "o")
-            .replace('ú', "u")
+            .replace(['ú', 'ü'], "u")
             .replace('ñ', "n");
 
         let mut key = String::new();
@@ -158,29 +196,90 @@ impl FillerCacheManager {
     /// Pre-warm and index all `.mp3` audio files found in `cache_dir` into RAM.
     pub async fn prewarm_audio_cache<P: AsRef<Path>>(&self, cache_dir: P) -> usize {
         let dir = cache_dir.as_ref();
-        if !dir.exists() {
-            let _ = create_dir_all(dir);
-            return 0;
+        match tokio::fs::try_exists(dir).await {
+            Ok(false) => {
+                if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                    warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "Failed to create filler audio cache directory"
+                    );
+                }
+                return 0;
+            }
+            Err(e) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to check existence of filler audio cache directory"
+                );
+                return 0;
+            }
+            Ok(true) => {}
         }
 
-        let mut loaded_count = 0;
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut guard = self.audio_cache.write().await;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "mp3") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Ok(bytes) = std::fs::read(&path) {
-                            if !bytes.is_empty() {
-                                guard.insert(stem.to_string(), bytes);
-                                loaded_count += 1;
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to read filler audio cache directory"
+                );
+                return 0;
+            }
+        };
+
+        let mut loaded = Vec::new();
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    let is_file = tokio::fs::metadata(&path)
+                        .await
+                        .map(|m| m.is_file())
+                        .unwrap_or(false);
+                    if is_file && path.extension().is_some_and(|ext| ext == "mp3") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            match tokio::fs::read(&path).await {
+                                Ok(bytes) if !bytes.is_empty() => {
+                                    loaded.push((stem.to_string(), bytes));
+                                }
+                                Ok(_) => {
+                                    warn!(
+                                        path = %path.display(),
+                                        "Skipping empty filler audio file"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        path = %path.display(),
+                                        error = %e,
+                                        "Failed to read filler audio file"
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "Failed reading directory entry in filler audio cache"
+                    );
+                    break;
+                }
             }
         }
+
+        let loaded_count = loaded.len();
         if loaded_count > 0 {
+            let mut guard = self.audio_cache.write().await;
+            for (stem, bytes) in loaded {
+                guard.insert(stem, bytes);
+            }
             info!(
                 loaded_count,
                 "Pre-warmed conversational filler audio clips into RAM successfully"
@@ -193,11 +292,7 @@ impl FillerCacheManager {
     pub async fn get_cached_audio(&self, phrase: &str) -> Option<Vec<u8>> {
         let key = Self::phrase_to_cache_key(phrase);
         let guard = self.audio_cache.read().await;
-        if let Some(exact) = guard.get(&key) {
-            return Some(exact.clone());
-        }
-        // Fallback: return any available cached audio clip to avoid zero-audio lag
-        guard.values().next().cloned()
+        guard.get(&key).cloned()
     }
 
     /// Manually cache synthesized audio for a phrase.
@@ -247,14 +342,23 @@ impl FillerCacheManager {
 
     /// Reload configuration dynamically from disk.
     pub async fn reload(&self) -> Result<(), BrainError> {
-        if self.file_path.exists() {
-            let content = std::fs::read_to_string(&self.file_path)
-                .map_err(|e| BrainError::FillersError(e.to_string()))?;
-            let loaded: FillerCollection = serde_json::from_str(&content)?;
-            *self.fillers.write().await = loaded;
-            info!("Reloaded conversational fillers from disk");
+        match tokio::fs::read_to_string(&self.file_path).await {
+            Ok(content) => {
+                let loaded: FillerCollection = serde_json::from_str(&content)?;
+                *self.fillers.write().await = loaded;
+                info!("Reloaded conversational fillers from disk");
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                warn!(
+                    path = %self.file_path.display(),
+                    error = %e,
+                    "Failed to read fillers configuration during reload"
+                );
+                Err(BrainError::FillersError(e.to_string()))
+            }
         }
-        Ok(())
     }
 }
 
@@ -371,5 +475,86 @@ mod tests {
 
         // Channel should not have received patience filler
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_audio_returns_none_on_cache_miss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fillers.json");
+        let cache = FillerCacheManager::new(Some(path)).unwrap();
+
+        cache
+            .store_cached_audio("Un momento, Señor.", vec![1, 2, 3, 4])
+            .await;
+
+        assert_eq!(
+            cache.get_cached_audio("Un momento, Señor.").await,
+            Some(vec![1, 2, 3, 4])
+        );
+        // Must return None rather than returning unrelated cached audio
+        assert_eq!(
+            cache.get_cached_audio("Frase que no está en caché").await,
+            None
+        );
+    }
+
+    #[test]
+    fn test_phrase_to_cache_key_normalizes_diaeresis_and_accents() {
+        assert_eq!(
+            FillerCacheManager::phrase_to_cache_key("Pingüino en cigüeña"),
+            "pinguino_en_ciguena"
+        );
+        assert_eq!(
+            FillerCacheManager::phrase_to_cache_key("Übungen ÁÉÍÓÚÑ"),
+            "ubungen_aeioun"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_audio_cache_async_loads_mp3s_and_skips_empty() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("fillers.json");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).unwrap();
+
+        let phrase = "Deme un segundo, Señor.";
+        let key = FillerCacheManager::phrase_to_cache_key(phrase);
+        std::fs::write(audio_dir.join(format!("{key}.mp3")), b"ID3AUDIO").unwrap();
+        std::fs::write(audio_dir.join("empty.mp3"), b"").unwrap();
+        std::fs::write(audio_dir.join("ignored.txt"), b"hello").unwrap();
+
+        let cache = FillerCacheManager::new(Some(cfg_path)).unwrap();
+        let count = cache.prewarm_audio_cache(&audio_dir).await;
+        assert_eq!(count, 1);
+
+        assert_eq!(
+            cache.get_cached_audio(phrase).await,
+            Some(b"ID3AUDIO".to_vec())
+        );
+        assert_eq!(cache.get_cached_audio("empty").await, None);
+        assert_eq!(cache.get_cached_audio("ignored").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_reload_updates_fillers_and_errors_on_invalid_json() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("fillers.json");
+        let cache = FillerCacheManager::new(Some(&cfg_path)).unwrap();
+
+        let updated = FillerCollection {
+            immediate: vec!["Solo esta frase.".into()],
+            tools: HashMap::new(),
+            patience: vec!["Esperando...".into()],
+        };
+        std::fs::write(&cfg_path, serde_json::to_string(&updated).unwrap()).unwrap();
+        cache.reload().await.unwrap();
+
+        assert_eq!(
+            cache.select_immediate().await,
+            Some("Solo esta frase.".into())
+        );
+
+        std::fs::write(&cfg_path, "{corrupt json").unwrap();
+        assert!(cache.reload().await.is_err());
     }
 }

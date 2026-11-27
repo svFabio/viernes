@@ -4,11 +4,12 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::{create_dir_all, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::BrainError;
@@ -60,17 +61,44 @@ impl SessionPointerManager {
         };
 
         // Regex pattern detecting rotation commands in Spanish
-        let pattern = r"(?i)\b(abre|inicia|comienza|empezar|abrir|iniciar|abrí|empezá)\s+(otra|una\s+nueva|de\s+cero)\s*(conversaci[oó]n|charla|sesi[oó]n)?\b|\b(nueva\s+conversaci[oó]n|nueva\s+sesi[oó]n|resetear\s+sesi[oó]n|limpiar\s+contexto|empezar\s+de\s+cero)\b";
+        let pattern = r"(?i)\b(abre|inicia|comienza|empezar|abrir|iniciar|abrí|empezá)\s+(otra|una\s+nueva|de\s+cero)\s+(conversaci[oó]n|charla|sesi[oó]n)\b|\b(nueva\s+conversaci[oó]n|nueva\s+sesi[oó]n|resetear\s+sesi[oó]n|limpiar\s+contexto|empezar\s+de\s+cero)\b";
         let rotation_regex = Regex::new(pattern)
             .map_err(|e| BrainError::Internal(format!("invalid regex pattern: {e}")))?;
 
-        let state = if file_path.exists() {
-            match std::fs::read_to_string(&file_path) {
-                Ok(content) => serde_json::from_str::<SessionState>(&content).unwrap_or_default(),
-                Err(_) => SessionState::default(),
+        let state = match std::fs::read_to_string(&file_path) {
+            Ok(content) => match serde_json::from_str::<SessionState>(&content) {
+                Ok(parsed) => parsed,
+                Err(parse_err) => {
+                    warn!(
+                        path = %file_path.display(),
+                        error = %parse_err,
+                        "Corrupt session file detected; backing up before creating fresh state"
+                    );
+                    let file_name = file_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "session.json".to_string());
+                    let backup_name =
+                        format!("{file_name}.corrupt.{}", Utc::now().timestamp_millis());
+                    let backup_path = file_path.with_file_name(backup_name);
+                    if let Err(rename_err) = std::fs::rename(&file_path, &backup_path) {
+                        warn!(
+                            src = %file_path.display(),
+                            dst = %backup_path.display(),
+                            error = %rename_err,
+                            "Failed to back up corrupt session file"
+                        );
+                    }
+                    SessionState::default()
+                }
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => SessionState::default(),
+            Err(e) => {
+                return Err(BrainError::SessionError(format!(
+                    "failed to read session file {}: {e}",
+                    file_path.display()
+                )));
             }
-        } else {
-            SessionState::default()
         };
 
         let manager = Self {
@@ -102,9 +130,9 @@ impl SessionPointerManager {
     /// Increment turn count and atomically save.
     pub async fn increment_turn_count(&self) -> Result<u32, BrainError> {
         let mut guard = self.state.write().await;
-        guard.turn_count += 1;
+        guard.turn_count = guard.turn_count.saturating_add(1);
         let count = guard.turn_count;
-        self.save_atomic(&guard)?;
+        self.save_atomic_async(&guard).await?;
         Ok(count)
     }
 
@@ -116,10 +144,18 @@ impl SessionPointerManager {
 
     /// Atomically update active conversation ID if agy assigned a real ID on init.
     pub async fn update_conversation_id(&self, new_id: &str) -> Result<(), BrainError> {
+        let trimmed = new_id.trim();
+        if trimmed.is_empty() {
+            warn!("Rejecting empty or whitespace-only conversation ID update");
+            return Err(BrainError::SessionError(
+                "conversation ID must not be empty or whitespace-only".into(),
+            ));
+        }
+
         let mut guard = self.state.write().await;
-        if guard.current_session_id != new_id {
-            guard.current_session_id = new_id.to_string();
-            self.save_atomic(&guard)?;
+        if guard.current_session_id != trimmed {
+            guard.current_session_id = trimmed.to_string();
+            self.save_atomic_async(&guard).await?;
         }
         Ok(())
     }
@@ -141,22 +177,71 @@ impl SessionPointerManager {
         guard.created_at = Utc::now();
         guard.turn_count = 0;
 
-        self.save_atomic(&guard)?;
+        self.save_atomic_async(&guard).await?;
         Ok(new_id)
     }
 
-    /// Atomically persist current state using temporary file + rename.
+    fn temp_path(&self) -> PathBuf {
+        let temp_filename = format!("session.{}.tmp", Uuid::new_v4());
+        match self.file_path.parent() {
+            Some(parent) => parent.join(temp_filename),
+            None => PathBuf::from(temp_filename),
+        }
+    }
+
+    /// Atomically persist current state asynchronously using temporary file + rename.
+    async fn save_atomic_async(&self, state: &SessionState) -> Result<(), BrainError> {
+        if let Some(parent) = self.file_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| BrainError::SessionError(e.to_string()))?;
+        }
+
+        let temp_path = self.temp_path();
+        let serialized = serde_json::to_string_pretty(state)?;
+
+        let write_res: Result<(), BrainError> = async {
+            let mut file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|e| BrainError::SessionError(e.to_string()))?;
+            file.write_all(serialized.as_bytes())
+                .await
+                .map_err(|e| BrainError::SessionError(e.to_string()))?;
+            file.sync_all()
+                .await
+                .map_err(|e| BrainError::SessionError(e.to_string()))?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = write_res {
+            if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                if rm_err.kind() != ErrorKind::NotFound {
+                    warn!(path = %temp_path.display(), error = %rm_err, "Failed removing temp session file");
+                }
+            }
+            return Err(e);
+        }
+
+        if let Err(e) = tokio::fs::rename(&temp_path, &self.file_path).await {
+            if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                if rm_err.kind() != ErrorKind::NotFound {
+                    warn!(path = %temp_path.display(), error = %rm_err, "Failed removing temp session file after rename failure");
+                }
+            }
+            return Err(BrainError::SessionError(e.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Atomically persist current state synchronously during initialization.
     fn save_atomic(&self, state: &SessionState) -> Result<(), BrainError> {
         if let Some(parent) = self.file_path.parent() {
             create_dir_all(parent).map_err(|e| BrainError::SessionError(e.to_string()))?;
         }
 
-        let temp_filename = format!("session.{}.tmp", Uuid::new_v4());
-        let temp_path = match self.file_path.parent() {
-            Some(parent) => parent.join(temp_filename),
-            None => PathBuf::from(temp_filename),
-        };
-
+        let temp_path = self.temp_path();
         let serialized = serde_json::to_string_pretty(state)?;
 
         let write_res = (|| -> Result<(), BrainError> {
@@ -204,8 +289,90 @@ mod tests {
         assert!(mgr.detects_rotation_intent("Viernes, abre otra conversación por favor"));
         assert!(mgr.detects_rotation_intent("inicia una nueva sesión"));
         assert!(mgr.detects_rotation_intent("quiero una nueva conversación"));
+        assert!(mgr.detects_rotation_intent("empezar de cero"));
+        assert!(mgr.detects_rotation_intent("limpiar contexto"));
         assert!(!mgr.detects_rotation_intent("¿Cómo está el clima hoy?"));
         assert!(!mgr.detects_rotation_intent("Abre el navegador"));
+        assert!(!mgr.detects_rotation_intent("abre otra ventana"));
+        assert!(!mgr.detects_rotation_intent("inicia otra aplicación"));
+        assert!(!mgr.detects_rotation_intent("abrir una nueva pestaña"));
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_session_file_is_backed_up() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let corrupt_payload = "{not valid json!!!";
+        std::fs::write(&path, corrupt_payload).unwrap();
+
+        let mgr = SessionPointerManager::new(Some(&path)).unwrap();
+        assert!(!mgr.current_session_id().await.is_empty());
+
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("session.json.corrupt.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backed_up = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert_eq!(backed_up, corrupt_payload);
+
+        // Fresh valid JSON must now exist at session.json
+        let reloaded = SessionPointerManager::new(Some(&path)).unwrap();
+        assert_eq!(
+            reloaded.current_session_id().await,
+            mgr.current_session_id().await
+        );
+    }
+
+    #[test]
+    fn test_non_not_found_io_error_returns_err() {
+        let dir = tempdir().unwrap();
+        // Passing a directory path causes read_to_string to fail with non-NotFound IO error
+        let res = SessionPointerManager::new(Some(dir.path()));
+        assert!(matches!(res, Err(BrainError::SessionError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_update_conversation_id_rejects_empty_and_whitespace() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mgr = SessionPointerManager::new(Some(&path)).unwrap();
+        let original = mgr.current_session_id().await;
+
+        assert!(mgr.update_conversation_id("").await.is_err());
+        assert_eq!(mgr.current_session_id().await, original);
+
+        assert!(mgr.update_conversation_id("   \t\n ").await.is_err());
+        assert_eq!(mgr.current_session_id().await, original);
+
+        mgr.update_conversation_id("  conv-42  ").await.unwrap();
+        assert_eq!(mgr.current_session_id().await, "conv-42");
+
+        let reloaded = SessionPointerManager::new(Some(&path)).unwrap();
+        assert_eq!(reloaded.current_session_id().await, "conv-42");
+    }
+
+    #[tokio::test]
+    async fn test_increment_turn_count_saturates_without_overflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            current_session_id: "sess-max".into(),
+            created_at: Utc::now(),
+            archived_sessions: Vec::new(),
+            turn_count: u32::MAX,
+        };
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        let mgr = SessionPointerManager::new(Some(&path)).unwrap();
+        let count = mgr.increment_turn_count().await.unwrap();
+        assert_eq!(count, u32::MAX);
+        assert_eq!(mgr.turn_count().await, u32::MAX);
     }
 
     #[tokio::test]
