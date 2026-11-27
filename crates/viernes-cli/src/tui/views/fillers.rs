@@ -2,6 +2,8 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -121,11 +123,7 @@ impl FillersView {
             PathBuf::from(home).join(".config/viernes/fillers.json")
         });
 
-        let socket_path = custom_socket_path.unwrap_or_else(|| {
-            let env_sock = std::env::var("VIERNES_PTT_SOCKET")
-                .unwrap_or_else(|_| "/tmp/viernes_ptt.sock".to_string());
-            PathBuf::from(env_sock)
-        });
+        let socket_path = custom_socket_path.unwrap_or_else(viernes_core::default_ptt_socket_path);
 
         let mut view = Self {
             fillers: FillerCollection::default(),
@@ -175,22 +173,22 @@ impl FillersView {
         }
     }
 
-    /// Return reference to phrases in the currently selected category.
+    /// Return phrases in the currently selected category in deterministic order.
     #[must_use]
     pub fn current_phrases(&self) -> Vec<String> {
         match self.current_category {
             FillerCategory::Generic => self.fillers.immediate.clone(),
             FillerCategory::Tools => {
-                // Flatten all tools phrases for unified editing
+                // Flatten all tools phrases in sorted key order so indices match edit/delete
+                let mut keys: Vec<&String> = self.fillers.tools.keys().collect();
+                keys.sort();
                 let mut all = Vec::new();
-                for list in self.fillers.tools.values() {
-                    all.extend(list.clone());
+                for key in keys {
+                    if let Some(list) = self.fillers.tools.get(key) {
+                        all.extend(list.iter().cloned());
+                    }
                 }
-                if all.is_empty() {
-                    vec!["Accediendo a las herramientas del sistema...".into()]
-                } else {
-                    all
-                }
+                all
             }
             FillerCategory::Patience => self.fillers.patience.clone(),
         }
@@ -228,34 +226,49 @@ impl FillersView {
         validate_phrase(new_text)?;
         let trimmed = new_text.trim().to_string();
 
-        match self.current_category {
+        let edited = match self.current_category {
             FillerCategory::Generic => {
-                if self.selected_index < self.fillers.immediate.len() {
-                    self.fillers.immediate[self.selected_index] = trimmed;
+                if let Some(slot) = self.fillers.immediate.get_mut(self.selected_index) {
+                    *slot = trimmed;
+                    true
+                } else {
+                    false
                 }
             }
             FillerCategory::Tools => {
-                let mut found = false;
+                let mut keys: Vec<String> = self.fillers.tools.keys().cloned().collect();
+                keys.sort();
                 let mut current_idx = 0;
-                for list in self.fillers.tools.values_mut() {
-                    for item in list.iter_mut() {
-                        if current_idx == self.selected_index {
-                            *item = trimmed.clone();
-                            found = true;
-                            break;
+                let mut found = false;
+                for key in keys {
+                    if let Some(list) = self.fillers.tools.get_mut(&key) {
+                        for item in list.iter_mut() {
+                            if current_idx == self.selected_index {
+                                *item = trimmed.clone();
+                                found = true;
+                                break;
+                            }
+                            current_idx += 1;
                         }
-                        current_idx += 1;
                     }
                     if found {
                         break;
                     }
                 }
+                found
             }
             FillerCategory::Patience => {
-                if self.selected_index < self.fillers.patience.len() {
-                    self.fillers.patience[self.selected_index] = trimmed;
+                if let Some(slot) = self.fillers.patience.get_mut(self.selected_index) {
+                    *slot = trimmed;
+                    true
+                } else {
+                    false
                 }
             }
+        };
+
+        if !edited {
+            return Err("No hay una frase seleccionada para editar".into());
         }
 
         self.has_unsaved_changes = true;
@@ -271,22 +284,29 @@ impl FillersView {
             return Err("No se puede eliminar la última frase de la categoría".into());
         }
 
-        match self.current_category {
+        let deleted = match self.current_category {
             FillerCategory::Generic => {
                 if self.selected_index < self.fillers.immediate.len() {
                     self.fillers.immediate.remove(self.selected_index);
+                    true
+                } else {
+                    false
                 }
             }
             FillerCategory::Tools => {
+                let mut keys: Vec<String> = self.fillers.tools.keys().cloned().collect();
+                keys.sort();
                 let mut current_idx = 0;
                 let mut remove_target = None;
-                for (cat_key, list) in self.fillers.tools.iter_mut() {
-                    for (i, _) in list.iter().enumerate() {
-                        if current_idx == self.selected_index {
-                            remove_target = Some((cat_key.clone(), i));
-                            break;
+                for cat_key in keys {
+                    if let Some(list) = self.fillers.tools.get(&cat_key) {
+                        for i in 0..list.len() {
+                            if current_idx == self.selected_index {
+                                remove_target = Some((cat_key.clone(), i));
+                                break;
+                            }
+                            current_idx += 1;
                         }
-                        current_idx += 1;
                     }
                     if remove_target.is_some() {
                         break;
@@ -295,14 +315,26 @@ impl FillersView {
                 if let Some((cat_key, i)) = remove_target {
                     if let Some(list) = self.fillers.tools.get_mut(&cat_key) {
                         list.remove(i);
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             }
             FillerCategory::Patience => {
                 if self.selected_index < self.fillers.patience.len() {
                     self.fillers.patience.remove(self.selected_index);
+                    true
+                } else {
+                    false
                 }
             }
+        };
+
+        if !deleted {
+            return Err("No hay una frase seleccionada para eliminar".into());
         }
 
         if self.selected_index > 0 && self.selected_index >= self.current_phrases().len() {
@@ -316,30 +348,56 @@ impl FillersView {
 
     /// Atomically write current collection to `fillers.json` (temp file + rename).
     pub fn save_to_disk(&mut self) -> Result<(), String> {
-        if let Some(parent) = self.file_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        crate::tui::ensure_parent_dir(&self.file_path)?;
 
         let json_str = serde_json::to_string_pretty(&self.fillers)
             .map_err(|e| format!("Error de serialización JSON: {e}"))?;
 
-        let temp_path = self.file_path.with_extension("tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)
-                .map_err(|e| format!("Error al crear archivo temporal: {e}"))?;
+        let file_name = self
+            .file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fillers.json");
+        let temp_path = self
+            .file_path
+            .with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+
+        let mut open_opts = OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+
+        let mut file = open_opts
+            .open(&temp_path)
+            .map_err(|e| format!("Error al crear archivo temporal: {e}"))?;
+
+        let write_result = (|| -> Result<(), String> {
+            #[cfg(unix)]
+            {
+                let mut permissions = file
+                    .metadata()
+                    .map_err(|e| format!("Error leyendo metadatos: {e}"))?
+                    .permissions();
+                permissions.set_mode(0o600);
+                file.set_permissions(permissions)
+                    .map_err(|e| format!("Error configurando permisos 0600: {e}"))?;
+            }
 
             file.write_all(json_str.as_bytes())
                 .map_err(|e| format!("Error al escribir archivo: {e}"))?;
             file.sync_all()
                 .map_err(|e| format!("Error de sincronización en disco: {e}"))?;
-        }
+            drop(file);
 
-        std::fs::rename(&temp_path, &self.file_path)
-            .map_err(|e| format!("Error al renombrar archivo atómicamente: {e}"))?;
+            std::fs::rename(&temp_path, &self.file_path)
+                .map_err(|e| format!("Error al renombrar archivo atómicamente: {e}"))?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
 
         self.has_unsaved_changes = false;
         self.status_message = Some("Frases guardadas atómicamente en fillers.json".into());
@@ -349,9 +407,10 @@ impl FillersView {
     /// Send asynchronous hot-reload IPC trigger to running Viernes daemon.
     pub async fn dispatch_hot_reload(&self) -> Result<(), String> {
         if !self.socket_path.exists() {
-            return Err(
-                "Daemon no está activo (socket /tmp/viernes_ptt.sock no encontrado)".into(),
-            );
+            return Err(format!(
+                "Daemon no está activo (socket {} no encontrado)",
+                self.socket_path.display()
+            ));
         }
 
         let mut stream = UnixStream::connect(&self.socket_path)
@@ -381,6 +440,26 @@ impl FillersView {
             return FillersAction::None;
         }
 
+        // Discard unsaved changes confirmation modal
+        if self.show_discard_confirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.show_discard_confirm = false;
+                    self.fillers = FillerCollection::default();
+                    self.load_from_disk();
+                    self.selected_index = 0;
+                    self.has_unsaved_changes = false;
+                    self.error_message = None;
+                    self.status_message = Some("Cambios sin guardar descartados".into());
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.show_discard_confirm = false;
+                }
+                _ => {}
+            }
+            return FillersAction::None;
+        }
+
         // Active text entry (Adding or Editing)
         match self.mode {
             FillerEditorMode::Adding => match key.code {
@@ -406,7 +485,7 @@ impl FillersView {
                     self.input_buffer.pop();
                 }
                 KeyCode::Char(c) => {
-                    if self.input_buffer.len() < MAX_PHRASE_LENGTH {
+                    if self.input_buffer.chars().count() < MAX_PHRASE_LENGTH {
                         self.input_buffer.push(c);
                     } else {
                         self.error_message = Some("Límite de 120 caracteres alcanzado".into());
@@ -436,7 +515,7 @@ impl FillersView {
                     self.input_buffer.pop();
                 }
                 KeyCode::Char(c) => {
-                    if self.input_buffer.len() < MAX_PHRASE_LENGTH {
+                    if self.input_buffer.chars().count() < MAX_PHRASE_LENGTH {
                         self.input_buffer.push(c);
                     } else {
                         self.error_message = Some("Límite de 120 caracteres alcanzado".into());
@@ -494,6 +573,9 @@ impl FillersView {
                         return FillersAction::SavedAndReloaded;
                     }
                 }
+                KeyCode::Esc if self.has_unsaved_changes => {
+                    self.show_discard_confirm = true;
+                }
                 _ => {}
             },
         }
@@ -539,35 +621,42 @@ impl FillersView {
         // 2. Phrases List
         let phrases = self.current_phrases();
         let total = phrases.len();
-        let list_items: Vec<ListItem> = phrases
-            .iter()
-            .enumerate()
-            .map(|(idx, phrase)| {
-                let is_selected = idx == self.selected_index;
-                let marker = if is_selected { " > " } else { "   " };
-                let num_span = Span::styled(
-                    format!("{marker}{}. ", idx + 1),
-                    if is_selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                );
-                let text_span = Span::styled(
-                    phrase,
-                    if is_selected {
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                );
-                ListItem::new(Line::from(vec![num_span, text_span]))
-            })
-            .collect();
+        let list_items: Vec<ListItem> = if phrases.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "  (No hay frases en esta categoría. Presione [a] para agregar)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            phrases
+                .iter()
+                .enumerate()
+                .map(|(idx, phrase)| {
+                    let is_selected = idx == self.selected_index;
+                    let marker = if is_selected { " > " } else { "   " };
+                    let num_span = Span::styled(
+                        format!("{marker}{}. ", idx + 1),
+                        if is_selected {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    );
+                    let text_span = Span::styled(
+                        phrase,
+                        if is_selected {
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    );
+                    ListItem::new(Line::from(vec![num_span, text_span]))
+                })
+                .collect()
+        };
 
         let list_title = format!(
             " Frases registradas ({total}/50 en {}) ",
@@ -580,14 +669,15 @@ impl FillersView {
         f.render_widget(List::new(list_items).block(list_block), chunks[1]);
 
         // 3. Add / Edit Text Buffer Box
+        let buf_char_len = self.input_buffer.chars().count();
         let (input_title, input_text, input_style) = match self.mode {
             FillerEditorMode::Adding => (
-                format!(" [+] Nueva frase ({}/120) ", self.input_buffer.len()),
+                format!(" [+] Nueva frase ({buf_char_len}/{MAX_PHRASE_LENGTH}) "),
                 format!("> {}_", self.input_buffer),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             FillerEditorMode::Editing => (
-                format!(" [✎] Editando frase ({}/120) ", self.input_buffer.len()),
+                format!(" [✎] Editando frase ({buf_char_len}/{MAX_PHRASE_LENGTH}) "),
                 format!("> {}_", self.input_buffer),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
@@ -691,6 +781,17 @@ impl FillersView {
                 Color::Yellow,
             );
         }
+
+        // Discard Confirmation Modal
+        if self.show_discard_confirm {
+            render_modal(
+                f,
+                area,
+                " Cambios sin guardar ",
+                "Hay cambios pendientes de guardar en fillers.json.\n\n¿Desea descartarlos? Presione [y/Enter] para descartar o [n/Esc] para volver.",
+                Color::Yellow,
+            );
+        }
     }
 }
 
@@ -717,10 +818,10 @@ pub fn validate_phrase(text: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("La frase no puede estar vacía".into());
     }
-    if trimmed.len() > MAX_PHRASE_LENGTH {
+    let char_len = trimmed.chars().count();
+    if char_len > MAX_PHRASE_LENGTH {
         return Err(format!(
-            "La frase supera el límite de {MAX_PHRASE_LENGTH} caracteres (longitud: {})",
-            trimmed.len()
+            "La frase supera el límite de {MAX_PHRASE_LENGTH} caracteres (longitud: {char_len})"
         ));
     }
     Ok(())
@@ -874,6 +975,51 @@ mod tests {
         let bak_path = dir.path().join("fillers.json.bak");
         assert!(bak_path.exists());
         assert_eq!(std::fs::read_to_string(bak_path)?, "{ broken json ...");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tools_category_no_synthetic_placeholder_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let json_path = dir.path().join("fillers.json");
+        let mut view = FillersView::new(Some(json_path), None);
+        view.current_category = FillerCategory::Tools;
+        view.fillers.tools.clear();
+
+        // Empty tools must report 0 phrases (no synthetic mismatch)
+        assert!(view.current_phrases().is_empty());
+        assert!(view.edit_current_phrase("Editado").is_err());
+
+        // Add then edit deterministically
+        view.add_phrase("Primera herramienta")?;
+        assert_eq!(view.current_phrases(), vec!["Primera herramienta"]);
+        view.selected_index = 0;
+        view.edit_current_phrase("Herramienta editada")?;
+        assert_eq!(view.current_phrases(), vec!["Herramienta editada"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fillers_discard_confirm_flow() -> Result<(), Box<dyn std::error::Error>> {
+        use crossterm::event::KeyModifiers;
+
+        let dir = tempdir()?;
+        let json_path = dir.path().join("fillers.json");
+        let mut view = FillersView::new(Some(json_path), None);
+        view.save_to_disk()?;
+        let initial_len = view.current_phrases().len();
+
+        view.add_phrase("Cambio temporal")?;
+        assert!(view.has_unsaved_changes);
+
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(view.show_discard_confirm);
+
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!view.show_discard_confirm);
+        assert!(!view.has_unsaved_changes);
+        assert_eq!(view.current_phrases().len(), initial_len);
         Ok(())
     }
 }

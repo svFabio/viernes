@@ -134,6 +134,15 @@ impl<C: AudioCapture, S: SpeechToText> AudioPipeline<C, S> {
                     }
                 }
             }
+            PttEvent::Cancel => {
+                self.arbitrator.on_ptt_released();
+                self.vad.reset();
+                let _ = self.capture.finish_recording();
+                let _ = self.event_tx.send(SystemEvent::ResetToIdle).await;
+            }
+            PttEvent::Reload => {
+                debug!("AudioPipeline: Reload PTT event received");
+            }
         }
         Ok(())
     }

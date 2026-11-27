@@ -48,6 +48,7 @@ pub struct VoiceActivityDetector {
     pre_roll_capacity: usize,
     min_speech_samples: usize,
     max_speech_samples: usize,
+    max_ptt_speech_samples: usize,
     silence_timeout_enabled: bool,
 }
 
@@ -56,15 +57,21 @@ impl VoiceActivityDetector {
     pub const MIN_SPEECH_DURATION_MS: u64 = 250;
     /// Maximum allowed speech duration (20 seconds) before enforcing a safety cutoff.
     pub const MAX_SPEECH_DURATION_SECS: u64 = 20;
+    /// Maximum allowed speech duration (60 seconds) while silence timeout is disabled (e.g. PTT held).
+    pub const MAX_PTT_SPEECH_DURATION_SECS: u64 = 60;
     /// Required consecutive high-energy frames to transition from silence to speech.
     pub const CONSECUTIVE_FRAMES_TRIGGER: usize = 2;
 
     /// Creates a new `VoiceActivityDetector` instance.
     #[must_use]
     pub fn new(sample_rate: u32, threshold: f32, silence_timeout_ms: u64) -> Self {
+        let sample_rate = sample_rate.max(1);
         let min_speech_samples =
             ((sample_rate as f64) * (Self::MIN_SPEECH_DURATION_MS as f64 / 1000.0)) as usize;
-        let max_speech_samples = (sample_rate as usize) * (Self::MAX_SPEECH_DURATION_SECS as usize);
+        let max_speech_samples =
+            (sample_rate as usize).saturating_mul(Self::MAX_SPEECH_DURATION_SECS as usize);
+        let max_ptt_speech_samples =
+            (sample_rate as usize).saturating_mul(Self::MAX_PTT_SPEECH_DURATION_SECS as usize);
         // Retain 100ms of pre-roll to avoid clipping leading consonants
         let pre_roll_capacity = ((sample_rate as f64) * 0.100) as usize;
 
@@ -80,6 +87,7 @@ impl VoiceActivityDetector {
             pre_roll_capacity,
             min_speech_samples,
             max_speech_samples,
+            max_ptt_speech_samples,
             silence_timeout_enabled: true,
         }
     }
@@ -164,11 +172,20 @@ impl VoiceActivityDetector {
 
         match self.state {
             VadState::Silence => {
-                // Maintain pre-roll sliding buffer
-                self.pre_roll_buffer.extend_from_slice(chunk);
-                if self.pre_roll_buffer.len() > self.pre_roll_capacity {
-                    let drain_count = self.pre_roll_buffer.len() - self.pre_roll_capacity;
-                    self.pre_roll_buffer.drain(0..drain_count);
+                // Maintain pre-roll sliding buffer without exceeding pre_roll_capacity allocation
+                if self.pre_roll_capacity > 0 {
+                    if chunk.len() >= self.pre_roll_capacity {
+                        self.pre_roll_buffer.clear();
+                        let start = chunk.len() - self.pre_roll_capacity;
+                        self.pre_roll_buffer.extend_from_slice(&chunk[start..]);
+                    } else {
+                        let new_len = self.pre_roll_buffer.len() + chunk.len();
+                        if new_len > self.pre_roll_capacity {
+                            let drain_count = new_len - self.pre_roll_capacity;
+                            self.pre_roll_buffer.drain(0..drain_count);
+                        }
+                        self.pre_roll_buffer.extend_from_slice(chunk);
+                    }
                 }
 
                 if is_voice {
@@ -194,18 +211,28 @@ impl VoiceActivityDetector {
                 }
             }
             VadState::Speech => {
-                self.speech_buffer.extend_from_slice(chunk);
+                let ceiling = if self.silence_timeout_enabled {
+                    self.max_speech_samples
+                } else {
+                    self.max_ptt_speech_samples
+                };
+                let remaining = ceiling.saturating_sub(self.speech_buffer.len());
+                let to_copy = chunk.len().min(remaining);
+                self.speech_buffer.extend_from_slice(&chunk[..to_copy]);
 
                 if is_voice {
                     self.accumulated_silence_samples = 0;
                 } else {
-                    self.accumulated_silence_samples += chunk.len();
+                    self.accumulated_silence_samples =
+                        self.accumulated_silence_samples.saturating_add(chunk.len());
                 }
 
-                // Check 20-second safety cutoff limit
-                if self.speech_buffer.len() >= self.max_speech_samples {
+                // Check safety cutoff limit (20s for VAD, 60s ceiling when silence timeout is disabled)
+                if self.speech_buffer.len() >= ceiling {
                     info!(
-                        "VAD: Max safety cutoff reached (20s limit exceeded); forcing segment cut"
+                        ceiling_samples = ceiling,
+                        silence_timeout_enabled = self.silence_timeout_enabled,
+                        "VAD: Max safety cutoff reached; forcing segment cut"
                     );
                     let final_buffer = std::mem::take(&mut self.speech_buffer);
                     self.reset();
@@ -411,5 +438,63 @@ mod tests {
         // 25 + 60 + 25 = 110 frames * 320 samples = 35200 samples
         assert_eq!(finished.len(), 35_200);
         assert_eq!(vad.state(), VadState::Silence);
+    }
+
+    #[test]
+    fn test_vad_sample_rate_zero_is_guarded() {
+        let mut vad = VoiceActivityDetector::new(0, 0.05, 200);
+        assert_eq!(vad.sample_rate, 1);
+        assert_eq!(vad.max_speech_samples, 20);
+        assert_eq!(vad.max_ptt_speech_samples, 60);
+
+        let voice = vec![0.2; 5];
+        // Must not panic on feed_chunk or force_finish
+        let _ = vad.feed_chunk(&voice);
+        let _ = vad.feed_chunk(&voice);
+        assert_eq!(vad.state(), VadState::Speech);
+    }
+
+    #[test]
+    fn test_vad_ptt_mode_allows_over_20s_and_caps_at_60s() {
+        let mut vad = VoiceActivityDetector::new(16_000, 0.05, 800);
+        vad.set_silence_timeout_enabled(false);
+        vad.start_speech_capture();
+
+        let one_sec = vec![0.2; 16_000];
+        // Feed 25 seconds (> 20s VAD limit): must NOT cut off while silence_timeout_enabled == false
+        for _ in 0..25 {
+            let evs = vad.feed_chunk(&one_sec);
+            assert!(evs.is_empty());
+        }
+        assert_eq!(vad.state(), VadState::Speech);
+        assert_eq!(vad.speech_buffer.len(), 25 * 16_000);
+
+        // Feed remaining 35 seconds to reach 60s safety ceiling
+        let mut cut = None;
+        for _ in 0..35 {
+            let evs = vad.feed_chunk(&one_sec);
+            if let Some(ev) = evs
+                .into_iter()
+                .find(|e| matches!(e, VadEvent::VoiceFinished(_)))
+            {
+                cut = Some(ev);
+                break;
+            }
+        }
+        match cut {
+            Some(VadEvent::VoiceFinished(buf)) => assert_eq!(buf.len(), 60 * 16_000),
+            other => panic!("Expected 60s safety ceiling VoiceFinished, got {other:?}"),
+        }
+        assert_eq!(vad.state(), VadState::Silence);
+    }
+
+    #[test]
+    fn test_vad_caps_oversized_chunk_allocation() {
+        let mut vad = VoiceActivityDetector::new(16_000, 0.05, 800);
+        // Oversized silence chunk must keep pre_roll_buffer capped at 100ms (1600 samples)
+        let huge_silence = vec![0.001; 100_000];
+        let evs = vad.feed_chunk(&huge_silence);
+        assert!(evs.is_empty());
+        assert_eq!(vad.pre_roll_buffer.len(), 1600);
     }
 }

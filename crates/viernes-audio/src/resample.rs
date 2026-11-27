@@ -3,13 +3,19 @@
 //! Provides deterministic downsampling from arbitrary hardware sample rates
 //! (e.g. 44.1 kHz, 48 kHz, 96 kHz) to 16.0 kHz mono Float32 PCM required by Whisper STT.
 
+/// Maximum permitted upsampling ratio to prevent excessive allocation on malformed sample rates.
+pub const MAX_UPSAMPLE_RATIO: f64 = 64.0;
+
 /// Downmixes interleaved multi-channel PCM Float32 audio into mono Float32 PCM.
 ///
 /// # Panics
 /// Does not panic. If `channels == 0`, returns empty vector.
 #[must_use]
 pub fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
-    if channels <= 1 || interleaved.is_empty() {
+    if channels == 0 || interleaved.is_empty() {
+        return Vec::new();
+    }
+    if channels == 1 {
         return interleaved.to_vec();
     }
 
@@ -41,8 +47,14 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
         return samples.to_vec();
     }
 
+    let upsample_ratio = to_rate as f64 / from_rate as f64;
+    if !upsample_ratio.is_finite() || upsample_ratio > MAX_UPSAMPLE_RATIO {
+        return Vec::new();
+    }
+
     let ratio = from_rate as f64 / to_rate as f64;
-    let target_len = ((samples.len() as f64) / ratio).round() as usize;
+    let max_safe_len = samples.len().saturating_mul(MAX_UPSAMPLE_RATIO as usize);
+    let target_len = (((samples.len() as f64) / ratio).round() as usize).min(max_safe_len);
     let mut output = Vec::with_capacity(target_len);
 
     for i in 0..target_len {
@@ -128,5 +140,19 @@ mod tests {
         let processed = process_to_16k_mono(&stereo, 2, 48000);
         assert_eq!(processed.len(), 160); // 10ms at 16kHz
         assert!((processed[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_downmix_zero_channels_returns_empty() {
+        let input = vec![0.1, 0.2, 0.3];
+        let mono = downmix_to_mono(&input, 0);
+        assert!(mono.is_empty());
+    }
+
+    #[test]
+    fn test_resample_excessive_upsample_ratio_is_rejected() {
+        let input = vec![0.5; 128];
+        let out = resample_linear(&input, 1, 192_000);
+        assert!(out.is_empty());
     }
 }

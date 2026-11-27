@@ -32,6 +32,7 @@ impl<'a> Widget for SpectrumWidget<'a> {
             SystemState::Speaking => " Espectro de Voz (Reproduciendo audio) ",
             SystemState::Listening => " Espectro de Voz (Capturando audio) ",
             SystemState::Thinking => " Espectro de Voz (Procesando) ",
+            SystemState::AwaitingConfirmation => " Espectro de Voz (CONFIRMACIÓN REQUERIDA) ",
             SystemState::Idle => " Espectro de Voz (Reposo) ",
         };
 
@@ -39,6 +40,7 @@ impl<'a> Widget for SpectrumWidget<'a> {
             SystemState::Speaking => Color::Cyan,
             SystemState::Listening => Color::Yellow,
             SystemState::Thinking => Color::Magenta,
+            SystemState::AwaitingConfirmation => Color::Rgb(255, 191, 0),
             SystemState::Idle => Color::DarkGray,
         };
 
@@ -176,6 +178,14 @@ fn bar_style(row: u16, max_rows: u16, state: SystemState) -> Style {
             Style::default().fg(color)
         }
         SystemState::Thinking => Style::default().fg(Color::Magenta),
+        SystemState::AwaitingConfirmation => {
+            let color = if ratio < 0.5 {
+                Color::Yellow
+            } else {
+                Color::Rgb(255, 175, 0)
+            };
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        }
         SystemState::Idle => Style::default().fg(Color::DarkGray),
     }
 }
@@ -217,5 +227,23 @@ mod tests {
         let buffer_speaking = format!("{:?}", terminal.backend().buffer());
         assert!(buffer_speaking.contains("Espectro de Voz (Reproduciendo audio)"));
         assert!(buffer_speaking.contains('█'));
+    }
+
+    #[test]
+    fn test_spectrum_widget_rendering_awaiting_confirmation() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let confirm_amps = vec![0.45; 32];
+        terminal
+            .draw(|f| {
+                let widget = SpectrumWidget::new(&confirm_amps, SystemState::AwaitingConfirmation);
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let buffer_str = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_str.contains("CONFIRMACIÓN REQUERIDA"));
+        assert!(buffer_str.contains('█'));
     }
 }

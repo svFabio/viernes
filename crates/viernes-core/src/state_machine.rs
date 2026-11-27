@@ -75,13 +75,14 @@ impl StateMachine {
         self.event_tx.clone()
     }
 
-    /// Broadcast an external event to all subscribers and process state transitions.
+    /// Process state transitions under lock and then broadcast the external event to subscribers.
     pub async fn dispatch(
         &self,
         event: SystemEvent,
     ) -> Result<Option<TransitionRecord>, ViernesError> {
-        let _ = self.event_tx.send(event.clone());
-        self.process_transition(event).await
+        let record = self.process_transition(event.clone()).await?;
+        let _ = self.event_tx.send(event);
+        Ok(record)
     }
 
     /// Determine the deterministic next state given current state and incoming event.
@@ -109,6 +110,9 @@ impl StateMachine {
                 SystemState::Thinking,
                 SystemEvent::SpeakingStarted | SystemEvent::SentenceReady(_),
             ) => Some(SystemState::Speaking),
+            (SystemState::Thinking, SystemEvent::AwaitingConfirmationRequested { .. }) => {
+                Some(SystemState::AwaitingConfirmation)
+            }
             // Filler playback finishes while thinking: remain in Thinking
             (SystemState::Thinking, SystemEvent::FillerPlaybackFinished) => {
                 Some(SystemState::Thinking)
@@ -120,12 +124,33 @@ impl StateMachine {
             (SystemState::Speaking, SystemEvent::FillerPlaybackFinished) => {
                 Some(SystemState::Thinking)
             }
+            (SystemState::Speaking, SystemEvent::AwaitingConfirmationRequested { .. }) => {
+                Some(SystemState::AwaitingConfirmation)
+            }
 
             // Speaking interruption (Barge-in): human speaks while assistant talks
             (
                 SystemState::Speaking,
                 SystemEvent::VoiceStarted | SystemEvent::BargeIn | SystemEvent::PttPressed,
             ) => Some(SystemState::Listening),
+
+            // AwaitingConfirmation transitions
+            (
+                SystemState::AwaitingConfirmation,
+                SystemEvent::ConfirmationReceived { confirmed: true },
+            ) => Some(SystemState::Thinking),
+            (
+                SystemState::AwaitingConfirmation,
+                SystemEvent::ConfirmationReceived { confirmed: false },
+            ) => Some(SystemState::Idle),
+            (
+                SystemState::AwaitingConfirmation,
+                SystemEvent::VoiceStarted | SystemEvent::BargeIn | SystemEvent::PttPressed,
+            ) => Some(SystemState::Listening),
+            (
+                SystemState::AwaitingConfirmation,
+                SystemEvent::SpeakingStarted | SystemEvent::SentenceReady(_),
+            ) => Some(SystemState::Speaking),
 
             // Global reset triggers
             (_, SystemEvent::ResetToIdle | SystemEvent::SystemError(_)) => Some(SystemState::Idle),
@@ -145,8 +170,10 @@ impl StateMachine {
 
         if let Some(next_state) = Self::compute_next_state(prev_state, &event) {
             if prev_state != next_state {
-                // If transitioning from Speaking to Listening, activate atomic barge-in flag
-                if prev_state == SystemState::Speaking && next_state == SystemState::Listening {
+                // If transitioning from Speaking to Listening (or explicit BargeIn), activate atomic barge-in flag
+                if (prev_state == SystemState::Speaking || matches!(event, SystemEvent::BargeIn))
+                    && next_state == SystemState::Listening
+                {
                     self.barge_in_active.store(true, Ordering::Release);
                     warn!(
                         from = %prev_state,
@@ -157,6 +184,7 @@ impl StateMachine {
                 }
 
                 *state_guard = next_state;
+                drop(state_guard);
 
                 let record = TransitionRecord {
                     timestamp: chrono::Utc::now(),
@@ -294,6 +322,133 @@ mod tests {
         assert_eq!(sm.state().await, SystemState::Idle);
     }
 
+    #[tokio::test]
+    async fn test_awaiting_confirmation_accepted_and_rejected() {
+        let sm = StateMachine::new(16);
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Thinking);
+
+        // Thinking -> AwaitingConfirmation
+        let rec = sm
+            .dispatch(SystemEvent::AwaitingConfirmationRequested {
+                action: "rm -rf /tmp/foo".into(),
+            })
+            .await
+            .unwrap();
+        assert!(rec.is_some());
+        assert_eq!(sm.state().await, SystemState::AwaitingConfirmation);
+
+        // Confirmed -> Thinking
+        let rec = sm
+            .dispatch(SystemEvent::ConfirmationReceived { confirmed: true })
+            .await
+            .unwrap();
+        assert!(rec.is_some());
+        assert_eq!(sm.state().await, SystemState::Thinking);
+
+        // Request again, then reject -> Idle
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "drop table".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(sm.state().await, SystemState::AwaitingConfirmation);
+
+        let rec = sm
+            .dispatch(SystemEvent::ConfirmationReceived { confirmed: false })
+            .await
+            .unwrap();
+        assert!(rec.is_some());
+        assert_eq!(sm.state().await, SystemState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_awaiting_confirmation_from_speaking_and_barge_in() {
+        let sm = StateMachine::new(16);
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        sm.dispatch(SystemEvent::SpeakingStarted).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Speaking);
+
+        // Speaking -> AwaitingConfirmation
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "restart service".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(sm.state().await, SystemState::AwaitingConfirmation);
+
+        // Barge-in during AwaitingConfirmation -> Listening & sets barge_in_active
+        sm.dispatch(SystemEvent::BargeIn).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Listening);
+        assert!(sm.is_barge_in_active());
+        sm.reset_barge_in();
+
+        // VoiceStarted or PttPressed during AwaitingConfirmation -> Listening without barge_in_active
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "delete file".into(),
+        })
+        .await
+        .unwrap();
+        sm.dispatch(SystemEvent::VoiceStarted).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Listening);
+        assert!(!sm.is_barge_in_active());
+
+        sm.dispatch(SystemEvent::PttReleased).await.unwrap();
+        sm.dispatch(SystemEvent::AwaitingConfirmationRequested {
+            action: "delete file".into(),
+        })
+        .await
+        .unwrap();
+        sm.dispatch(SystemEvent::PttPressed).await.unwrap();
+        assert_eq!(sm.state().await, SystemState::Listening);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_updates_state_before_event_broadcast() {
+        let sm = Arc::new(StateMachine::new(16));
+        let mut event_rx = sm.subscribe_events();
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let sm_reader = sm.clone();
+        let observer = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            for _ in 0..4 {
+                let ev = event_rx.recv().await.unwrap();
+                let st = sm_reader.state().await;
+                let barge_in = sm_reader.is_barge_in_active();
+                observed.push((ev, st, barge_in));
+                ack_tx.send(()).await.unwrap();
+            }
+            observed
+        });
+
+        // Give observer task a chance to start awaiting recv()
+        tokio::task::yield_now().await;
+
+        for event in [
+            SystemEvent::VoiceStarted,
+            SystemEvent::PttReleased,
+            SystemEvent::SpeakingStarted,
+            SystemEvent::BargeIn,
+        ] {
+            sm.dispatch(event).await.unwrap();
+            ack_rx.recv().await.unwrap();
+        }
+
+        let observed = observer.await.unwrap();
+        assert_eq!(observed[0].1, SystemState::Listening);
+        assert!(!observed[0].2);
+        assert_eq!(observed[1].1, SystemState::Thinking);
+        assert!(!observed[1].2);
+        assert_eq!(observed[2].1, SystemState::Speaking);
+        assert!(!observed[2].2);
+        assert_eq!(observed[3].1, SystemState::Listening);
+        assert!(observed[3].2);
+    }
+
     // Property-based test verifying random sequences never deadlock or leave undefined states
     fn arb_system_event() -> impl Strategy<Value = SystemEvent> {
         prop_oneof![
@@ -307,13 +462,18 @@ mod tests {
             Just(SystemEvent::TranscriptReady("hello".into())),
             Just(SystemEvent::SpeakingStarted),
             Just(SystemEvent::PlaybackFinished),
+            Just(SystemEvent::FillerPlaybackFinished),
             Just(SystemEvent::BargeIn),
             Just(SystemEvent::ResetToIdle),
             Just(SystemEvent::SystemError("arbitrary".into())),
             Just(SystemEvent::ToolExecutionRequested {
                 tool_name: "test".into()
             }),
+            Just(SystemEvent::AwaitingConfirmationRequested {
+                action: "rm".into()
+            }),
             Just(SystemEvent::ConfirmationReceived { confirmed: true }),
+            Just(SystemEvent::ConfirmationReceived { confirmed: false }),
         ]
     }
 
@@ -330,8 +490,15 @@ mod tests {
                 for event in events {
                     let _ = sm.dispatch(event).await;
                     let st = sm.state().await;
-                    // State must strictly be one of the 4 defined enum variants
-                    prop_assert!(matches!(st, SystemState::Idle | SystemState::Listening | SystemState::Thinking | SystemState::Speaking));
+                    // State must strictly be one of the 5 defined enum variants
+                    prop_assert!(matches!(
+                        st,
+                        SystemState::Idle
+                            | SystemState::Listening
+                            | SystemState::Thinking
+                            | SystemState::Speaking
+                            | SystemState::AwaitingConfirmation
+                    ));
                 }
                 Ok(())
             }).unwrap();

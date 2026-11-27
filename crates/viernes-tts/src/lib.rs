@@ -3,7 +3,7 @@
 //! # Architecture Overview
 //!
 //! - **KeyPool & ElevenLabs**: Lock-free API key rotation (`AtomicUsize`) across free tiers with `wiremock` tests.
-//! - **Edge-TTS**: 100% native asynchronous WebSocket synthesis with binary MP3 frame extraction.
+//! - **Edge-TTS**: Asynchronous CLI subprocess synthesis with timeout/kill-on-drop plus SSML and binary frame helpers.
 //! - **StreamingAudioPlayer**: Non-blocking audio playback powered by `rodio` and in-memory MP3 decoding.
 //! - **SilentAudioSink**: Hermetic mock sink for headless CI environments.
 //! - **Barge-in**: Sub-80ms atomic interruption kill-switch with acoustic echo grace windows.
@@ -25,7 +25,7 @@ pub use barge_in::BargeInController;
 pub use edge::EdgeTtsClient;
 pub use elevenlabs::ElevenLabsClient;
 pub use error::TtsError;
-pub use key_pool::KeyPool;
+pub use key_pool::{ActiveKey, KeyPool};
 pub use player::{SilentAudioSink, StreamingAudioPlayer};
 pub use resilient::ResilientTtsEngine;
 pub use temp_storage::TempStorageManager;

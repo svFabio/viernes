@@ -2,8 +2,11 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -15,6 +18,7 @@ use ratatui::{
 };
 use regex::Regex;
 use viernes_core::config::ViernesConfig;
+use viernes_core::events::SystemEvent;
 
 /// Alias for the primary resilient Text-to-Speech engine in Viernes.
 pub type ViernesTts = viernes_tts::resilient::ResilientTtsEngine;
@@ -122,6 +126,11 @@ impl CredentialsView {
                 view.api_keys = cfg.elevenlabs_api_keys;
             } else if !cfg.elevenlabs_api_key.is_empty() {
                 view.api_keys = vec![cfg.elevenlabs_api_key];
+            }
+            if let Some(ref model_id) = cfg.elevenlabs_model_id {
+                if !model_id.trim().is_empty() {
+                    view.model = ElevenLabsModel::from_str_id(model_id);
+                }
             }
         }
         view
@@ -252,53 +261,127 @@ impl CredentialsView {
         self.status_message = Some(format!("Model switched to {}", self.model.as_str()));
     }
 
-    /// Atomically persist current credentials to disk with restricted permissions 0600.
+    /// Atomically persist current credentials to disk with restricted permissions 0600,
+    /// preserving unrelated configuration lines in `.env`.
     pub fn save_to_disk(&mut self) -> Result<(), String> {
-        if let Some(parent) = self.env_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        crate::tui::ensure_parent_dir(&self.env_path)?;
+
+        let existing_lines: Vec<String> = if self.env_path.exists() {
+            std::fs::read_to_string(&self.env_path)
+                .map_err(|e| format!("Failed to read existing .env file: {e}"))?
+                .lines()
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let primary_key = self.api_keys.first().cloned().unwrap_or_default();
         let pool_str = self.api_keys.join(",");
 
-        let content = format!(
-            "# Viernes Voice Assistant Environment Configuration\n\
-             ELEVENLABS_API_KEY=\"{}\"\n\
-             ELEVENLABS_API_KEYS=\"{}\"\n\
-             ELEVENLABS_VOICE_ID=\"{}\"\n\
-             ELEVENLABS_MODEL_ID=\"{}\"\n",
-            primary_key,
-            pool_str,
-            self.voice_id,
-            self.model.as_str()
-        );
+        let mut new_lines = Vec::with_capacity(existing_lines.len() + 5);
+        if existing_lines.is_empty() {
+            new_lines.push("# Viernes Voice Assistant Environment Configuration".to_string());
+        }
 
-        let temp_path = self.env_path.with_extension("tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)
-                .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+        let mut api_key_found = false;
+        let mut api_keys_found = false;
+        let mut voice_id_found = false;
+        let mut model_id_found = false;
 
-            // Set POSIX 0600 permissions
-            let mut permissions = file
-                .metadata()
-                .map_err(|e| format!("Failed to read metadata: {e}"))?
-                .permissions();
-            permissions.set_mode(0o600);
-            file.set_permissions(permissions)
-                .map_err(|e| format!("Failed to set 0600 permissions: {e}"))?;
+        for line in existing_lines {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#') {
+                if let Some((k, _)) = trimmed.split_once('=') {
+                    match k.trim() {
+                        "ELEVENLABS_API_KEY" => {
+                            new_lines.push(format!("ELEVENLABS_API_KEY=\"{primary_key}\""));
+                            api_key_found = true;
+                            continue;
+                        }
+                        "ELEVENLABS_API_KEYS" => {
+                            new_lines.push(format!("ELEVENLABS_API_KEYS=\"{pool_str}\""));
+                            api_keys_found = true;
+                            continue;
+                        }
+                        "ELEVENLABS_VOICE_ID" => {
+                            new_lines.push(format!("ELEVENLABS_VOICE_ID=\"{}\"", self.voice_id));
+                            voice_id_found = true;
+                            continue;
+                        }
+                        "ELEVENLABS_MODEL_ID" => {
+                            new_lines
+                                .push(format!("ELEVENLABS_MODEL_ID=\"{}\"", self.model.as_str()));
+                            model_id_found = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            new_lines.push(line);
+        }
+
+        if !api_key_found {
+            new_lines.push(format!("ELEVENLABS_API_KEY=\"{primary_key}\""));
+        }
+        if !api_keys_found {
+            new_lines.push(format!("ELEVENLABS_API_KEYS=\"{pool_str}\""));
+        }
+        if !voice_id_found {
+            new_lines.push(format!("ELEVENLABS_VOICE_ID=\"{}\"", self.voice_id));
+        }
+        if !model_id_found {
+            new_lines.push(format!("ELEVENLABS_MODEL_ID=\"{}\"", self.model.as_str()));
+        }
+
+        let content = new_lines.join("\n") + "\n";
+
+        let file_name = self
+            .env_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("env");
+        let temp_path = self
+            .env_path
+            .with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+
+        let mut open_opts = OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+
+        let mut file = open_opts
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+
+        let write_result = (|| -> Result<(), String> {
+            #[cfg(unix)]
+            {
+                let mut permissions = file
+                    .metadata()
+                    .map_err(|e| format!("Failed to read metadata: {e}"))?
+                    .permissions();
+                permissions.set_mode(0o600);
+                file.set_permissions(permissions)
+                    .map_err(|e| format!("Failed to set 0600 permissions: {e}"))?;
+            }
 
             file.write_all(content.as_bytes())
                 .map_err(|e| format!("Failed to write content: {e}"))?;
             file.sync_all()
                 .map_err(|e| format!("Failed to sync temporary file: {e}"))?;
-        }
+            drop(file);
 
-        std::fs::rename(&temp_path, &self.env_path)
-            .map_err(|e| format!("Atomic rename failed: {e}"))?;
+            std::fs::rename(&temp_path, &self.env_path)
+                .map_err(|e| format!("Atomic rename failed: {e}"))?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
 
         self.has_unsaved_changes = false;
         self.status_message = Some("Credentials saved to ~/.config/viernes/.env (0600)".into());
@@ -314,18 +397,53 @@ impl CredentialsView {
         let test_phrase =
             phrase.unwrap_or("A la orden, Señor. Viernes en línea y lista para operar.");
 
-        let tts = ViernesTts::from_env();
-        let mut player = viernes_tts::player::StreamingAudioPlayer::create_resilient_player(None);
+        let provider_override = std::env::var("TTS_PROVIDER")
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
 
-        let audio_bytes = tts
-            .synthesize_resilient(test_phrase)
-            .await
-            .map_err(|e| format!("TTS synthesis error: {e}"))?;
+        let tts = if provider_override != "edge" && !self.api_keys.is_empty() {
+            let pool = viernes_tts::KeyPool::new(self.api_keys.clone());
+            let primary: Arc<dyn viernes_core::traits::TextToSpeech> =
+                Arc::new(viernes_tts::ElevenLabsClient::with_options(
+                    pool,
+                    Some(self.voice_id.clone()),
+                    Some(self.model.as_str().to_string()),
+                    None,
+                ));
+            let fallback: Arc<dyn viernes_core::traits::TextToSpeech> =
+                Arc::new(viernes_tts::EdgeTtsClient::new());
+            ViernesTts::new(primary, fallback)
+        } else {
+            ViernesTts::from_env()
+        };
 
-        player
-            .enqueue_chunk(audio_bytes)
-            .await
-            .map_err(|e| format!("Audio player enqueue error: {e}"))?;
+        let (ev_tx, mut ev_rx) = tokio::sync::broadcast::channel(8);
+        let mut player =
+            viernes_tts::player::StreamingAudioPlayer::create_resilient_player(Some(ev_tx));
+
+        let audio_bytes = match tts.synthesize_resilient(test_phrase).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.is_auditioning = false;
+                return Err(format!("TTS synthesis error: {e}").into());
+            }
+        };
+
+        if let Err(e) = player.enqueue_chunk(audio_bytes).await {
+            self.is_auditioning = false;
+            return Err(format!("Audio player enqueue error: {e}").into());
+        }
+
+        // Wait briefly for playback completion so audio isn't truncated on drop
+        let _ = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Ok(event) = ev_rx.recv().await {
+                if matches!(event, SystemEvent::PlaybackFinished) {
+                    break;
+                }
+            }
+        })
+        .await;
 
         self.is_auditioning = false;
         self.status_message = Some("Audición completada exitosamente".into());
@@ -532,9 +650,10 @@ impl CredentialsView {
             .style(Style::default().fg(Color::Cyan));
         f.render_widget(List::new(items).block(key_block), chunks[0]);
 
-        // 2. Add Key Input Buffer
+        // 2. Add Key Input Buffer (masked on screen)
         let add_key_text = if self.focus == CredentialsFocus::AddingKey {
-            format!("> {}_", self.input_buffer)
+            let masked_input = "*".repeat(self.input_buffer.chars().count());
+            format!("> {masked_input}_")
         } else {
             "Press [a] to add new ElevenLabs API Key".to_string()
         };
@@ -709,15 +828,16 @@ impl CredentialsView {
     }
 }
 
-/// Mask an ElevenLabs API key showing prefix and suffix.
+/// Mask an ElevenLabs API key showing prefix and suffix (UTF-8 char-boundary safe).
 #[must_use]
 pub fn mask_api_key(key: &str) -> String {
     let trimmed = key.trim();
-    if trimmed.len() <= 10 {
+    let char_count = trimmed.chars().count();
+    if char_count <= 10 {
         return "sk_***".into();
     }
-    let prefix = &trimmed[..6.min(trimmed.len())];
-    let suffix = &trimmed[trimmed.len().saturating_sub(4)..];
+    let prefix: String = trimmed.chars().take(6).collect();
+    let suffix: String = trimmed.chars().skip(char_count - 4).collect();
     format!("{prefix}...{suffix}")
 }
 
@@ -904,5 +1024,78 @@ ELEVENLABS_API_KEYS="sk_11111111111111111111111111111111,sk_22222222222222222222
         view.delete_selected_key()?;
         assert_eq!(view.api_keys.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_save_to_disk_preserves_unrelated_env_keys_and_0600(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let env_file = dir.path().join(".env");
+        let existing = "\
+# Custom comment
+AUDIO_DUCKING_ENABLED=true
+AUDIO_DUCKING_VOLUME_PERCENT=35
+VIERNES_VOLUME_PERCENT=145
+VAD_THRESHOLD=0.025
+SILENCE_TIMEOUT_MS=900
+AUDIO_INPUT_DEVICE=\"USB Mic Studio\"
+AUDIO_OUTPUT_DEVICE=\"Headphones Analog\"
+ELEVENLABS_API_KEY=\"sk_old111111111111111111111111111111\"
+";
+        std::fs::write(&env_file, existing)?;
+
+        let mut view = CredentialsView::from_path(Some(env_file.clone()));
+        let new_key = "sk_new1234567890abcdef1234567890abcd";
+        view.api_keys = vec![new_key.to_string()];
+        view.update_voice_id("21m00Tcm4TlvDq8ikWAM")?;
+        view.model = ElevenLabsModel::TurboV2_5;
+        view.save_to_disk()?;
+
+        let saved = std::fs::read_to_string(&env_file)?;
+        assert!(saved.contains("# Custom comment"));
+        assert!(saved.contains("AUDIO_DUCKING_ENABLED=true"));
+        assert!(saved.contains("AUDIO_DUCKING_VOLUME_PERCENT=35"));
+        assert!(saved.contains("VIERNES_VOLUME_PERCENT=145"));
+        assert!(saved.contains("VAD_THRESHOLD=0.025"));
+        assert!(saved.contains("SILENCE_TIMEOUT_MS=900"));
+        assert!(saved.contains("AUDIO_INPUT_DEVICE=\"USB Mic Studio\""));
+        assert!(saved.contains("AUDIO_OUTPUT_DEVICE=\"Headphones Analog\""));
+        assert!(saved.contains(&format!("ELEVENLABS_API_KEY=\"{new_key}\"")));
+        assert!(saved.contains(&format!("ELEVENLABS_API_KEYS=\"{new_key}\"")));
+        assert!(saved.contains("ELEVENLABS_VOICE_ID=\"21m00Tcm4TlvDq8ikWAM\""));
+        assert!(saved.contains("ELEVENLABS_MODEL_ID=\"eleven_turbo_v2_5\""));
+
+        let mode = std::fs::metadata(&env_file)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_api_key_utf8_multibyte_safe() {
+        let utf8_key = "sk_áéíóúñ1234567890";
+        let masked = mask_api_key(utf8_key);
+        assert_eq!(masked, "sk_áéí...7890");
+
+        let short_utf8 = "sk_áéí";
+        assert_eq!(mask_api_key(short_utf8), "sk_***");
+    }
+
+    #[test]
+    fn test_adding_key_input_is_masked_on_render() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = tempdir().unwrap();
+        let mut view = CredentialsView::from_path(Some(dir.path().join(".env")));
+        view.focus = CredentialsFocus::AddingKey;
+        view.input_buffer = "sk_secret_1234567890".to_string();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| view.render(f, f.area())).unwrap();
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(!rendered.contains("sk_secret_1234567890"));
+        assert!(rendered.contains("********************"));
     }
 }

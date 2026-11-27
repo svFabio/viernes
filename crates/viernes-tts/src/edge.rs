@@ -1,4 +1,8 @@
-//! Native async WebSocket client for Microsoft Edge Text-to-Speech fallback.
+//! Asynchronous Edge-TTS fallback client with CLI subprocess execution and protocol helpers.
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use viernes_core::error::ViernesError;
@@ -10,8 +14,9 @@ use crate::error::TtsError;
 const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const DEFAULT_EDGE_VOICE: &str = "es-CO-SalomeNeural";
 const DEFAULT_AUDIO_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
+const EDGE_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Native asynchronous Edge-TTS fallback provider communicating directly over WebSockets.
+/// Asynchronous Edge-TTS fallback provider backed by the `edge-tts` CLI with WebSocket/SSML helpers.
 #[derive(Debug, Clone)]
 pub struct EdgeTtsClient {
     voice: String,
@@ -77,7 +82,7 @@ impl EdgeTtsClient {
     pub fn build_config_message(audio_format: &str) -> String {
         format!(
             "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n\
-            {{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"{}\"}}}}}}",
+            {{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"{}\"}}}}}}}}",
             audio_format
         )
     }
@@ -134,56 +139,36 @@ impl EdgeTtsClient {
         self.synthesize_via_cli(trimmed).await
     }
 
+    /// Builds CLI arguments for `edge-tts`, using `--flag=value` syntax to prevent flag injection
+    /// when input text or negative prosody values start with `-`.
+    fn build_cli_args(&self, text: &str) -> Vec<String> {
+        vec![
+            format!("--text={text}"),
+            format!("--voice={}", self.voice),
+            format!("--rate={}", self.rate),
+            format!("--pitch={}", self.pitch),
+            "--write-media".to_string(),
+            "-".to_string(),
+        ]
+    }
+
     /// Synthesizes speech using the local `edge-tts` tool with automatic DRM v2 negotiation
     /// and zero-disk in-memory stdout piping.
     pub async fn synthesize_via_cli(&self, text: &str) -> Result<Vec<u8>, TtsError> {
-        let edge_bin = if let Ok(home) = std::env::var("HOME") {
-            let p = std::path::PathBuf::from(home).join(".local/bin/edge-tts");
-            if p.exists() {
-                p
-            } else {
-                std::path::PathBuf::from("edge-tts")
-            }
-        } else {
-            std::path::PathBuf::from("edge-tts")
-        };
-
-        let mut cmd = if edge_bin.exists() {
+        let mut cmd = if let Some(edge_bin) = resolve_binary("edge-tts") {
             tokio::process::Command::new(edge_bin)
         } else {
-            let uv_bin = if let Ok(home) = std::env::var("HOME") {
-                let p = std::path::PathBuf::from(home).join(".local/bin/uv");
-                if p.exists() {
-                    p
-                } else {
-                    std::path::PathBuf::from("uv")
-                }
-            } else {
-                std::path::PathBuf::from("uv")
-            };
+            let uv_bin = resolve_binary("uv").unwrap_or_else(|| PathBuf::from("uv"));
             let mut c = tokio::process::Command::new(uv_bin);
             c.args(["run", "--with", "edge-tts", "edge-tts"]);
             c
         };
 
-        cmd.arg("--text")
-            .arg(text)
-            .arg("--voice")
-            .arg(&self.voice)
-            .arg("--rate")
-            .arg(&self.rate)
-            .arg("--pitch")
-            .arg(&self.pitch)
-            .arg("--write-media")
-            .arg("-");
-
+        cmd.args(self.build_cli_args(text));
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| TtsError::Protocol(format!("Failed to spawn edge-tts: {e}")))?;
+        let output = run_cli_with_timeout(&mut cmd, EDGE_CLI_TIMEOUT).await?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -198,6 +183,48 @@ impl EdgeTtsClient {
 
         Ok(output.stdout)
     }
+}
+
+/// Resolves a binary by checking `~/.local/bin/<name>` first, then scanning `$PATH`.
+fn resolve_binary(name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path_env = std::env::var_os("PATH");
+    resolve_binary_in(name, home.as_deref(), path_env.as_deref())
+}
+
+/// Pure helper resolving `<name>` from `<home>/.local/bin` or `$PATH` entries.
+fn resolve_binary_in(name: &str, home: Option<&Path>, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(home_dir) = home {
+        let candidate = home_dir.join(".local/bin").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(paths) = path_env {
+        for dir in std::env::split_paths(paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Executes a child command with `.kill_on_drop(true)` and a hard timeout.
+async fn run_cli_with_timeout(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, TtsError> {
+    cmd.kill_on_drop(true);
+    tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| {
+            TtsError::Protocol(format!("edge-tts timed out after {}s", timeout.as_secs()))
+        })?
+        .map_err(|e| TtsError::Protocol(format!("Failed to spawn edge-tts: {e}")))
 }
 
 #[async_trait]
@@ -230,6 +257,13 @@ mod tests {
         let msg = EdgeTtsClient::build_config_message("audio-24khz-48kbitrate-mono-mp3");
         assert!(msg.contains("Path:speech.config"));
         assert!(msg.contains("audio-24khz-48kbitrate-mono-mp3"));
+
+        let (_headers, json_body) = msg.split_once("\r\n\r\n").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_body).unwrap();
+        assert_eq!(
+            parsed["context"]["synthesis"]["audio"]["outputFormat"],
+            "audio-24khz-48kbitrate-mono-mp3"
+        );
     }
 
     #[test]
@@ -279,5 +313,62 @@ mod tests {
         let client = EdgeTtsClient::new();
         let res = client.synthesize("   ").await;
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_resolve_binary_prefers_local_bin_then_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("home");
+        let local_bin = home_dir.join(".local/bin");
+        let path_dir = tmp.path().join("usr_bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&path_dir).unwrap();
+
+        let path_edge = path_dir.join("edge-tts");
+        std::fs::write(&path_edge, b"").unwrap();
+        let joined_path = std::env::join_paths([&path_dir]).unwrap();
+
+        // Only in $PATH -> resolves to $PATH binary
+        assert_eq!(
+            resolve_binary_in("edge-tts", Some(&home_dir), Some(&joined_path)),
+            Some(path_edge)
+        );
+
+        // Also present in ~/.local/bin -> prefers ~/.local/bin
+        let local_edge = local_bin.join("edge-tts");
+        std::fs::write(&local_edge, b"").unwrap();
+        assert_eq!(
+            resolve_binary_in("edge-tts", Some(&home_dir), Some(&joined_path)),
+            Some(local_edge)
+        );
+
+        // Missing binary -> None
+        assert_eq!(
+            resolve_binary_in("nonexistent-bin", Some(&home_dir), Some(&joined_path)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cli_args_prevent_leading_dash_flag_injection() {
+        let client = EdgeTtsClient::with_voice("es-CO-SalomeNeural");
+        let args = client.build_cli_args("-5 grados bajo cero");
+        assert!(args.iter().any(|a| a == "--text=-5 grados bajo cero"));
+        assert!(!args.iter().any(|a| a == "-5 grados bajo cero"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_subprocess_timeout_kills_hung_process() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 5"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let start = std::time::Instant::now();
+        let err = run_cli_with_timeout(&mut cmd, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

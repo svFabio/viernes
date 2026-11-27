@@ -1,15 +1,14 @@
 //! Temporary storage cache manager with retention policies, quota eviction, and shutdown cleanup.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use viernes_core::error::ViernesError;
 
-const DEFAULT_TEMP_DIR: &str = "/tmp/viernes";
 const DEFAULT_TTL: Duration = Duration::from_secs(2 * 60 * 60); // 2 hours
 const DEFAULT_MAX_QUOTA_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_TARGET_QUOTA_BYTES: u64 = 70 * 1024 * 1024; // 70 MB target after purge
@@ -21,6 +20,19 @@ struct FileMeta {
     modified: SystemTime,
 }
 
+/// Sanitizes a temporary audio filename prefix to prevent path traversal.
+fn sanitize_prefix(prefix: &str) -> String {
+    let clean: String = prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if clean.is_empty() {
+        "audio".to_string()
+    } else {
+        clean
+    }
+}
+
 /// Thread-safe temporary storage manager ensuring safe disk usage and user privacy.
 #[derive(Debug)]
 pub struct TempStorageManager {
@@ -28,11 +40,12 @@ pub struct TempStorageManager {
     ttl: Duration,
     max_quota_bytes: u64,
     target_quota_bytes: u64,
+    lock: Mutex<()>,
 }
 
 impl Default for TempStorageManager {
     fn default() -> Self {
-        Self::new(PathBuf::from(DEFAULT_TEMP_DIR))
+        Self::new(viernes_core::default_temp_dir_path())
     }
 }
 
@@ -59,51 +72,75 @@ impl TempStorageManager {
             ttl,
             max_quota_bytes,
             target_quota_bytes,
+            lock: Mutex::new(()),
         };
-        let _ = manager.ensure_directory_secure();
+        if let Err(err) = manager.ensure_directory_secure() {
+            warn!(
+                path = %manager.dir.display(),
+                error = %err,
+                "Failed to initialize private temporary audio directory"
+            );
+        }
         manager
     }
 
     /// Ensures the temporary storage directory exists with restricted `0700` user permissions.
     pub fn ensure_directory_secure(&self) -> Result<(), ViernesError> {
-        if !self.dir.exists() {
-            fs::create_dir_all(&self.dir).map_err(ViernesError::Io)?;
-        }
-
-        // Set POSIX 0700 permissions (read/write/exec only for owner)
-        let mut permissions = fs::metadata(&self.dir)
-            .map_err(ViernesError::Io)?
-            .permissions();
-
-        permissions.set_mode(0o700);
-        fs::set_permissions(&self.dir, permissions).map_err(ViernesError::Io)?;
-
+        viernes_core::ensure_private_dir(&self.dir).map_err(ViernesError::Io)?;
         debug!(path = %self.dir.display(), "Temporary directory secured with 0700 permissions");
         Ok(())
     }
 
-    /// Writes temporary audio bytes to a securely generated file inside the temp folder.
+    /// Writes temporary audio bytes to a securely generated file (`0600` on Unix) inside the temp folder.
     pub fn write_temp_audio(&self, prefix: &str, bytes: &[u8]) -> Result<PathBuf, ViernesError> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.ensure_directory_secure()?;
 
+        let safe_prefix = sanitize_prefix(prefix);
         let file_name = format!(
             "{}_{}_{}.mp3",
-            prefix,
+            safe_prefix,
             std::process::id(),
             Uuid::new_v4().simple()
         );
         let file_path = self.dir.join(file_name);
 
-        fs::write(&file_path, bytes).map_err(ViernesError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file_path)
+                .map_err(ViernesError::Io)?;
+            file.write_all(bytes).map_err(ViernesError::Io)?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&file_path, bytes).map_err(ViernesError::Io)?;
+        }
 
-        // Run quota check after write
-        let _ = self.purge_excess_and_expired();
+        // Run quota check after write while holding lock
+        if let Err(err) = self.purge_excess_and_expired_locked() {
+            warn!(
+                path = %self.dir.display(),
+                error = %err,
+                "Failed to purge expired or excess temporary audio files after write"
+            );
+        }
 
         Ok(file_path)
     }
 
     /// Scans the directory and purges files older than the configured TTL or exceeding quota.
     pub fn purge_excess_and_expired(&self) -> Result<usize, ViernesError> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.purge_excess_and_expired_locked()
+    }
+
+    fn purge_excess_and_expired_locked(&self) -> Result<usize, ViernesError> {
         if !self.dir.exists() {
             return Ok(0);
         }
@@ -117,29 +154,35 @@ impl TempStorageManager {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    let size = meta.len();
-                    let modified = meta.modified().unwrap_or(now);
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
 
-                    // Check TTL expiration
-                    if let Ok(age) = now.duration_since(modified) {
-                        if age > self.ttl {
-                            debug!(path = %path.display(), age_secs = age.as_secs(), "Purging expired audio file");
-                            let _ = fs::remove_file(&path);
-                            purged_count += 1;
-                            continue;
-                        }
+            let size = meta.len();
+            let modified = meta.modified().unwrap_or(now);
+
+            // Check TTL expiration
+            if let Ok(age) = now.duration_since(modified) {
+                if age > self.ttl {
+                    debug!(path = %path.display(), age_secs = age.as_secs(), "Purging expired audio file");
+                    if let Err(err) = fs::remove_file(&path) {
+                        warn!(path = %path.display(), error = %err, "Failed to remove expired audio file");
+                    } else {
+                        purged_count += 1;
                     }
-
-                    total_size += size;
-                    files.push(FileMeta {
-                        path,
-                        size,
-                        modified,
-                    });
+                    continue;
                 }
             }
+
+            total_size += size;
+            files.push(FileMeta {
+                path,
+                size,
+                modified,
+            });
         }
 
         // Check disk quota threshold
@@ -170,6 +213,11 @@ impl TempStorageManager {
 
     /// Cleans all temporary audio fragments upon system shutdown.
     pub fn clean_all(&self) -> Result<usize, ViernesError> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.clean_all_locked()
+    }
+
+    fn clean_all_locked(&self) -> Result<usize, ViernesError> {
         if !self.dir.exists() {
             return Ok(0);
         }
@@ -178,7 +226,13 @@ impl TempStorageManager {
         let entries = fs::read_dir(&self.dir).map_err(ViernesError::Io)?;
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() && fs::remove_file(&p).is_ok() {
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            if fs::remove_file(&p).is_ok() {
                 count += 1;
             }
         }
@@ -199,14 +253,30 @@ impl TempStorageManager {
 
 impl Drop for TempStorageManager {
     fn drop(&mut self) {
-        let _ = self.purge_excess_and_expired();
+        if let Err(err) = self.clean_all() {
+            warn!(
+                path = %self.dir.display(),
+                error = %err,
+                "Failed to clean temporary audio files on drop"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_default_uses_core_temp_dir_path() {
+        assert_eq!(
+            TempStorageManager::default().dir(),
+            viernes_core::default_temp_dir_path()
+        );
+    }
 
     #[test]
     fn test_secure_directory_creation_and_write() {
@@ -222,8 +292,74 @@ mod tests {
         assert!(path.exists());
         assert!(fs::read(&path).unwrap() == b"mock mp3 bytes");
 
-        let perms = fs::metadata(&target_dir).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o700);
+        #[cfg(unix)]
+        {
+            let dir_perms = fs::metadata(&target_dir).unwrap().permissions();
+            assert_eq!(dir_perms.mode() & 0o777, 0o700);
+            let file_perms = fs::metadata(&path).unwrap().permissions();
+            assert_eq!(file_perms.mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_prefix_sanitization_prevents_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let target_dir = tmp.path().join("viernes_sanitize");
+        let manager = TempStorageManager::new(target_dir.clone());
+
+        let p1 = manager.write_temp_audio("../../etc/passwd", b"x").unwrap();
+        assert_eq!(p1.parent().unwrap(), target_dir.as_path());
+        assert!(p1
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("etcpasswd_"));
+
+        let p2 = manager.write_temp_audio("../..", b"y").unwrap();
+        assert_eq!(p2.parent().unwrap(), target_dir.as_path());
+        assert!(p2
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("audio_"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinks_are_skipped_during_purge_and_clean_all() {
+        let tmp = tempdir().unwrap();
+        let outside_file = tmp.path().join("outside.txt");
+        fs::write(&outside_file, b"keep me").unwrap();
+
+        let target_dir = tmp.path().join("viernes_symlink_test");
+        let manager =
+            TempStorageManager::with_policies(target_dir.clone(), Duration::from_secs(0), 10, 5);
+
+        let link_path = target_dir.join("sneaky.mp3");
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+        let real_file = manager.write_temp_audio("real", b"123456789012").unwrap();
+        assert!(!real_file.exists() || manager.purge_excess_and_expired().is_ok());
+
+        let removed = manager.clean_all().unwrap();
+        assert_eq!(removed, 0);
+        assert!(fs::symlink_metadata(&link_path).is_ok());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn test_drop_cleans_all_files() {
+        let tmp = tempdir().unwrap();
+        let target_dir = tmp.path().join("viernes_drop_test");
+        let file_path = {
+            let manager = TempStorageManager::new(target_dir);
+            let p = manager.write_temp_audio("f1", b"123").unwrap();
+            assert!(p.exists());
+            p
+        };
+        assert!(!file_path.exists());
     }
 
     #[test]

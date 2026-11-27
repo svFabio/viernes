@@ -65,6 +65,24 @@ impl CpalDeviceEnumerator {
     }
 }
 
+fn inspect_device_caps<I>(configs: I) -> (u16, Vec<u32>)
+where
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    let mut max_channels = 0;
+    let mut sample_rates = Vec::new();
+    for c in configs {
+        if c.channels() > max_channels {
+            max_channels = c.channels();
+        }
+        sample_rates.push(c.min_sample_rate().0);
+        sample_rates.push(c.max_sample_rate().0);
+    }
+    sample_rates.sort_unstable();
+    sample_rates.dedup();
+    (max_channels, sample_rates)
+}
+
 impl DeviceEnumerator for CpalDeviceEnumerator {
     fn list_input_devices(&self) -> Result<Vec<AudioDeviceInfo>, ViernesError> {
         let host = cpal::default_host();
@@ -81,19 +99,10 @@ impl DeviceEnumerator for CpalDeviceEnumerator {
                 .unwrap_or_else(|_| format!("Input Device #{index}"));
             let is_default = default_name.as_deref() == Some(&name);
 
-            let mut max_channels = 0;
-            let mut sample_rates = Vec::new();
-            if let Ok(configs) = dev.supported_input_configs() {
-                for c in configs {
-                    if c.channels() > max_channels {
-                        max_channels = c.channels();
-                    }
-                    sample_rates.push(c.min_sample_rate().0);
-                    sample_rates.push(c.max_sample_rate().0);
-                }
-            }
-            sample_rates.sort_unstable();
-            sample_rates.dedup();
+            let (max_channels, sample_rates) = dev
+                .supported_input_configs()
+                .map(inspect_device_caps)
+                .unwrap_or((0, Vec::new()));
 
             list.push(AudioDeviceInfo {
                 index,
@@ -122,19 +131,10 @@ impl DeviceEnumerator for CpalDeviceEnumerator {
                 .unwrap_or_else(|_| format!("Output Device #{index}"));
             let is_default = default_name.as_deref() == Some(&name);
 
-            let mut max_channels = 0;
-            let mut sample_rates = Vec::new();
-            if let Ok(configs) = dev.supported_output_configs() {
-                for c in configs {
-                    if c.channels() > max_channels {
-                        max_channels = c.channels();
-                    }
-                    sample_rates.push(c.min_sample_rate().0);
-                    sample_rates.push(c.max_sample_rate().0);
-                }
-            }
-            sample_rates.sort_unstable();
-            sample_rates.dedup();
+            let (max_channels, sample_rates) = dev
+                .supported_output_configs()
+                .map(inspect_device_caps)
+                .unwrap_or((0, Vec::new()));
 
             list.push(AudioDeviceInfo {
                 index,
@@ -149,13 +149,65 @@ impl DeviceEnumerator for CpalDeviceEnumerator {
     }
 
     fn default_input_device(&self) -> Result<Option<AudioDeviceInfo>, ViernesError> {
-        let inputs = self.list_input_devices()?;
-        Ok(inputs.into_iter().find(|d| d.is_default))
+        let host = cpal::default_host();
+        let Some(dev) = host.default_input_device() else {
+            return Ok(None);
+        };
+        let name = dev
+            .name()
+            .unwrap_or_else(|_| "Default Input Device".to_string());
+        let index = host
+            .input_devices()
+            .ok()
+            .and_then(|devs| {
+                devs.enumerate()
+                    .find(|(_, d)| d.name().ok().as_deref() == Some(&name))
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        let (max_channels, sample_rates) = dev
+            .supported_input_configs()
+            .map(inspect_device_caps)
+            .unwrap_or((0, Vec::new()));
+
+        Ok(Some(AudioDeviceInfo {
+            index,
+            name,
+            is_default: true,
+            max_channels,
+            sample_rates,
+        }))
     }
 
     fn default_output_device(&self) -> Result<Option<AudioDeviceInfo>, ViernesError> {
-        let outputs = self.list_output_devices()?;
-        Ok(outputs.into_iter().find(|d| d.is_default))
+        let host = cpal::default_host();
+        let Some(dev) = host.default_output_device() else {
+            return Ok(None);
+        };
+        let name = dev
+            .name()
+            .unwrap_or_else(|_| "Default Output Device".to_string());
+        let index = host
+            .output_devices()
+            .ok()
+            .and_then(|devs| {
+                devs.enumerate()
+                    .find(|(_, d)| d.name().ok().as_deref() == Some(&name))
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        let (max_channels, sample_rates) = dev
+            .supported_output_configs()
+            .map(inspect_device_caps)
+            .unwrap_or((0, Vec::new()));
+
+        Ok(Some(AudioDeviceInfo {
+            index,
+            name,
+            is_default: true,
+            max_channels,
+            sample_rates,
+        }))
     }
 }
 
@@ -230,10 +282,10 @@ pub fn resolve_input_device_from_env(
     enumerator: &dyn DeviceEnumerator,
 ) -> Result<Option<AudioDeviceInfo>, ViernesError> {
     let devices = enumerator.list_input_devices()?;
-    let default_dev = enumerator.default_input_device()?;
+    let default_dev = devices.iter().find(|d| d.is_default);
     let env_query = std::env::var("AUDIO_INPUT_DEVICE").ok();
 
-    Ok(resolve_device(env_query.as_deref(), &devices, default_dev.as_ref()).cloned())
+    Ok(resolve_device(env_query.as_deref(), &devices, default_dev).cloned())
 }
 
 /// Resolves the output audio device respecting the `AUDIO_OUTPUT_DEVICE` environment variable.
@@ -241,10 +293,10 @@ pub fn resolve_output_device_from_env(
     enumerator: &dyn DeviceEnumerator,
 ) -> Result<Option<AudioDeviceInfo>, ViernesError> {
     let devices = enumerator.list_output_devices()?;
-    let default_dev = enumerator.default_output_device()?;
+    let default_dev = devices.iter().find(|d| d.is_default);
     let env_query = std::env::var("AUDIO_OUTPUT_DEVICE").ok();
 
-    Ok(resolve_device(env_query.as_deref(), &devices, default_dev.as_ref()).cloned())
+    Ok(resolve_device(env_query.as_deref(), &devices, default_dev).cloned())
 }
 
 /// Hermetic fake device enumerator for unit tests and CI runners.

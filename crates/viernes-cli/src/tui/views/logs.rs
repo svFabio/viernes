@@ -90,15 +90,20 @@ impl LogEntry {
         let raw = line.into();
         let severity = LogSeverity::parse(&raw);
 
-        // Simple heuristic extraction of timestamp if present
+        // Simple heuristic extraction of timestamp if present (UTF-8 char-boundary safe)
         let (timestamp, message) =
-            if raw.len() >= 8 && raw.chars().nth(2) == Some(':') && raw.chars().nth(5) == Some(':')
-            {
-                let ts = raw[..8].to_string();
-                let msg = raw[8..].trim_start().to_string();
-                (ts, msg)
+            if raw.chars().nth(2) == Some(':') && raw.chars().nth(5) == Some(':') {
+                if let Some((split_idx, _)) = raw.char_indices().nth(8) {
+                    let ts = raw[..split_idx].to_string();
+                    let msg = raw[split_idx..].trim_start().to_string();
+                    (ts, msg)
+                } else if raw.chars().count() == 8 {
+                    (raw.clone(), String::new())
+                } else {
+                    (String::new(), raw.clone())
+                }
             } else {
-                ("".to_string(), raw.clone())
+                (String::new(), raw.clone())
             };
 
         Self {
@@ -442,5 +447,21 @@ mod tests {
                 logs.render(f, f.area());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_log_entry_utf8_multibyte_prefix_no_panic() {
+        let entry = LogEntry::new("é1:23:45 msg");
+        assert_eq!(entry.timestamp, "é1:23:45");
+        assert_eq!(entry.message, "msg");
+
+        let entry_tail_utf8 = LogEntry::new("é1:23:4é [INFO] hola");
+        assert_eq!(entry_tail_utf8.timestamp, "é1:23:4é");
+        assert_eq!(entry_tail_utf8.message, "[INFO] hola");
+        assert_eq!(entry_tail_utf8.severity, LogSeverity::Info);
+
+        let short_utf8 = LogEntry::new("é1:23:4");
+        assert_eq!(short_utf8.timestamp, "");
+        assert_eq!(short_utf8.message, "é1:23:4");
     }
 }

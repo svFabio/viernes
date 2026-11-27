@@ -1,18 +1,29 @@
 //! Application state, navigation tabs, dashboard rendering, and user input orchestration.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use tokio::sync::mpsc;
+use viernes_audio::capture::{AudioCaptureConfig, CpalAudioCapture};
+use viernes_audio::vad::compute_rms;
 use viernes_core::config::ViernesConfig;
 use viernes_core::state::{DaemonLiveStatus, SystemState};
+use viernes_core::traits::AudioCapture;
 
 use crate::tui::views::credentials::{CredentialsAction, CredentialsView};
 use crate::tui::views::devices::DevicesView;
 use crate::tui::views::fillers::{FillersAction, FillersView};
-use crate::tui::views::service::ServiceView;
+use crate::tui::views::service::{
+    fetch_journal_logs_async, probe_health_async, reset_session_async, restart_service_async,
+    start_service_async, stop_service_async, DaemonHealth, ServiceView,
+};
 use crate::tui::widgets::ptt::ptt_socket_path;
 use crate::tui::widgets::{
     send_ipc_ptt, ConversationTurn, ConversationWidget, PttWidget, Speaker, SpectrumWidget,
@@ -98,12 +109,50 @@ impl ActiveTab {
     }
 }
 
+/// Converts raw PCM audio samples into a normalized VU meter level `[0.0, 1.0]`.
+#[must_use]
+pub fn rms_to_vu_level(samples: &[f32]) -> f32 {
+    let rms = compute_rms(samples);
+    if rms.is_finite() {
+        (rms * 3.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Messages delivered from background async tasks back to [`TuiApp`].
+#[derive(Debug)]
+enum TuiBackgroundMsg {
+    DaemonStatusLoaded {
+        status: Option<DaemonLiveStatus>,
+        daemon_connected: bool,
+    },
+    HealthRefreshed(DaemonHealth),
+    JournalLogsLoaded(Vec<String>),
+    ServiceActionFinished {
+        success_toast: &'static str,
+        success_log: &'static str,
+        error_prefix: &'static str,
+        result: Result<(), String>,
+    },
+    AuditionFinished(Result<String, String>),
+    IpcReloadFinished {
+        context: &'static str,
+        result: Result<(), String>,
+    },
+    MicLevelUpdated(f32),
+    MicTestStatus(String),
+    MicTestFailed(String),
+}
+
 /// Unified application state for the Viernes TUI.
 pub struct TuiApp {
     /// Currently visible tab.
     pub active_tab: ActiveTab,
     /// Flag signaling main event loop termination.
     pub should_quit: bool,
+    /// Confirmation prompt shown when quitting with unsaved changes in Tabs 2/3/4.
+    pub show_quit_confirm: bool,
     /// Number of ticks elapsed for 30 FPS animation.
     pub tick_count: u64,
 
@@ -141,6 +190,22 @@ pub struct TuiApp {
     pub last_terminal_width: u16,
     /// Last recorded terminal height for responsive layout and click mapping.
     pub last_terminal_height: u16,
+
+    // --- Async background task coordination ---
+    bg_tx: mpsc::UnboundedSender<TuiBackgroundMsg>,
+    bg_rx: mpsc::UnboundedReceiver<TuiBackgroundMsg>,
+    status_poll_in_flight: bool,
+    health_poll_in_flight: bool,
+    logs_poll_in_flight: bool,
+    mic_test_stop: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        if let Some(stop) = self.mic_test_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Convenience alias for `TuiApp`.
@@ -183,11 +248,13 @@ impl TuiApp {
             }
         }
 
-        let daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
+        let daemon_connected = ptt_socket_path().exists();
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
         Self {
             active_tab: ActiveTab::Monitor,
             should_quit: false,
+            show_quit_confirm: false,
             tick_count: 0,
             credentials_view: CredentialsView::new(config.clone()),
             config: config.clone(),
@@ -204,6 +271,306 @@ impl TuiApp {
             last_ptt_toggle: std::time::Instant::now() - std::time::Duration::from_secs(1),
             last_terminal_width: 80,
             last_terminal_height: 24,
+            bg_tx,
+            bg_rx,
+            status_poll_in_flight: false,
+            health_poll_in_flight: false,
+            logs_poll_in_flight: false,
+            mic_test_stop: None,
+        }
+    }
+
+    /// Returns `true` if any configuration tab (2, 3, or 4) has unsaved edits.
+    #[must_use]
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.credentials_view.has_unsaved_changes
+            || self.fillers_view.has_unsaved_changes
+            || self.devices_view.has_unsaved_ducking_changes
+    }
+
+    /// Applies an updated daemon live status snapshot to TUI state and turn history.
+    pub fn apply_daemon_status(
+        &mut self,
+        status: Option<DaemonLiveStatus>,
+        daemon_connected: bool,
+    ) {
+        if let Some(status) = status {
+            self.daemon_connected = true;
+            if !self.ptt_active {
+                self.assistant_state = status.state;
+            }
+
+            if status.turn_counter > self.last_synced_turn {
+                if !status.last_user_prompt.is_empty() {
+                    self.add_turn(Speaker::User, status.last_user_prompt.clone());
+                }
+                if !status.last_assistant_text.is_empty() {
+                    self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                }
+                self.last_synced_turn = status.turn_counter;
+            } else if !status.last_assistant_text.is_empty() {
+                if let Some(last) = self.turns.last_mut() {
+                    if last.speaker == Speaker::Viernes {
+                        if last.text != status.last_assistant_text {
+                            last.text = status.last_assistant_text.clone();
+                        }
+                    } else {
+                        self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                    }
+                } else {
+                    self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
+                }
+            }
+        } else {
+            self.daemon_connected = daemon_connected;
+        }
+    }
+
+    fn spawn_status_poll(&mut self) {
+        if self.status_poll_in_flight {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.status_poll_in_flight = true;
+        let tx = self.bg_tx.clone();
+        handle.spawn(async move {
+            let res = tokio::task::spawn_blocking(|| {
+                let status = DaemonLiveStatus::read_from_disk();
+                let daemon_connected = ptt_socket_path().exists();
+                (status, daemon_connected)
+            })
+            .await;
+
+            let (status, daemon_connected) = res.unwrap_or((None, false));
+            let _ = tx.send(TuiBackgroundMsg::DaemonStatusLoaded {
+                status,
+                daemon_connected,
+            });
+        });
+    }
+
+    fn spawn_health_refresh(&mut self) {
+        if self.health_poll_in_flight {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.health_poll_in_flight = true;
+        let tx = self.bg_tx.clone();
+        let socket_path = self.service_view.ipc_socket_path.clone();
+        handle.spawn(async move {
+            let health = probe_health_async(socket_path).await;
+            let _ = tx.send(TuiBackgroundMsg::HealthRefreshed(health));
+        });
+    }
+
+    fn spawn_journal_logs_refresh(&mut self) {
+        if self.logs_poll_in_flight {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.logs_poll_in_flight = true;
+        let tx = self.bg_tx.clone();
+        handle.spawn(async move {
+            let lines = fetch_journal_logs_async(100).await;
+            let _ = tx.send(TuiBackgroundMsg::JournalLogsLoaded(lines));
+        });
+    }
+
+    fn spawn_ipc_reload(&self, context: &'static str) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let tx = self.bg_tx.clone();
+        handle.spawn(async move {
+            let result = send_ipc_ptt("reload").await.map_err(|e| e.to_string());
+            let _ = tx.send(TuiBackgroundMsg::IpcReloadFinished { context, result });
+        });
+    }
+
+    fn spawn_voice_audition(&mut self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.credentials_view.is_auditioning = false;
+            return;
+        };
+        let mut cv = self.credentials_view.clone();
+        let tx = self.bg_tx.clone();
+        handle.spawn(async move {
+            let res = cv
+                .test_audition(None)
+                .await
+                .map(|()| "Audición completada exitosamente".to_string())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(TuiBackgroundMsg::AuditionFinished(res));
+        });
+    }
+
+    fn spawn_service_action<F>(
+        &mut self,
+        log_cmd: &str,
+        success_toast: &'static str,
+        success_log: &'static str,
+        error_prefix: &'static str,
+        fut: F,
+    ) where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.service_view.logs.push_line(log_cmd);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let tx = self.bg_tx.clone();
+        let socket_path = self.service_view.ipc_socket_path.clone();
+        handle.spawn(async move {
+            let result = fut.await;
+            let ok = result.is_ok();
+            let _ = tx.send(TuiBackgroundMsg::ServiceActionFinished {
+                success_toast,
+                success_log,
+                error_prefix,
+                result,
+            });
+            if ok {
+                let health = probe_health_async(socket_path).await;
+                let _ = tx.send(TuiBackgroundMsg::HealthRefreshed(health));
+            }
+        });
+    }
+
+    fn sync_mic_test_task(&mut self) {
+        if self.devices_view.is_testing_mic {
+            if self.mic_test_stop.is_some() {
+                return;
+            }
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            self.mic_test_stop = Some(stop_flag.clone());
+            let tx = self.bg_tx.clone();
+            let device_query = self
+                .devices_view
+                .selected_input_device()
+                .map(|d| d.name.clone());
+
+            handle.spawn(async move {
+                let mut capture = CpalAudioCapture::new(AudioCaptureConfig {
+                    device_query,
+                    ..Default::default()
+                });
+                capture.set_recording_active(false);
+                if let Err(err) = capture.start_stream().await {
+                    let _ = tx.send(TuiBackgroundMsg::MicTestFailed(format!(
+                        "Micrófono no disponible ({err})"
+                    )));
+                    return;
+                }
+
+                let _ = tx.send(TuiBackgroundMsg::MicTestStatus(
+                    "Prueba de micrófono activa (RMS en vivo)".into(),
+                ));
+                let rx = capture.receiver();
+                while !stop_flag.load(Ordering::Relaxed) {
+                    let mut latest_level: Option<f32> = None;
+                    while let Ok(chunk) = rx.try_recv() {
+                        let lvl = rms_to_vu_level(&chunk);
+                        latest_level = Some(latest_level.map_or(lvl, |prev| prev.max(lvl)));
+                    }
+                    if let Some(level) = latest_level {
+                        let _ = tx.send(TuiBackgroundMsg::MicLevelUpdated(level));
+                    }
+                    tokio::time::sleep(Duration::from_millis(33)).await;
+                }
+                let _ = capture.stop_stream().await;
+            });
+        } else {
+            if let Some(stop) = self.mic_test_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            self.devices_view.set_mic_level(0.0);
+        }
+    }
+
+    fn drain_background_messages(&mut self) {
+        while let Ok(msg) = self.bg_rx.try_recv() {
+            match msg {
+                TuiBackgroundMsg::DaemonStatusLoaded {
+                    status,
+                    daemon_connected,
+                } => {
+                    self.status_poll_in_flight = false;
+                    self.apply_daemon_status(status, daemon_connected);
+                }
+                TuiBackgroundMsg::HealthRefreshed(health) => {
+                    self.health_poll_in_flight = false;
+                    self.service_view.apply_health(health);
+                }
+                TuiBackgroundMsg::JournalLogsLoaded(lines) => {
+                    self.logs_poll_in_flight = false;
+                    self.service_view.apply_journal_logs(lines);
+                }
+                TuiBackgroundMsg::ServiceActionFinished {
+                    success_toast,
+                    success_log,
+                    error_prefix,
+                    result,
+                } => {
+                    self.service_view.apply_async_action_result(
+                        success_toast,
+                        success_log,
+                        error_prefix,
+                        result,
+                    );
+                    if let Some((ref toast, _)) = self.service_view.toast_message {
+                        self.status_line = Some(toast.clone());
+                    }
+                }
+                TuiBackgroundMsg::AuditionFinished(res) => {
+                    self.credentials_view.is_auditioning = false;
+                    match res {
+                        Ok(msg) => {
+                            self.credentials_view.error_message = None;
+                            self.credentials_view.status_message = Some(msg.clone());
+                            self.status_line = Some(msg);
+                        }
+                        Err(err) => {
+                            self.credentials_view.error_message = Some(err.clone());
+                            self.status_line = Some(format!("Error en audición: {err}"));
+                        }
+                    }
+                }
+                TuiBackgroundMsg::IpcReloadFinished { context, result } => match result {
+                    Ok(()) => {
+                        self.status_line = Some(format!("{context} y recargado en daemon vía IPC"));
+                    }
+                    Err(_) => {
+                        self.status_line = Some(format!("{context} (daemon inactivo)"));
+                    }
+                },
+                TuiBackgroundMsg::MicLevelUpdated(level) => {
+                    if self.devices_view.is_testing_mic {
+                        self.devices_view.set_mic_level(level);
+                    }
+                }
+                TuiBackgroundMsg::MicTestStatus(msg) => {
+                    self.devices_view.status_message = Some(msg.clone());
+                    self.status_line = Some(msg);
+                }
+                TuiBackgroundMsg::MicTestFailed(err) => {
+                    self.devices_view.is_testing_mic = false;
+                    self.devices_view.set_mic_level(0.0);
+                    if let Some(stop) = self.mic_test_stop.take() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    self.devices_view.status_message = Some(err.clone());
+                    self.status_line = Some(err);
+                }
+            }
         }
     }
 
@@ -217,43 +584,20 @@ impl TuiApp {
         self.active_tab = self.active_tab.prev();
     }
 
-    /// Advances periodic animations at 30 FPS.
+    /// Advances periodic animations at 30 FPS without blocking on disk/process I/O.
     pub fn on_tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
+        self.drain_background_messages();
 
-        // Periodically verify background daemon status and socket connectivity
-        if self.tick_count.is_multiple_of(3) {
-            if let Some(status) = DaemonLiveStatus::read_from_disk() {
-                self.daemon_connected = true;
-                if !self.ptt_active {
-                    self.assistant_state = status.state;
-                }
+        // Periodically poll daemon status off the UI thread
+        if self.tick_count == 1 || self.tick_count.is_multiple_of(3) {
+            self.spawn_status_poll();
+        }
 
-                if status.turn_counter > self.last_synced_turn {
-                    if !status.last_user_prompt.is_empty() {
-                        self.add_turn(Speaker::User, status.last_user_prompt.clone());
-                    }
-                    if !status.last_assistant_text.is_empty() {
-                        self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
-                    }
-                    self.last_synced_turn = status.turn_counter;
-                } else if !status.last_assistant_text.is_empty() {
-                    // Synchronize assistant response regardless of whether daemon is currently Speaking or Idle
-                    if let Some(last) = self.turns.last_mut() {
-                        if last.speaker == Speaker::Viernes {
-                            if last.text != status.last_assistant_text {
-                                last.text = status.last_assistant_text.clone();
-                            }
-                        } else {
-                            self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
-                        }
-                    } else {
-                        self.add_turn(Speaker::Viernes, status.last_assistant_text.clone());
-                    }
-                }
-            } else if self.tick_count.is_multiple_of(30) {
-                self.daemon_connected = std::path::Path::new(&ptt_socket_path()).exists();
-            }
+        // Periodically refresh systemd service health & journalctl logs asynchronously
+        if self.tick_count == 1 || self.tick_count.is_multiple_of(150) {
+            self.spawn_health_refresh();
+            self.spawn_journal_logs_refresh();
         }
 
         // Update soundwave spectrum based on assistant state
@@ -290,6 +634,14 @@ impl TuiApp {
                 let wave = (fi * 6.0 - t).cos().abs() * 0.25 + pulse * 0.75;
                 *bar = (*bar * 0.5 + wave * 0.5).clamp(0.05, 0.55);
             }
+        } else if self.assistant_state == SystemState::AwaitingConfirmation {
+            let t = (self.tick_count as f32) * 0.16;
+            let pulse = (t.sin() * 0.5 + 0.5) * 0.45 + 0.15;
+            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
+                let fi = i as f32 / bar_count as f32;
+                let wave = (fi * 8.0 + t).sin().abs() * 0.2 + pulse * 0.8;
+                *bar = (*bar * 0.45 + wave * 0.55).clamp(0.08, 0.75);
+            }
         } else {
             // Quiescent idle baseline wave
             let t = (self.tick_count as f32) * 0.05;
@@ -298,12 +650,6 @@ impl TuiApp {
                 let wave = ((fi * 4.0 + t).sin() * 0.5 + 0.5) * 0.06 + 0.02;
                 *bar = (*bar * 0.8 + wave * 0.2).clamp(0.01, 0.12);
             }
-        }
-
-        // Background simulation for mic level in Devices view if testing
-        if self.devices_view.is_testing_mic {
-            let level = (((self.tick_count as f32 * 0.2).sin().abs()) * 0.75) + 0.1;
-            self.devices_view.set_mic_level(level);
         }
     }
 
@@ -390,6 +736,23 @@ impl TuiApp {
             return;
         }
 
+        // Global unsaved-changes quit confirmation modal
+        if self.show_quit_confirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.show_quit_confirm = false;
+                    self.should_quit = true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.show_quit_confirm = false;
+                    self.status_line =
+                        Some("Salida cancelada. Presione [s] para guardar cambios.".into());
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // 1. Tab-specific delegates when editing text fields
         let is_editing = (self.active_tab == ActiveTab::VoiceAndKeys
             && self.credentials_view.focus
@@ -411,7 +774,12 @@ impl TuiApp {
                         self.devices_view.output_dropdown_open = false;
                         return;
                     }
-                    self.should_quit = true;
+                    if self.has_unsaved_changes() {
+                        self.show_quit_confirm = true;
+                        self.status_line = Some("Cambios sin guardar (y/n)".into());
+                    } else {
+                        self.should_quit = true;
+                    }
                     return;
                 }
                 KeyCode::Char('1') => {
@@ -432,6 +800,8 @@ impl TuiApp {
                 }
                 KeyCode::Char('5') => {
                     self.active_tab = ActiveTab::ServiceAndLogs;
+                    self.spawn_health_refresh();
+                    self.spawn_journal_logs_refresh();
                     return;
                 }
                 KeyCode::Tab => {
@@ -439,6 +809,10 @@ impl TuiApp {
                         self.devices_view.next_focus();
                     } else {
                         self.next_tab();
+                        if self.active_tab == ActiveTab::ServiceAndLogs {
+                            self.spawn_health_refresh();
+                            self.spawn_journal_logs_refresh();
+                        }
                     }
                     return;
                 }
@@ -447,6 +821,10 @@ impl TuiApp {
                         self.devices_view.prev_focus();
                     } else {
                         self.prev_tab();
+                        if self.active_tab == ActiveTab::ServiceAndLogs {
+                            self.spawn_health_refresh();
+                            self.spawn_journal_logs_refresh();
+                        }
                     }
                     return;
                 }
@@ -465,11 +843,15 @@ impl TuiApp {
                         || self.assistant_state == SystemState::Speaking
                         || self.assistant_state == SystemState::Listening
                         || self.assistant_state == SystemState::Thinking
+                        || self.assistant_state == SystemState::AwaitingConfirmation
                     {
                         // Barge-in / Cancel speech
                         self.ptt_active = false;
                         self.assistant_state = SystemState::Idle;
                         let _ = send_ipc_ptt("cancel").await;
+                    } else if self.has_unsaved_changes() {
+                        self.show_quit_confirm = true;
+                        self.status_line = Some("Cambios sin guardar (y/n)".into());
                     } else {
                         self.should_quit = true;
                     }
@@ -481,9 +863,11 @@ impl TuiApp {
                 match action {
                     CredentialsAction::SavedToDisk => {
                         self.status_line = Some("Credenciales guardadas en .env (0600)".into());
+                        self.spawn_ipc_reload("Credenciales guardadas en .env (0600)");
                     }
                     CredentialsAction::TestVoiceTriggered => {
                         self.status_line = Some("Iniciando audición de prueba de voz...".into());
+                        self.spawn_voice_audition();
                     }
                     CredentialsAction::None => {}
                 }
@@ -516,10 +900,24 @@ impl TuiApp {
                         self.devices_view.select_next();
                     }
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => self.devices_view.toggle_action(),
+                KeyCode::Enter => {
+                    if self.devices_view.input_dropdown_open
+                        || self.devices_view.output_dropdown_open
+                    {
+                        self.devices_view.confirm_selection();
+                    } else {
+                        self.devices_view.toggle_action();
+                        self.sync_mic_test_task();
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    self.devices_view.toggle_action();
+                    self.sync_mic_test_task();
+                }
                 KeyCode::Char('m') => {
                     self.devices_view.focus = crate::tui::views::devices::DeviceFocus::MicTest;
                     self.devices_view.toggle_action();
+                    self.sync_mic_test_task();
                 }
                 KeyCode::Char('d') => {
                     self.devices_view.focus = crate::tui::views::devices::DeviceFocus::AudioDucking;
@@ -531,21 +929,58 @@ impl TuiApp {
                 }
                 KeyCode::Char('s') => {
                     if let Err(e) = self.devices_view.save_ducking_config() {
-                        self.status_line = Some(format!("Error guardando atenuación: {e}"));
+                        self.status_line = Some(format!("Error guardando audio: {e}"));
                     } else {
                         self.status_line =
                             Some("Configuración de audio guardada en .env (0600)".into());
+                        self.spawn_ipc_reload("Configuración de audio guardada en .env (0600)");
                     }
                 }
                 KeyCode::Char('r') => self.devices_view.refresh_from_host(),
                 _ => {}
             },
             ActiveTab::ServiceAndLogs => match key.code {
-                KeyCode::Char('R') | KeyCode::Char('r') => self.service_view.action_restart(),
-                KeyCode::Char('K') | KeyCode::Char('k') => self.service_view.action_stop(),
-                KeyCode::Char('S') | KeyCode::Char('s') => self.service_view.action_start(),
-                KeyCode::Char('N') | KeyCode::Char('n') => self.service_view.action_new_session(),
-                KeyCode::Char('u') => self.service_view.refresh_health(),
+                KeyCode::Char('R') | KeyCode::Char('r') => {
+                    self.spawn_service_action(
+                        "Orden recibida: [R] Reiniciar Servicio...",
+                        "Servicio reiniciado exitosamente",
+                        "[INFO] Daemon reiniciado con éxito.",
+                        "Error al reiniciar",
+                        restart_service_async(),
+                    );
+                }
+                KeyCode::Char('K') | KeyCode::Char('k') => {
+                    self.spawn_service_action(
+                        "Orden recibida: [K] Detener Servicio...",
+                        "Servicio detenido correctamente",
+                        "[INFO] Daemon detenido.",
+                        "Error al detener",
+                        stop_service_async(),
+                    );
+                }
+                KeyCode::Char('S') | KeyCode::Char('s') => {
+                    self.spawn_service_action(
+                        "Orden recibida: [S] Iniciar Servicio...",
+                        "Servicio iniciado exitosamente",
+                        "[INFO] Daemon iniciado con éxito.",
+                        "Error al iniciar",
+                        start_service_async(),
+                    );
+                }
+                KeyCode::Char('N') | KeyCode::Char('n') => {
+                    self.spawn_service_action(
+                        "Orden recibida: [N] Rotar Nueva Sesión...",
+                        "Nueva sesión conversacional iniciada",
+                        "[INFO] Puntero de sesión rotado (--new-conversation).",
+                        "Error al rotar sesión",
+                        reset_session_async(),
+                    );
+                }
+                KeyCode::Char('u') => {
+                    self.spawn_health_refresh();
+                    self.spawn_journal_logs_refresh();
+                    self.status_line = Some("Actualizando estado del servicio y logs...".into());
+                }
                 KeyCode::Char('f') => self.service_view.logs.cycle_filter(),
                 KeyCode::Char('a') => self.service_view.logs.toggle_auto_scroll(),
                 KeyCode::Char('c') => self.service_view.logs.clear(),
@@ -609,7 +1044,8 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(3), // Navigation Tabs bar
                 Constraint::Min(18),   // Active tab body
-                Constraint::Length(1), // Global hotkeys status line
+                Constraint::Length(1), // Global status line
+                Constraint::Length(1), // Global hotkeys footer
             ])
             .split(area);
 
@@ -679,7 +1115,20 @@ impl TuiApp {
             }
         }
 
-        // 3. Global hotkeys footer
+        // 3. Global status bar
+        let status_text = self.status_line.as_deref().unwrap_or("Listo");
+        let status_bar = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Estado: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status_text, Style::default().fg(Color::Gray)),
+        ]));
+        f.render_widget(status_bar, main_chunks[2]);
+
+        // 4. Global hotkeys footer
         let footer_line = Line::from(vec![
             Span::styled(
                 "[1-5]: ",
@@ -716,7 +1165,33 @@ impl TuiApp {
             Span::raw("Salir"),
         ]);
         let footer = Paragraph::new(footer_line).alignment(Alignment::Center);
-        f.render_widget(footer, main_chunks[2]);
+        f.render_widget(footer, main_chunks[3]);
+
+        // 5. Global Unsaved Changes Quit Confirmation Modal
+        if self.show_quit_confirm {
+            let modal_w = 60.min(area.width);
+            let modal_h = 7.min(area.height);
+            let modal_area = Rect::new(
+                (area.width.saturating_sub(modal_w)) / 2,
+                (area.height.saturating_sub(modal_h)) / 2,
+                modal_w,
+                modal_h,
+            );
+            f.render_widget(Clear, modal_area);
+            let modal = Paragraph::new(
+                "Hay cambios sin guardar en la configuración.\n\n¿Desea salir y descartarlos? [y] Salir / [n] Cancelar",
+            )
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Cambios sin guardar (y/n) ")
+                    .title_alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+            f.render_widget(modal, modal_area);
+        }
     }
 }
 
@@ -850,5 +1325,89 @@ mod tests {
         assert!(buffer_str.contains("Dimensiones de Terminal insuficientes"));
         assert!(buffer_str.contains("70x20"));
         assert!(buffer_str.contains("80x24"));
+    }
+
+    #[tokio::test]
+    async fn test_tui_app_devices_enter_confirms_open_dropdown() {
+        let mut app = TuiApp::new(None);
+        app.devices_view = DevicesView::new_mock(
+            vec![
+                viernes_audio::devices::AudioDeviceInfo {
+                    index: 0,
+                    name: "Default Mic".into(),
+                    is_default: true,
+                    max_channels: 1,
+                    sample_rates: vec![16000],
+                },
+                viernes_audio::devices::AudioDeviceInfo {
+                    index: 1,
+                    name: "USB Mic".into(),
+                    is_default: false,
+                    max_channels: 1,
+                    sample_rates: vec![48000],
+                },
+            ],
+            vec![],
+        );
+        app.active_tab = ActiveTab::AudioDevices;
+        app.devices_view.input_dropdown_open = true;
+        app.devices_view.select_next();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        assert!(!app.devices_view.input_dropdown_open);
+        assert!(app
+            .devices_view
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("USB Mic"));
+    }
+
+    #[tokio::test]
+    async fn test_tui_app_quit_prompts_when_unsaved_changes_exist() {
+        let mut app = TuiApp::new(None);
+        app.credentials_view.has_unsaved_changes = true;
+
+        // First 'q' opens confirmation instead of quitting
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(!app.should_quit);
+        assert!(app.show_quit_confirm);
+
+        // 'n' cancels quit
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await;
+        assert!(!app.should_quit);
+        assert!(!app.show_quit_confirm);
+
+        // 'q' then 'y' quits
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(app.show_quit_confirm);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_tui_app_renders_status_line() {
+        let mut app = TuiApp::new(None);
+        app.status_line = Some("Estado Visible Prueba".into());
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer_str = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_str.contains("Estado Visible Prueba"));
+    }
+
+    #[test]
+    fn test_rms_to_vu_level_bounds() {
+        assert_eq!(rms_to_vu_level(&[]), 0.0);
+        assert_eq!(rms_to_vu_level(&[0.0, 0.0]), 0.0);
+        assert!((rms_to_vu_level(&[1.0, 1.0]) - 1.0).abs() < f32::EPSILON);
+        assert_eq!(rms_to_vu_level(&[f32::NAN]), 0.0);
     }
 }

@@ -13,10 +13,13 @@ pub mod state;
 pub mod state_machine;
 pub mod traits;
 
-pub use config::ViernesConfig;
+pub use config::{
+    default_alsa_log_path, default_ptt_socket_path, default_status_file_path,
+    default_temp_dir_path, ensure_private_dir, runtime_dir, ViernesConfig,
+};
 pub use error::{CoreError, ViernesError};
 pub use events::{State, SystemEvent, TransitionRecord};
-pub use state::SystemState;
+pub use state::{DaemonLiveStatus, SystemState};
 pub use state_machine::StateMachine;
 pub use traits::{AudioCapture, AudioPlayback, BrainService, SpeechToText, TextToSpeech};
 
@@ -33,12 +36,14 @@ mod property_tests {
                 Just(SystemState::Listening),
                 Just(SystemState::Thinking),
                 Just(SystemState::Speaking),
+                Just(SystemState::AwaitingConfirmation),
             ],
             s2 in prop_oneof![
                 Just(SystemState::Idle),
                 Just(SystemState::Listening),
                 Just(SystemState::Thinking),
                 Just(SystemState::Speaking),
+                Just(SystemState::AwaitingConfirmation),
             ]
         ) {
             let mut state = s1;

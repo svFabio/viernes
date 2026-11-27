@@ -3,57 +3,79 @@
 use regex::Regex;
 use std::time::Duration;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::BrainError;
 
 /// Confirmation timeout threshold (10 seconds).
 pub const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+const DESTRUCTIVE_PATTERNS: &[&str] = &[
+    r"(?i)\brm\s+(?:[^\n;|&]*\s+)?(?:-[a-zA-Z]*r[a-zA-Z]*|--recursive)\b",
+    r"(?i)\bmkfs\b",
+    r"(?i)\bdd\s+if=",
+    r"(?i)\b(format|fdisk|parted)\b",
+    r"(?i)\bgit\s+reset\s+--hard\b",
+    r"(?i)\bgit\s+clean\s+-fdx?\b",
+    r"(?i)\b(drop\s+database|drop\s+table|truncate\s+table)\b",
+    r"(?i)\b(?:kill|pkill|killall)\s+(?:[^\n;|&]*\s+)?(?:-(?:9|(?:SIG)?KILL)\b|-s\s+(?:9|(?:SIG)?KILL)\b)",
+    r"(?i)\b(shutdown|reboot|poweroff)\b",
+];
+
+const AFFIRMATIVE_PATTERN: &str =
+    r"(?i)\b(s[ií]|afirmativo|procede|dale|confirmado|hazlo|ejecuta|adelante|yes)\b";
+
+const NEGATIVE_PATTERN: &str =
+    r"(?i)\b(no|cancela|aborta|det[eé]n|rechaza|cancelar|abort|negativo)\b";
+
 /// Classifier analyzing tool calls and commands to identify destructive or high-risk actions.
 pub struct RiskClassifier {
     destructive_patterns: Vec<Regex>,
-    affirmative_regex: Regex,
-    negative_regex: Regex,
+    affirmative_regex: Option<Regex>,
+    negative_regex: Option<Regex>,
 }
 
 impl Default for RiskClassifier {
     fn default() -> Self {
-        let raw_patterns = vec![
-            r"(?i)\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f*|-rf)\b",
-            r"(?i)\bmkfs\b",
-            r"(?i)\bdd\s+if=",
-            r"(?i)\b(format|fdisk|parted)\b",
-            r"(?i)\bgit\s+reset\s+--hard\b",
-            r"(?i)\bgit\s+clean\s+-fdx?\b",
-            r"(?i)\b(drop\s+database|drop\s+table|truncate\s+table)\b",
-            r"(?i)\bkill\s+-9\b",
-            r"(?i)\b(shutdown|reboot|poweroff)\b",
-        ];
-
-        let destructive_patterns = raw_patterns
-            .into_iter()
-            .filter_map(|p| Regex::new(p).ok())
-            .collect();
-
-        let affirmative_regex = Regex::new(
-            r"(?i)\b(s[ií]|afirmativo|procede|dale|confirmado|hazlo|ejecuta|adelante|yes)\b",
-        )
-        .expect("valid regex");
-
-        let negative_regex =
-            Regex::new(r"(?i)\b(no|cancela|aborta|det[eé]n|rechaza|cancelar|abort|negativo)\b")
-                .expect("valid regex");
-
-        Self {
-            destructive_patterns,
-            affirmative_regex,
-            negative_regex,
+        match Self::try_new() {
+            Ok(classifier) => classifier,
+            Err(e) => {
+                error!(error = %e, "Failed to initialize RiskClassifier regex patterns");
+                Self {
+                    destructive_patterns: Vec::new(),
+                    affirmative_regex: None,
+                    negative_regex: None,
+                }
+            }
         }
     }
 }
 
 impl RiskClassifier {
+    /// Compile all risk classification regular expressions without silently dropping any pattern.
+    pub fn try_new() -> Result<Self, BrainError> {
+        let destructive_patterns = DESTRUCTIVE_PATTERNS
+            .iter()
+            .map(|p| {
+                Regex::new(p).map_err(|e| {
+                    BrainError::Internal(format!("invalid destructive regex '{p}': {e}"))
+                })
+            })
+            .collect::<Result<Vec<Regex>, _>>()?;
+
+        let affirmative_regex = Regex::new(AFFIRMATIVE_PATTERN)
+            .map_err(|e| BrainError::Internal(format!("invalid affirmative regex: {e}")))?;
+
+        let negative_regex = Regex::new(NEGATIVE_PATTERN)
+            .map_err(|e| BrainError::Internal(format!("invalid negative regex: {e}")))?;
+
+        Ok(Self {
+            destructive_patterns,
+            affirmative_regex: Some(affirmative_regex),
+            negative_regex: Some(negative_regex),
+        })
+    }
+
     /// Evaluate whether a command line or operation is classified as destructive.
     #[must_use]
     pub fn is_destructive(&self, command: &str) -> bool {
@@ -67,9 +89,17 @@ impl RiskClassifier {
     #[must_use]
     pub fn parse_confirmation_response(&self, spoken_text: &str) -> Option<bool> {
         let text = spoken_text.trim();
-        if self.negative_regex.is_match(text) {
+        if self
+            .negative_regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(text))
+        {
             Some(false)
-        } else if self.affirmative_regex.is_match(text) {
+        } else if self
+            .affirmative_regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(text))
+        {
             Some(true)
         } else {
             None
@@ -163,15 +193,36 @@ mod tests {
 
         assert!(classifier.is_destructive("rm -rf /tmp/data"));
         assert!(classifier.is_destructive("rm -r -f ./build"));
+        assert!(classifier.is_destructive("rm -f -r ./build"));
+        assert!(classifier.is_destructive("rm --recursive ./build"));
+        assert!(classifier.is_destructive("rm -f --recursive ./build"));
         assert!(classifier.is_destructive("mkfs.ext4 /dev/sda1"));
         assert!(classifier.is_destructive("dd if=/dev/zero of=/dev/sdb"));
         assert!(classifier.is_destructive("git reset --hard HEAD~1"));
         assert!(classifier.is_destructive("DROP DATABASE production;"));
+        assert!(classifier.is_destructive("kill -9 1234"));
+        assert!(classifier.is_destructive("kill -SIGKILL 1234"));
+        assert!(classifier.is_destructive("pkill -9 firefox"));
+        assert!(classifier.is_destructive("killall -9 python3"));
 
         // Safe operations
         assert!(!classifier.is_destructive("ls -la"));
         assert!(!classifier.is_destructive("cargo test"));
         assert!(!classifier.is_destructive("git status"));
+        assert!(!classifier.is_destructive("rm ./single-report.txt"));
+        assert!(!classifier.is_destructive("kill -15 1234"));
+        assert!(!classifier.is_destructive("pkill -f my_worker"));
+    }
+
+    #[test]
+    fn test_risk_classifier_try_new_compiles_all_patterns() {
+        let classifier = RiskClassifier::try_new().unwrap();
+        assert_eq!(
+            classifier.destructive_patterns.len(),
+            DESTRUCTIVE_PATTERNS.len()
+        );
+        assert!(classifier.affirmative_regex.is_some());
+        assert!(classifier.negative_regex.is_some());
     }
 
     #[test]
