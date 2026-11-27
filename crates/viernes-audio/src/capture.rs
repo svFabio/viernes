@@ -70,10 +70,19 @@ impl std::fmt::Debug for CpalAudioCapture {
         f.debug_struct("CpalAudioCapture")
             .field("config", &self.config)
             .field("is_running", &self.is_running.load(Ordering::SeqCst))
-            .field("negotiated_rate", &*self.negotiated_rate.lock().unwrap())
+            .field(
+                "negotiated_rate",
+                &*self
+                    .negotiated_rate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
             .field(
                 "negotiated_channels",
-                &*self.negotiated_channels.lock().unwrap(),
+                &*self
+                    .negotiated_channels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
             )
             .finish()
     }
@@ -121,9 +130,86 @@ impl CpalAudioCapture {
     #[must_use]
     pub fn stream_parameters(&self) -> (u32, u16) {
         (
-            *self.negotiated_rate.lock().unwrap(),
-            *self.negotiated_channels.lock().unwrap(),
+            *self
+                .negotiated_rate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            *self
+                .negotiated_channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
         )
+    }
+}
+
+fn negotiate_input_config(
+    device: &cpal::Device,
+    preferred_rate: u32,
+) -> Result<(StreamConfig, SampleFormat), String> {
+    let target_rate = cpal::SampleRate(preferred_rate);
+    let format_preference = [
+        SampleFormat::F32,
+        SampleFormat::I16,
+        SampleFormat::I32,
+        SampleFormat::U16,
+    ];
+
+    if let Ok(configs) = device.supported_input_configs() {
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = configs.collect();
+        for desired_channels in [1u16, 2u16] {
+            for desired_format in format_preference {
+                if ranges.iter().any(|c| {
+                    c.channels() == desired_channels
+                        && c.min_sample_rate() <= target_rate
+                        && c.max_sample_rate() >= target_rate
+                        && c.sample_format() == desired_format
+                }) {
+                    return Ok((
+                        StreamConfig {
+                            channels: desired_channels,
+                            sample_rate: target_rate,
+                            buffer_size: cpal::BufferSize::Default,
+                        },
+                        desired_format,
+                    ));
+                }
+            }
+        }
+    }
+
+    device
+        .default_input_config()
+        .map(|cfg| (cfg.config(), cfg.sample_format()))
+        .map_err(|e| format!("Default config error: {e}"))
+}
+
+fn push_captured_samples(
+    samples: &[f32],
+    channels: u16,
+    from_rate: u32,
+    needs_processing: bool,
+    stream_rec: &AtomicBool,
+    stream_acc: &Mutex<Vec<f32>>,
+    stream_tx: &Sender<Vec<f32>>,
+) {
+    let processed = if needs_processing {
+        process_to_16k_mono(samples, channels, from_rate)
+    } else {
+        samples.to_vec()
+    };
+
+    if !processed.is_empty() {
+        if stream_rec.load(Ordering::Relaxed) {
+            if let Ok(mut acc) = stream_acc.try_lock() {
+                if acc.len() + processed.len() > MAX_ACCUMULATED_SAMPLES {
+                    let overflow = (acc.len() + processed.len()) - MAX_ACCUMULATED_SAMPLES;
+                    let drain_count = overflow.min(acc.len());
+                    acc.drain(0..drain_count);
+                }
+                acc.extend_from_slice(&processed);
+            }
+        }
+        let _ = stream_tx.try_send(processed);
     }
 }
 
@@ -138,15 +224,11 @@ impl AudioCapture for CpalAudioCapture {
         let host = cpal::default_host();
         let enumerator = CpalDeviceEnumerator::new();
         let devices = enumerator.list_input_devices()?;
-        let default_dev = enumerator.default_input_device()?;
+        let default_dev = devices.iter().find(|d| d.is_default);
 
-        let selected = resolve_device(
-            self.config.device_query.as_deref(),
-            &devices,
-            default_dev.as_ref(),
-        );
+        let selected = resolve_device(self.config.device_query.as_deref(), &devices, default_dev);
 
-        let device_name = selected.map(|d| d.name.clone());
+        let selected_device = selected.map(|d| (d.index, d.name.clone()));
         let preferred_rate = self.config.preferred_sample_rate;
 
         let tx = self.sender.clone();
@@ -157,17 +239,33 @@ impl AudioCapture for CpalAudioCapture {
         let chan_holder = self.negotiated_channels.clone();
 
         let (cmd_tx, cmd_rx) = bounded::<AudioWorkerCommand>(4);
-        let (init_tx, init_rx) = bounded::<Result<(), String>>(1);
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         // Spawn isolated audio capture worker OS thread
         let handle = std::thread::Builder::new()
             .name("viernes-audio-capture".into())
             .spawn(move || {
-                let dev_res = if let Some(ref name) = device_name {
-                    host.input_devices()
-                        .ok()
-                        .and_then(|mut devs| {
-                            devs.find(|d| d.name().map(|n| &n == name).unwrap_or(false))
+                let dev_res = if let Some((idx, ref name)) = selected_device {
+                    let all_devs: Vec<cpal::Device> = host
+                        .input_devices()
+                        .map(|devs| devs.collect())
+                        .unwrap_or_default();
+                    all_devs
+                        .get(idx)
+                        .filter(|d| d.name().ok().as_deref() == Some(name.as_str()))
+                        .cloned()
+                        .or_else(|| {
+                            all_devs
+                                .iter()
+                                .find(|d| d.name().ok().as_deref() == Some(name.as_str()))
+                                .cloned()
+                        })
+                        .or_else(|| {
+                            if name == &format!("Input Device #{idx}") {
+                                all_devs.get(idx).cloned()
+                            } else {
+                                None
+                            }
                         })
                         .or_else(|| host.default_input_device())
                 } else {
@@ -182,50 +280,22 @@ impl AudioCapture for CpalAudioCapture {
                     }
                 };
 
-                let target_rate = cpal::SampleRate(preferred_rate);
-                let desired_config = StreamConfig {
-                    channels: 1,
-                    sample_rate: target_rate,
-                    buffer_size: cpal::BufferSize::Default,
-                };
-
-                let (stream_config, sample_format, needs_resample) = match device
-                    .supported_input_configs()
-                {
-                    Ok(mut configs) => {
-                        let direct_match = configs.any(|c| {
-                            c.channels() == 1
-                                && c.min_sample_rate() <= target_rate
-                                && c.max_sample_rate() >= target_rate
-                                && c.sample_format() == SampleFormat::F32
-                        });
-
-                        if direct_match {
-                            (desired_config, SampleFormat::F32, false)
-                        } else {
-                            match device.default_input_config() {
-                                Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
-                                Err(e) => {
-                                    let _ = init_tx.send(Err(format!("Default config error: {e}")));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => match device.default_input_config() {
-                        Ok(cfg) => (cfg.config(), cfg.sample_format(), true),
+                let (stream_config, sample_format) =
+                    match negotiate_input_config(&device, preferred_rate) {
+                        Ok(res) => res,
                         Err(e) => {
-                            let _ = init_tx.send(Err(format!("Default config error: {e}")));
+                            let _ = init_tx.send(Err(e));
                             return;
                         }
-                    },
-                };
+                    };
 
                 let from_rate = stream_config.sample_rate.0;
                 let channels = stream_config.channels;
+                // Whisper always requires 16kHz mono PCM, even if preferred_sample_rate != 16_000
+                let needs_processing = from_rate != 16_000 || channels != 1;
 
-                *rate_holder.lock().unwrap() = from_rate;
-                *chan_holder.lock().unwrap() = channels;
+                *rate_holder.lock().unwrap_or_else(|e| e.into_inner()) = from_rate;
+                *chan_holder.lock().unwrap_or_else(|e| e.into_inner()) = channels;
 
                 let stream_running = running_flag.clone();
                 let stream_acc = accumulated.clone();
@@ -241,26 +311,15 @@ impl AudioCapture for CpalAudioCapture {
                     SampleFormat::F32 => device.build_input_stream(
                         &stream_config,
                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            let processed = if needs_resample {
-                                process_to_16k_mono(data, channels, from_rate)
-                            } else {
-                                data.to_vec()
-                            };
-
-                            if !processed.is_empty() {
-                                if stream_rec.load(Ordering::Relaxed) {
-                                    if let Ok(mut acc) = stream_acc.try_lock() {
-                                        if acc.len() + processed.len() > MAX_ACCUMULATED_SAMPLES {
-                                            let overflow = (acc.len() + processed.len())
-                                                - MAX_ACCUMULATED_SAMPLES;
-                                            let drain_count = overflow.min(acc.len());
-                                            acc.drain(0..drain_count);
-                                        }
-                                        acc.extend_from_slice(&processed);
-                                    }
-                                }
-                                let _ = stream_tx.try_send(processed);
-                            }
+                            push_captured_samples(
+                                data,
+                                channels,
+                                from_rate,
+                                needs_processing,
+                                &stream_rec,
+                                &stream_acc,
+                                &stream_tx,
+                            );
                         },
                         err_fn,
                         None,
@@ -269,28 +328,56 @@ impl AudioCapture for CpalAudioCapture {
                         &stream_config,
                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
                             let f32_samples: Vec<f32> =
-                                data.iter().map(|&s| (s as f32) / 32768.0).collect();
-
-                            let processed = if needs_resample {
-                                process_to_16k_mono(&f32_samples, channels, from_rate)
-                            } else {
-                                f32_samples
-                            };
-
-                            if !processed.is_empty() {
-                                if stream_rec.load(Ordering::Relaxed) {
-                                    if let Ok(mut acc) = stream_acc.try_lock() {
-                                        if acc.len() + processed.len() > MAX_ACCUMULATED_SAMPLES {
-                                            let overflow = (acc.len() + processed.len())
-                                                - MAX_ACCUMULATED_SAMPLES;
-                                            let drain_count = overflow.min(acc.len());
-                                            acc.drain(0..drain_count);
-                                        }
-                                        acc.extend_from_slice(&processed);
-                                    }
-                                }
-                                let _ = stream_tx.try_send(processed);
-                            }
+                                data.iter().map(|&s| f32::from(s) / 32768.0).collect();
+                            push_captured_samples(
+                                &f32_samples,
+                                channels,
+                                from_rate,
+                                needs_processing,
+                                &stream_rec,
+                                &stream_acc,
+                                &stream_tx,
+                            );
+                        },
+                        err_fn,
+                        None,
+                    ),
+                    SampleFormat::I32 => device.build_input_stream(
+                        &stream_config,
+                        move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                            let f32_samples: Vec<f32> = data
+                                .iter()
+                                .map(|&s| (f64::from(s) / 2_147_483_648.0) as f32)
+                                .collect();
+                            push_captured_samples(
+                                &f32_samples,
+                                channels,
+                                from_rate,
+                                needs_processing,
+                                &stream_rec,
+                                &stream_acc,
+                                &stream_tx,
+                            );
+                        },
+                        err_fn,
+                        None,
+                    ),
+                    SampleFormat::U16 => device.build_input_stream(
+                        &stream_config,
+                        move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                            let f32_samples: Vec<f32> = data
+                                .iter()
+                                .map(|&s| (f32::from(s) - 32768.0) / 32768.0)
+                                .collect();
+                            push_captured_samples(
+                                &f32_samples,
+                                channels,
+                                from_rate,
+                                needs_processing,
+                                &stream_rec,
+                                &stream_acc,
+                                &stream_tx,
+                            );
                         },
                         err_fn,
                         None,
@@ -328,8 +415,8 @@ impl AudioCapture for CpalAudioCapture {
             })
             .map_err(|e| ViernesError::Audio(format!("Failed to spawn audio thread: {e}")))?;
 
-        // Wait for thread initialization result
-        match init_rx.recv() {
+        // Wait for thread initialization result without blocking Tokio runtime
+        match init_rx.await {
             Ok(Ok(())) => {
                 self.worker_tx = Some(cmd_tx);
                 self.worker_handle = Some(handle);
@@ -337,11 +424,17 @@ impl AudioCapture for CpalAudioCapture {
                 Ok(())
             }
             Ok(Err(e)) => {
-                let _ = handle.join();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                })
+                .await;
                 Err(ViernesError::Audio(e))
             }
             Err(e) => {
-                let _ = handle.join();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                })
+                .await;
                 Err(ViernesError::Audio(format!(
                     "Audio initialization channel disconnected: {e}"
                 )))
@@ -355,7 +448,10 @@ impl AudioCapture for CpalAudioCapture {
             let _ = tx.send(AudioWorkerCommand::Stop);
         }
         if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            })
+            .await;
         }
         Ok(())
     }
@@ -365,7 +461,10 @@ impl AudioCapture for CpalAudioCapture {
     }
 
     fn finish_recording(&mut self) -> Option<Vec<f32>> {
-        let mut guard = self.accumulated_buffer.lock().ok()?;
+        let mut guard = self
+            .accumulated_buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if guard.is_empty() {
             None
         } else {
@@ -401,7 +500,10 @@ impl FakeAudioCapture {
 
     /// Injects audio chunk directly into receiver channel.
     pub fn push_chunk(&self, chunk: Vec<f32>) {
-        self.recorded.lock().unwrap().extend_from_slice(&chunk);
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(&chunk);
         let _ = self.sender.send(chunk);
     }
 
@@ -416,12 +518,18 @@ impl FakeAudioCapture {
 impl AudioCapture for FakeAudioCapture {
     async fn start_stream(&mut self) -> Result<(), ViernesError> {
         self.is_running.store(true, Ordering::SeqCst);
-        self.recorded.lock().unwrap().clear();
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Push preloaded audio in 20ms chunks (320 samples @ 16kHz)
         for chunk in self.injected_audio.chunks(320) {
             let c = chunk.to_vec();
-            self.recorded.lock().unwrap().extend_from_slice(&c);
+            self.recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(&c);
             let _ = self.sender.try_send(c);
         }
         Ok(())
@@ -437,7 +545,7 @@ impl AudioCapture for FakeAudioCapture {
     }
 
     fn finish_recording(&mut self) -> Option<Vec<f32>> {
-        let mut guard = self.recorded.lock().unwrap();
+        let mut guard = self.recorded.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_empty() {
             None
         } else {
@@ -489,5 +597,20 @@ mod tests {
         assert!(!capture.is_recording_active());
         capture.set_recording_active(true);
         assert!(capture.is_recording_active());
+    }
+
+    #[test]
+    fn test_push_captured_samples_resamples_stereo_48k_to_16k_mono() {
+        let rec = AtomicBool::new(true);
+        let acc = Mutex::new(Vec::new());
+        let (tx, rx) = bounded(4);
+        // 10ms of stereo 48kHz = 960 samples -> 160 mono 16kHz samples
+        let stereo_48k = vec![0.25f32; 960];
+
+        push_captured_samples(&stereo_48k, 2, 48_000, true, &rec, &acc, &tx);
+
+        let streamed = rx.try_recv().unwrap();
+        assert_eq!(streamed.len(), 160);
+        assert_eq!(acc.lock().unwrap().len(), 160);
     }
 }

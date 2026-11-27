@@ -4,12 +4,16 @@
 //! hallucination filtering for noise/music/repetition tokens, and Spanish ("es") language configuration.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use viernes_core::error::ViernesError;
 use viernes_core::traits::SpeechToText;
+
+/// Maximum audio buffer length accepted for a single Whisper inference pass (60 seconds @ 16kHz).
+pub const MAX_INFERENCE_SAMPLES: usize = 16_000 * 60;
 
 /// Resolves the filesystem path to `scripts/transcribe_wav.py` robustly across working directories.
 /// Resolves the absolute path to the local GGML model file.
@@ -80,6 +84,20 @@ const EXACT_HALLUCINATION_PHRASES: &[&str] = &[
     "adios",
 ];
 
+fn hallucination_regexes() -> &'static [(&'static str, regex::Regex)] {
+    static REGEXES: OnceLock<Vec<(&'static str, regex::Regex)>> = OnceLock::new();
+    REGEXES.get_or_init(|| {
+        HALLUCINATION_PATTERNS
+            .iter()
+            .filter_map(|&pattern| {
+                regex::Regex::new(&format!("(?i){}", regex::escape(pattern)))
+                    .ok()
+                    .map(|re| (pattern, re))
+            })
+            .collect()
+    })
+}
+
 /// Cleans, normalizes, and filters hallucinated or repetitive tokens from Whisper transcripts.
 ///
 /// Returns an empty string if the transcript consists exclusively of noise tags,
@@ -99,15 +117,11 @@ pub fn clean_and_filter_hallucinations(raw: &str) -> String {
         return String::new();
     }
 
-    // 2. Check pattern containment
+    // 2. Check pattern containment using precompiled regexes
     let mut cleaned = trimmed.to_string();
-    for &pattern in HALLUCINATION_PATTERNS {
+    for (pattern, re) in hallucination_regexes() {
         if lower.contains(pattern) {
-            // Remove pattern case-insensitively
-            let re_pattern = regex::Regex::new(&format!("(?i){}", regex::escape(pattern)));
-            if let Ok(re) = re_pattern {
-                cleaned = re.replace_all(&cleaned, "").to_string();
-            }
+            cleaned = re.replace_all(&cleaned, "").to_string();
         }
     }
 
@@ -181,14 +195,14 @@ impl Default for WhisperConfig {
 #[derive(Clone)]
 pub struct LocalWhisperTranscriber {
     config: WhisperConfig,
-    context: Option<Arc<whisper_rs::WhisperContext>>,
+    context: Arc<OnceCell<Arc<whisper_rs::WhisperContext>>>,
 }
 
 impl std::fmt::Debug for LocalWhisperTranscriber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalWhisperTranscriber")
             .field("config", &self.config)
-            .field("has_context", &self.context.is_some())
+            .field("has_context", &self.context.initialized())
             .finish()
     }
 }
@@ -208,7 +222,7 @@ impl LocalWhisperTranscriber {
                         threads = config.cpu_threads,
                         "Pre-loaded resident WhisperContext into RAM successfully"
                     );
-                    Some(Arc::new(ctx))
+                    Arc::new(OnceCell::new_with(Some(Arc::new(ctx))))
                 }
                 Err(e) => {
                     warn!(
@@ -216,11 +230,11 @@ impl LocalWhisperTranscriber {
                         error = %e,
                         "Failed to pre-load WhisperContext at startup; will attempt on demand"
                     );
-                    None
+                    Arc::new(OnceCell::new())
                 }
             }
         } else {
-            None
+            Arc::new(OnceCell::new())
         };
 
         info!(
@@ -239,7 +253,7 @@ impl LocalWhisperTranscriber {
     /// Returns true if resident WhisperContext is pre-loaded in memory.
     #[must_use]
     pub fn is_context_loaded(&self) -> bool {
-        self.context.is_some()
+        self.context.initialized()
     }
 }
 
@@ -262,41 +276,60 @@ impl SpeechToText for LocalWhisperTranscriber {
             return Ok(String::new());
         }
 
+        let capped_len = samples.len().min(MAX_INFERENCE_SAMPLES);
+        if samples.len() > MAX_INFERENCE_SAMPLES {
+            warn!(
+                samples = samples.len(),
+                max_samples = MAX_INFERENCE_SAMPLES,
+                "Audio buffer exceeds max Whisper inference limit; truncating"
+            );
+        }
+
         let model_path = self.config.model_path.clone();
         let language = self.config.language.clone();
         let cpu_threads = self.config.cpu_threads;
-        let samples_vec = samples.to_vec();
-        let cached_ctx = self.context.clone();
+        let samples_vec = samples[..capped_len].to_vec();
+
+        // Lazily load and cache WhisperContext once across calls
+        let ctx_arc = self
+            .context
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(
+                    move || -> Result<Arc<whisper_rs::WhisperContext>, ViernesError> {
+                        let resolved_model = resolve_whisper_model_path(&model_path);
+                        if resolved_model.exists() {
+                            let ctx = whisper_rs::WhisperContext::new_with_params(
+                                &resolved_model,
+                                whisper_rs::WhisperContextParameters::default(),
+                            )
+                            .map_err(|e| {
+                                ViernesError::Stt(format!("Failed to load Whisper context: {e}"))
+                            })?;
+                            Ok(Arc::new(ctx))
+                        } else {
+                            Err(ViernesError::Stt(format!(
+                                "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
+                                model_path.display()
+                            )))
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    ViernesError::Stt(format!("STT model load task panicked or cancelled: {e}"))
+                })?
+            })
+            .await?
+            .clone();
 
         // Acceptance Criterion 5: Inferencia no bloqueante con spawn_blocking directa en memoria RAM
         let raw_result = tokio::task::spawn_blocking(move || -> Result<String, ViernesError> {
-            let ctx_arc = if let Some(ctx) = cached_ctx {
-                ctx
-            } else {
-                let resolved_model = resolve_whisper_model_path(&model_path);
-                if resolved_model.exists() {
-                    let ctx = whisper_rs::WhisperContext::new_with_params(
-                        &resolved_model,
-                        whisper_rs::WhisperContextParameters::default(),
-                    )
-                    .map_err(|e| ViernesError::Stt(format!("Failed to load Whisper context: {e}")))?;
-                    Arc::new(ctx)
-                } else {
-                    return Err(ViernesError::Stt(format!(
-                        "Whisper model not found at '{}'. Please ensure ggml-tiny.bin is placed in ~/.config/viernes/models/ or models/",
-                        model_path.display()
-                    )));
-                }
-            };
-
-            let mut state = ctx_arc.create_state().map_err(|e| {
-                ViernesError::Stt(format!("Failed to create Whisper state: {e}"))
-            })?;
+            let mut state = ctx_arc
+                .create_state()
+                .map_err(|e| ViernesError::Stt(format!("Failed to create Whisper state: {e}")))?;
 
             let mut params =
-                whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
-                    best_of: 1,
-                });
+                whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some(&language));
             params.set_n_threads(cpu_threads as i32);
             params.set_print_special(false);
@@ -352,13 +385,16 @@ impl MockTranscriber {
     /// Returns the number of times `transcribe` has been called.
     #[must_use]
     pub fn call_count(&self) -> usize {
-        *self.call_count.lock().unwrap()
+        *self.call_count.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Returns the sample count of the last received buffer.
     #[must_use]
     pub fn last_samples_len(&self) -> usize {
-        *self.last_samples_len.lock().unwrap()
+        *self
+            .last_samples_len
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -377,8 +413,11 @@ impl SpeechToText for MockTranscriber {
             )));
         }
 
-        *self.call_count.lock().unwrap() += 1;
-        *self.last_samples_len.lock().unwrap() = samples.len();
+        *self.call_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .last_samples_len
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = samples.len();
 
         let filtered = clean_and_filter_hallucinations(&self.fixed_response);
         Ok(filtered)
