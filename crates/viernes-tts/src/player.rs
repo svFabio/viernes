@@ -1,5 +1,6 @@
 //! Non-blocking streaming audio playback engine with in-memory MP3 decoding and headless CI support.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7,7 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::cpal::{
+    self,
+    traits::{DeviceTrait, HostTrait},
+};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, StreamError};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 use viernes_core::error::ViernesError;
@@ -109,12 +114,129 @@ enum PlayerCommand {
     PlayFiller(Vec<u8>),
     SetVolume(f32),
     Stop,
+    Shutdown,
+}
+
+/// Tracks queued item types (`true` = filler, `false` = response chunk) in FIFO order.
+#[derive(Debug, Default)]
+struct PlaybackQueueTracker {
+    queued_is_filler: VecDeque<bool>,
+}
+
+impl PlaybackQueueTracker {
+    fn push_chunk(&mut self) {
+        self.queued_is_filler.push_back(false);
+    }
+
+    fn push_filler(&mut self) {
+        self.queued_is_filler.push_back(true);
+    }
+
+    fn clear(&mut self) {
+        self.queued_is_filler.clear();
+    }
+
+    /// Reconciles tracked entries against the sink's current queue length and returns
+    /// the type of the most recently finished item (`true` = filler), if any finished.
+    fn reconcile(&mut self, sink_len: usize) -> Option<bool> {
+        let mut last_finished = None;
+        while self.queued_is_filler.len() > sink_len {
+            if let Some(is_filler) = self.queued_is_filler.pop_front() {
+                last_finished = Some(is_filler);
+            }
+        }
+        last_finished
+    }
+}
+
+/// Resolves an output device index from device names using numeric index, exact name, or partial match.
+fn find_matching_device_index(names: &[String], query: &str) -> Option<usize> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(idx) = trimmed.parse::<usize>() {
+        if idx < names.len() {
+            return Some(idx);
+        }
+        warn!(
+            device_index = idx,
+            available = names.len(),
+            "Requested output device index out of range"
+        );
+    }
+
+    let query_lower = trimmed.to_lowercase();
+    if let Some(idx) = names.iter().position(|n| n.to_lowercase() == query_lower) {
+        return Some(idx);
+    }
+
+    names
+        .iter()
+        .position(|n| n.to_lowercase().contains(&query_lower))
+}
+
+/// Opens a `rodio::OutputStream` for the requested output device, falling back to default on failure.
+fn open_output_stream(
+    output_device: Option<&str>,
+) -> Result<(OutputStream, OutputStreamHandle), StreamError> {
+    let query = output_device.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(query) = query {
+        let host = cpal::default_host();
+        match host.output_devices() {
+            Ok(devices) => {
+                let devices: Vec<cpal::Device> = devices.collect();
+                let names: Vec<String> = devices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| d.name().unwrap_or_else(|_| format!("Output Device #{i}")))
+                    .collect();
+
+                if let Some(idx) = find_matching_device_index(&names, query) {
+                    match OutputStream::try_from_device(&devices[idx]) {
+                        Ok(stream) => {
+                            info!(
+                                device = %names[idx],
+                                index = idx,
+                                "Opened selected audio output device"
+                            );
+                            return Ok(stream);
+                        }
+                        Err(err) => {
+                            warn!(
+                                device = %names[idx],
+                                error = %err,
+                                "Failed to open selected audio output device; falling back to default"
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        query = %query,
+                        available = names.len(),
+                        "Requested audio output device not found; falling back to default"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to enumerate audio output devices; falling back to default"
+                );
+            }
+        }
+    }
+
+    OutputStream::try_default()
 }
 
 /// Real-time streaming audio player backed by `rodio` Sink and dedicated thread.
 pub struct StreamingAudioPlayer {
     command_tx: crossbeam_channel::Sender<PlayerCommand>,
     playing_flag: Arc<AtomicBool>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
     _event_tx: Option<broadcast::Sender<SystemEvent>>,
 }
 
@@ -126,10 +248,28 @@ impl fmt::Debug for StreamingAudioPlayer {
     }
 }
 
+impl Drop for StreamingAudioPlayer {
+    fn drop(&mut self) {
+        if let Err(err) = self.command_tx.send(PlayerCommand::Shutdown) {
+            debug!(error = %err, "Audio playback command channel already closed on drop");
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            if handle.thread().id() != std::thread::current().id() {
+                if let Err(err) = handle.join() {
+                    warn!(
+                        "Audio playback worker thread panicked on shutdown: {:?}",
+                        err
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl StreamingAudioPlayer {
     /// Creates and initializes the streaming audio player on a dedicated OS thread with default 1.0 volume.
     pub fn new(event_tx: Option<broadcast::Sender<SystemEvent>>) -> Result<Self, TtsError> {
-        Self::new_with_volume(event_tx, 1.0)
+        Self::new_with_options(event_tx, 1.0, None)
     }
 
     /// Creates and initializes the streaming audio player with a specified volume multiplier.
@@ -137,25 +277,38 @@ impl StreamingAudioPlayer {
         event_tx: Option<broadcast::Sender<SystemEvent>>,
         initial_volume: f32,
     ) -> Result<Self, TtsError> {
+        Self::new_with_options(event_tx, initial_volume, None)
+    }
+
+    /// Creates and initializes the streaming audio player with volume and optional output device selection.
+    pub fn new_with_options(
+        event_tx: Option<broadcast::Sender<SystemEvent>>,
+        initial_volume: f32,
+        output_device: Option<&str>,
+    ) -> Result<Self, TtsError> {
         let (command_tx, command_rx) = crossbeam_channel::unbounded::<PlayerCommand>();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
 
         let playing_flag = Arc::new(AtomicBool::new(false));
         let playing_clone = Arc::clone(&playing_flag);
         let event_tx_clone = event_tx.clone();
+        let requested_device = output_device
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        std::thread::Builder::new()
+        let worker_handle = std::thread::Builder::new()
             .name("viernes-audio-playback".into())
             .spawn(move || {
                 // Initialize OutputStream inside dedicated playback thread to satisfy Send bounds
-                let (_stream, stream_handle) = match OutputStream::try_default() {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        let _ =
-                            init_tx.send(Err(format!("No hardware audio device available: {e}")));
-                        return;
-                    }
-                };
+                let (_stream, stream_handle) =
+                    match open_output_stream(requested_device.as_deref()) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let _ = init_tx
+                                .send(Err(format!("No hardware audio device available: {e}")));
+                            return;
+                        }
+                    };
 
                 let mut sink = match Sink::try_new(&stream_handle) {
                     Ok(s) => s,
@@ -170,16 +323,17 @@ impl StreamingAudioPlayer {
 
                 // Notify parent thread that audio hardware is ready
                 let _ = init_tx.send(Ok(()));
-                let mut current_is_filler = false;
+                let mut tracker = PlaybackQueueTracker::default();
 
                 loop {
                     match command_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(PlayerCommand::PlayChunk(bytes)) => {
+                            tracker.reconcile(sink.len());
                             let cursor = Cursor::new(bytes);
                             match Decoder::new(cursor) {
                                 Ok(source) => {
                                     sink.append(source);
-                                    current_is_filler = false;
+                                    tracker.push_chunk();
                                     playing_clone.store(true, Ordering::SeqCst);
                                 }
                                 Err(err) => {
@@ -191,11 +345,12 @@ impl StreamingAudioPlayer {
                             }
                         }
                         Ok(PlayerCommand::PlayFiller(bytes)) => {
+                            tracker.reconcile(sink.len());
                             let cursor = Cursor::new(bytes);
                             match Decoder::new(cursor) {
                                 Ok(source) => {
                                     sink.append(source);
-                                    current_is_filler = true;
+                                    tracker.push_filler();
                                     playing_clone.store(true, Ordering::SeqCst);
                                 }
                                 Err(err) => {
@@ -224,17 +379,24 @@ impl StreamingAudioPlayer {
                                     sink.stop();
                                 }
                             }
-                            current_is_filler = false;
+                            tracker.clear();
                             playing_clone.store(false, Ordering::SeqCst);
                         }
+                        Ok(PlayerCommand::Shutdown) => {
+                            debug!("Audio shutdown command received; stopping playback thread");
+                            sink.stop();
+                            tracker.clear();
+                            playing_clone.store(false, Ordering::SeqCst);
+                            break;
+                        }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            let finished = tracker.reconcile(sink.len());
                             if playing_clone.load(Ordering::SeqCst)
                                 && sink.empty()
                                 && command_rx.is_empty()
                             {
                                 playing_clone.store(false, Ordering::SeqCst);
-                                if current_is_filler {
-                                    current_is_filler = false;
+                                if finished.unwrap_or(false) {
                                     debug!("Filler audio playback queue drained; emitting FillerPlaybackFinished");
                                     if let Some(ref tx) = event_tx_clone {
                                         let _ = tx.send(SystemEvent::FillerPlaybackFinished);
@@ -264,10 +426,14 @@ impl StreamingAudioPlayer {
                 Ok(Self {
                     command_tx,
                     playing_flag,
+                    worker_handle: Some(worker_handle),
                     _event_tx: event_tx,
                 })
             }
-            Ok(Err(err)) => Err(TtsError::Playback(err)),
+            Ok(Err(err)) => {
+                let _ = worker_handle.join();
+                Err(TtsError::Playback(err))
+            }
             Err(_) => Err(TtsError::Playback(
                 "Audio hardware initialization timed out (headless environment)".into(),
             )),
@@ -279,7 +445,7 @@ impl StreamingAudioPlayer {
     pub fn create_resilient_player(
         event_tx: Option<broadcast::Sender<SystemEvent>>,
     ) -> Box<dyn AudioPlayback> {
-        Self::create_resilient_player_with_volume(event_tx, 1.0)
+        Self::create_resilient_player_with_options(event_tx, 1.0, None)
     }
 
     /// Creates an auto-fallback player with a specific volume multiplier.
@@ -288,7 +454,17 @@ impl StreamingAudioPlayer {
         event_tx: Option<broadcast::Sender<SystemEvent>>,
         initial_volume: f32,
     ) -> Box<dyn AudioPlayback> {
-        match Self::new_with_volume(event_tx.clone(), initial_volume) {
+        Self::create_resilient_player_with_options(event_tx, initial_volume, None)
+    }
+
+    /// Creates an auto-fallback player with a specific volume multiplier and optional output device.
+    #[must_use]
+    pub fn create_resilient_player_with_options(
+        event_tx: Option<broadcast::Sender<SystemEvent>>,
+        initial_volume: f32,
+        output_device: Option<&str>,
+    ) -> Box<dyn AudioPlayback> {
+        match Self::new_with_options(event_tx.clone(), initial_volume, output_device) {
             Ok(player) => Box::new(player),
             Err(err) => {
                 warn!("Falling back to SilentAudioSink due to: {}", err);
@@ -340,7 +516,9 @@ impl AudioPlayback for StreamingAudioPlayer {
     }
 
     fn stop_immediately(&mut self) -> Result<(), ViernesError> {
-        let _ = self.command_tx.send(PlayerCommand::Stop);
+        if let Err(err) = self.command_tx.send(PlayerCommand::Stop) {
+            warn!(error = %err, "Failed to send Stop command to audio playback thread");
+        }
         self.playing_flag.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -396,5 +574,71 @@ mod tests {
         let dummy = vec![0xFF, 0xFB, 0x90, 0x64];
         let result = player.enqueue_chunk(dummy).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resilient_player_with_options_fallback() {
+        let (tx, _rx) = broadcast::channel(8);
+        let mut player = StreamingAudioPlayer::create_resilient_player_with_options(
+            Some(tx),
+            0.75,
+            Some("nonexistent-device-xyz"),
+        );
+        let dummy = vec![0xFF, 0xFB, 0x90, 0x64];
+        assert!(player.enqueue_chunk(dummy).await.is_ok());
+    }
+
+    #[test]
+    fn test_find_matching_device_index() {
+        let devices = vec![
+            "Built-in Audio Analog Stereo".to_string(),
+            "USB Headset Pro".to_string(),
+            "HDMI Output 0".to_string(),
+        ];
+
+        assert_eq!(find_matching_device_index(&devices, ""), None);
+        assert_eq!(find_matching_device_index(&devices, "   "), None);
+        assert_eq!(find_matching_device_index(&devices, "1"), Some(1));
+        assert_eq!(
+            find_matching_device_index(&devices, "usb headset pro"),
+            Some(1)
+        );
+        assert_eq!(find_matching_device_index(&devices, "headset"), Some(1));
+        assert_eq!(find_matching_device_index(&devices, "hdmi"), Some(2));
+        assert_eq!(find_matching_device_index(&devices, "99"), None);
+        assert_eq!(find_matching_device_index(&devices, "bluetooth"), None);
+    }
+
+    #[test]
+    fn test_playback_queue_tracker_fifo_filler_and_chunk() {
+        let mut tracker = PlaybackQueueTracker::default();
+        tracker.push_filler();
+        tracker.push_chunk();
+        tracker.push_chunk();
+
+        // Filler finishes while 2 chunks remain
+        assert_eq!(tracker.reconcile(2), Some(true));
+        // First chunk finishes while 1 chunk remains
+        assert_eq!(tracker.reconcile(1), Some(false));
+        // Last chunk finishes; queue drains
+        assert_eq!(tracker.reconcile(0), Some(false));
+        // No more items
+        assert_eq!(tracker.reconcile(0), None);
+    }
+
+    #[test]
+    fn test_player_drop_and_stop_with_closed_channel() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(rx);
+        let mut player = StreamingAudioPlayer {
+            command_tx: tx,
+            playing_flag: Arc::new(AtomicBool::new(true)),
+            worker_handle: None,
+            _event_tx: None,
+        };
+
+        assert!(player.stop_immediately().is_ok());
+        assert!(!player.is_playing());
+        drop(player);
     }
 }

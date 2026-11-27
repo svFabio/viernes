@@ -66,13 +66,20 @@ impl ElevenLabsClient {
         base_url: Option<String>,
     ) -> Self {
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(5)
             .gzip(true)
             .brotli(true)
             .build()
-            .expect("Failed to build reqwest Client with TLS");
+            .unwrap_or_else(|err| {
+                warn!(
+                    error = %err,
+                    "Failed to build configured reqwest Client; falling back to default Client"
+                );
+                Client::new()
+            });
 
         let voice = voice_id
             .or_else(|| std::env::var("ELEVENLABS_VOICE_ID").ok())
@@ -97,11 +104,22 @@ impl ElevenLabsClient {
         &self.key_pool
     }
 
+    /// Reference to the configured model ID.
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
     /// Internal synthesis loop with atomic rotation on 401 or 429.
     async fn synthesize_internal(&self, text: &str) -> Result<Vec<u8>, TtsError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(TtsError::EmptyText);
+        }
+
+        let total_keys = self.key_pool.len();
+        if total_keys == 0 {
+            return Err(TtsError::NoKeysConfigured);
         }
 
         let endpoint = format!(
@@ -119,22 +137,24 @@ impl ElevenLabsClient {
         };
 
         let mut attempts = 0;
-        let max_attempts = self.key_pool.len().max(1);
 
-        while attempts < max_attempts {
+        while attempts < total_keys {
             attempts += 1;
-            let active_key = self.key_pool.get_active_key()?;
+            let Some(active) = self.key_pool.get_active_key_with_index() else {
+                return Err(TtsError::AllKeysExhausted(total_keys));
+            };
 
             debug!(
                 attempt = attempts,
-                max_attempts = max_attempts,
+                max_attempts = total_keys,
+                key_idx = active.index + 1,
                 "Dispatching ElevenLabs synthesis request"
             );
 
             let response = self
                 .client
                 .post(&endpoint)
-                .header("xi-api-key", &active_key)
+                .header("xi-api-key", &active.key)
                 .header("Content-Type", "application/json")
                 .header("Accept", "audio/mpeg")
                 .json(&payload)
@@ -150,13 +170,16 @@ impl ElevenLabsClient {
                     } else if status == StatusCode::UNAUTHORIZED
                         || status == StatusCode::TOO_MANY_REQUESTS
                     {
+                        let is_unauthorized = status == StatusCode::UNAUTHORIZED;
                         warn!(
                             status = %status,
+                            key_idx = active.index + 1,
+                            permanent = is_unauthorized,
                             attempt = attempts,
-                            "ElevenLabs API key quota exceeded or unauthorized; rotating key"
+                            "ElevenLabs API key rejected or quota exceeded; rotating key"
                         );
-                        // Rotate key atomically
-                        let _ = self.key_pool.mark_current_exhausted_and_rotate()?;
+                        self.key_pool
+                            .mark_exhausted_at(active.index, is_unauthorized);
                     } else {
                         let err_text = resp.text().await.unwrap_or_default();
                         return Err(TtsError::Protocol(format!(
@@ -171,7 +194,7 @@ impl ElevenLabsClient {
             }
         }
 
-        Err(TtsError::AllKeysExhausted(max_attempts))
+        Err(TtsError::AllKeysExhausted(total_keys))
     }
 }
 
@@ -253,5 +276,50 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("exhausted"));
+    }
+
+    #[tokio::test]
+    async fn test_401_permanently_disables_invalid_key_and_rotates() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/text-to-speech/.*/stream"))
+            .and(header("xi-api-key", "invalid_key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let dummy_mp3 = vec![0xFF, 0xFB, 0x90, 0x64, 0x11, 0x22];
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/text-to-speech/.*/stream"))
+            .and(header("xi-api-key", "valid_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(dummy_mp3.clone()))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let pool = KeyPool::new(vec!["invalid_key".into(), "valid_key".into()]);
+        let client = ElevenLabsClient::with_options(
+            pool,
+            None,
+            Some("eleven_flash_v2_5".into()),
+            Some(mock_server.uri()),
+        );
+        assert_eq!(client.model_id(), "eleven_flash_v2_5");
+
+        let audio1 = client.synthesize("First call").await.unwrap();
+        assert_eq!(audio1, dummy_mp3);
+
+        // Second call should go straight to valid_key without retrying permanently disabled invalid_key
+        let audio2 = client.synthesize("Second call").await.unwrap();
+        assert_eq!(audio2, dummy_mp3);
+    }
+
+    #[tokio::test]
+    async fn test_no_keys_configured_returns_error() {
+        let client = ElevenLabsClient::new(KeyPool::new(vec![]));
+        let err = client.synthesize("Hello").await.unwrap_err();
+        assert!(err.to_string().contains("No API keys configured"));
     }
 }
